@@ -6,12 +6,15 @@ import (
 	"testing"
 )
 
-func TestUIDBasicsAndParsing(t *testing.T) {
+func TestUIDAndSigHashBasicsAndParsing(t *testing.T) {
 	if !ZeroUID.IsZero() {
 		t.Fatal("ZeroUID.IsZero() = false, want true")
 	}
+	if !ZeroSigHash.IsZero() {
+		t.Fatal("ZeroSigHash.IsZero() = false, want true")
+	}
 
-	u1 := GenerateUID("pkg::Foo", "sig1")
+	u1 := GenerateNodeUID(KindFunction, "pkg::Foo", 0)
 	if u1.IsZero() {
 		t.Fatal("generated UID should not be zero")
 	}
@@ -33,7 +36,7 @@ func TestUIDBasicsAndParsing(t *testing.T) {
 		t.Fatalf("Compare equal UIDs = %d, want 0", u1.Compare(parsed))
 	}
 
-	u2 := GenerateUID("pkg::Bar", "sig1")
+	u2 := GenerateNodeUID(KindFunction, "pkg::Bar", 0)
 	if u1 == u2 {
 		t.Fatal("distinct QNames produced identical UIDs")
 	}
@@ -41,7 +44,7 @@ func TestUIDBasicsAndParsing(t *testing.T) {
 		t.Fatal("Compare different UIDs returned 0")
 	}
 
-	// JSON round-trip via MarshalText / UnmarshalText
+	// JSON round-trip for UID and SigHash
 	raw, err := json.Marshal(u1)
 	if err != nil {
 		t.Fatalf("json.Marshal(UID) failed: %v", err)
@@ -51,7 +54,23 @@ func TestUIDBasicsAndParsing(t *testing.T) {
 		t.Fatalf("json.Unmarshal(UID) failed: %v", err)
 	}
 	if decoded != u1 {
-		t.Fatalf("JSON round-trip mismatch: got %v, want %v", decoded, u1)
+		t.Fatalf("UID JSON round-trip mismatch: got %v, want %v", decoded, u1)
+	}
+
+	sig := ComputeSignatureHash([]Param{{Name: "a", Type: "int"}}, "error")
+	if sig.IsZero() || len(sig.String()) != 32 {
+		t.Fatalf("unexpected SigHash: %v", sig)
+	}
+	sigRaw, err := json.Marshal(sig)
+	if err != nil {
+		t.Fatalf("json.Marshal(SigHash) failed: %v", err)
+	}
+	var decodedSig SigHash
+	if err := json.Unmarshal(sigRaw, &decodedSig); err != nil {
+		t.Fatalf("json.Unmarshal(SigHash) failed: %v", err)
+	}
+	if decodedSig != sig {
+		t.Fatalf("SigHash JSON round-trip mismatch: got %v, want %v", decodedSig, sig)
 	}
 
 	// Error cases
@@ -61,42 +80,49 @@ func TestUIDBasicsAndParsing(t *testing.T) {
 	if _, err := ParseUID(strings.Repeat("z", 32)); err == nil {
 		t.Fatal("expected error for non-hex UID string")
 	}
-	var bad UID
-	if err := bad.UnmarshalText([]byte("bad")); err == nil {
-		t.Fatal("expected error from UnmarshalText for invalid input")
+	var badUID UID
+	if err := badUID.UnmarshalText([]byte("bad")); err == nil {
+		t.Fatal("expected error from UID.UnmarshalText for invalid input")
+	}
+	var badSig SigHash
+	if err := badSig.UnmarshalText([]byte("short")); err == nil {
+		t.Fatal("expected error from SigHash.UnmarshalText for short input")
+	}
+	if err := badSig.UnmarshalText([]byte(strings.Repeat("g", 32))); err == nil {
+		t.Fatal("expected error from SigHash.UnmarshalText for invalid hex")
 	}
 }
 
-func TestSignatureHashAndUIDStability(t *testing.T) {
+func TestComputeSignatureHash(t *testing.T) {
 	// Parameter names must NOT alter SignatureHash
-	sigA := SignatureHash([]Param{{Name: "a", Type: "int"}, {Name: "b", Type: "string"}}, "bool")
-	sigB := SignatureHash([]Param{{Name: "x", Type: "int"}, {Name: "y", Type: "string"}}, "bool")
+	sigA := ComputeSignatureHash([]Param{{Name: "a", Type: "int"}, {Name: "b", Type: "string"}}, "bool")
+	sigB := ComputeSignatureHash([]Param{{Name: "x", Type: "int"}, {Name: "y", Type: "string"}}, "bool")
 	if sigA != sigB {
 		t.Fatalf("renaming typed params changed signature hash: %s != %s", sigA, sigB)
 	}
 
 	// Whitespace trimming around types
-	sigTrim := SignatureHash([]Param{{Name: "x", Type: " int "}, {Name: "y", Type: "string "}}, " bool ")
+	sigTrim := ComputeSignatureHash([]Param{{Name: "x", Type: " int "}, {Name: "y", Type: "string "}}, " bool ")
 	if sigA != sigTrim {
 		t.Fatalf("type whitespace changed signature hash: %s != %s", sigA, sigTrim)
 	}
 
 	// Changing parameter type MUST alter SignatureHash
-	sigTypeChange := SignatureHash([]Param{{Name: "a", Type: "int64"}, {Name: "b", Type: "string"}}, "bool")
+	sigTypeChange := ComputeSignatureHash([]Param{{Name: "a", Type: "int64"}, {Name: "b", Type: "string"}}, "bool")
 	if sigA == sigTypeChange {
 		t.Fatal("changing param type did not change signature hash")
 	}
 
 	// Changing return type MUST alter SignatureHash
-	sigRetChange := SignatureHash([]Param{{Name: "a", Type: "int"}, {Name: "b", Type: "string"}}, "error")
+	sigRetChange := ComputeSignatureHash([]Param{{Name: "a", Type: "int"}, {Name: "b", Type: "string"}}, "error")
 	if sigA == sigRetChange {
 		t.Fatal("changing return type did not change signature hash")
 	}
 
 	// Untyped functions: renaming params preserves hash, changing arity changes hash
-	untyped2A := SignatureHash([]Param{{Name: "foo"}, {Name: "bar"}}, "")
-	untyped2B := SignatureHash([]Param{{Name: "baz"}, {Name: "qux"}}, "")
-	untyped3 := SignatureHash([]Param{{Name: "foo"}, {Name: "bar"}, {Name: "extra"}}, "")
+	untyped2A := ComputeSignatureHash([]Param{{Name: "foo"}, {Name: "bar"}}, "")
+	untyped2B := ComputeSignatureHash([]Param{{Name: "baz"}, {Name: "qux"}}, "")
+	untyped3 := ComputeSignatureHash([]Param{{Name: "foo"}, {Name: "bar"}, {Name: "extra"}}, "")
 	if untyped2A != untyped2B {
 		t.Fatal("renaming untyped params changed signature hash")
 	}
@@ -104,64 +130,82 @@ func TestSignatureHashAndUIDStability(t *testing.T) {
 		t.Fatal("changing untyped arity did not change signature hash")
 	}
 
-	// Length-prefix injection resistance: ("ab", "cd") vs ("a", "bcd")
-	if GenerateUID("ab", "cd") == GenerateUID("a", "bcd") {
-		t.Fatal("length-prefix collision between split inputs")
+	// Length-prefix injection resistance: ("a", "bc") vs ("ab", "c")
+	sigSplit1 := ComputeSignatureHash([]Param{{Type: "a"}}, "bc")
+	sigSplit2 := ComputeSignatureHash([]Param{{Type: "ab"}}, "c")
+	if sigSplit1 == sigSplit2 {
+		t.Fatal("length-prefix collision between split signature inputs")
 	}
 }
 
-func TestComputeNodeUID(t *testing.T) {
-	if !ComputeNodeUID(nil).IsZero() {
-		t.Fatal("ComputeNodeUID(nil) should be ZeroUID")
+func TestComputeNodeUIDStabilityAndOccurrence(t *testing.T) {
+	// Zero / invalid Node
+	if !ComputeNodeUID(Node{}).IsZero() {
+		t.Fatal("ComputeNodeUID(empty) should be ZeroUID")
+	}
+	if !ComputeNodeUID(Node{Kind: KindUnknown, QName: "pkg::X"}).IsZero() {
+		t.Fatal("ComputeNodeUID(KindUnknown) should be ZeroUID")
 	}
 
-	// Line numbers must NOT affect UID
-	fnLine10 := &Node{
-		Kind:       KindFunction,
-		Name:       "Handle",
-		QName:      "pkg::Server::Handle",
-		File:       "server.go",
-		StartLine:  10,
-		EndLine:    25,
-		Params:     []Param{{Name: "req", Type: "Request"}},
-		ReturnType: "Response",
-	}
-	fnLine100 := &Node{
-		Kind:       KindFunction,
-		Name:       "Handle",
-		QName:      "pkg::Server::Handle",
-		File:       "server.go",
-		StartLine:  100,
-		EndLine:    115,
-		Params:     []Param{{Name: "r", Type: "Request"}},
-		ReturnType: "Response",
-	}
-	if ComputeNodeUID(fnLine10) != ComputeNodeUID(fnLine100) {
-		t.Fatal("moving function lines or renaming params changed UID")
+	// Non-File node without QName must NOT fall back to File::Name
+	noQName := Node{Kind: KindFunction, Name: "__init__", File: "app.py", StartLine: 10}
+	if !ComputeNodeUID(noQName).IsZero() {
+		t.Fatal("ComputeNodeUID for non-File node with empty QName should be ZeroUID")
 	}
 
-	// Overload with different signature gets different UID
-	fnOverload := fnLine10.Clone()
-	fnOverload.Params = []Param{{Name: "req", Type: "Request"}, {Name: "ctx", Type: "Context"}}
-	if ComputeNodeUID(fnLine10) == ComputeNodeUID(fnOverload) {
-		t.Fatal("overloaded function with different signature produced same UID")
+	// KindFile falls back to File when QName is empty
+	fileFallback := Node{Kind: KindFile, Name: "app.py", File: "pkg/app.py"}
+	if ComputeNodeUID(fileFallback).IsZero() {
+		t.Fatal("KindFile should compute UID from File when QName is empty")
+	}
+
+	// Moving lines OR adding parameter type annotations preserves UID while changing SignatureHash
+	beforeEdit := Node{
+		Kind:          KindFunction,
+		Name:          "f",
+		QName:         "mod::f",
+		File:          "mod.py",
+		StartLine:     10,
+		EndLine:       15,
+		Params:        []Param{{Name: "a"}},
+		SignatureHash: ComputeSignatureHash([]Param{{Name: "a"}}, ""),
+	}
+	afterTypeAnnotation := Node{
+		Kind:          KindFunction,
+		Name:          "f",
+		QName:         "mod::f",
+		File:          "mod.py",
+		StartLine:     42,
+		EndLine:       50,
+		Params:        []Param{{Name: "a", Type: "int"}},
+		ReturnType:    "str",
+		SignatureHash: ComputeSignatureHash([]Param{{Name: "a", Type: "int"}}, "str"),
+	}
+	if ComputeNodeUID(beforeEdit) != ComputeNodeUID(afterTypeAnnotation) {
+		t.Fatal("adding type annotations or moving lines changed node UID")
+	}
+	if beforeEdit.SignatureHash == afterTypeAnnotation.SignatureHash {
+		t.Fatal("adding type annotations did not change SignatureHash")
+	}
+
+	// Same QName siblings (e.g. Go package init() functions or Python duplicate __init__)
+	// are disambiguated cleanly by Occurrence.
+	init0 := Node{Kind: KindFunction, Name: "init", QName: "pkg::init", Occurrence: 0, File: "a.go", StartLine: 5}
+	init1 := Node{Kind: KindFunction, Name: "init", QName: "pkg::init", Occurrence: 1, File: "b.go", StartLine: 5}
+	if ComputeNodeUID(init0) == ComputeNodeUID(init1) {
+		t.Fatal("distinct Occurrence values produced identical UIDs")
 	}
 
 	// Non-function kinds with same QName remain distinct
-	clsNode := &Node{Kind: KindClass, Name: "Config", QName: "app::Config"}
-	varNode := &Node{Kind: KindVariable, Name: "Config", QName: "app::Config"}
+	clsNode := Node{Kind: KindClass, Name: "Config", QName: "app::Config"}
+	varNode := Node{Kind: KindVariable, Name: "Config", QName: "app::Config"}
 	if ComputeNodeUID(clsNode) == ComputeNodeUID(varNode) {
 		t.Fatal("Class and Variable with same QName should have distinct UIDs")
 	}
 
-	// Fallback when QName is empty
-	noQNameWithFile := &Node{Kind: KindFunction, Name: "helper", File: "a.go"}
-	noQNameNoFile := &Node{Kind: KindFunction, Name: "helper"}
-	if ComputeNodeUID(noQNameWithFile).IsZero() || ComputeNodeUID(noQNameNoFile).IsZero() {
-		t.Fatal("fallback QName should still produce non-zero UID")
-	}
-	if ComputeNodeUID(noQNameWithFile) == ComputeNodeUID(noQNameNoFile) {
-		t.Fatal("file-scoped fallback UID should differ from fileless fallback UID")
+	// KindExternal produces valid UID
+	ext := Node{Kind: KindExternal, Name: "Println", QName: "fmt.Println"}
+	if ComputeNodeUID(ext).IsZero() {
+		t.Fatal("KindExternal should produce valid non-zero UID")
 	}
 }
-

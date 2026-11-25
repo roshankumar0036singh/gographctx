@@ -1,0 +1,53 @@
+name: CI
+
+on:
+  push:
+    branches: [main, "phase-*"]
+  pull_request:
+    branches: [main]
+
+jobs:
+  verify:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+        go-version: ["1.21", "1.25"]
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ matrix.go-version }}
+
+      - name: Check formatting
+        shell: bash
+        run: |
+          unformatted=$(gofmt -l .)
+          if [ -n "$unformatted" ]; then
+            echo "Files not formatted with gofmt:"
+            echo "$unformatted"
+            exit 1
+          fi
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: Staticcheck
+        if: matrix.os == 'ubuntu-latest' && matrix.go-version == '1.25'
+        uses: dominikh/staticcheck-action@v1.4.0
+        with:
+          version: "2025.1"
+
+      - name: Test with race detector
+        env:
+          CGO_ENABLED: "1"
+        run: go test -race -count=1 -v ./...
+
+      - name: Graph scale and memory benchmarks
+        if: matrix.os == 'ubuntu-latest' && matrix.go-version == '1.25'
+        run: go test -run=^$ -bench=. -benchmem -benchtime=1x ./internal/graph/...
+

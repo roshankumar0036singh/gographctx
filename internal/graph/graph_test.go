@@ -3,7 +3,10 @@ package graph
 import (
 	"errors"
 	"fmt"
+	"slices"
+	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 )
 
@@ -14,772 +17,737 @@ func mustAssertConsistent(t *testing.T, g *Graph) {
 	}
 }
 
-func TestGraphNodeCRUDAndIndexes(t *testing.T) {
+func TestZeroValueGraphSafety(t *testing.T) {
+	var g Graph
+	if g.NodeCount() != 0 || g.EdgeCount() != 0 || g.CallSiteCount() != 0 {
+		t.Fatal("zero-value graph should report zero counts")
+	}
+	if _, ok := g.GetNode(GenerateNodeUID(KindFunction, "x", 0)); ok {
+		t.Fatal("zero-value GetNode should return false")
+	}
+	if g.AllNodes() != nil || g.AllEdges() != nil || g.GetCallSites() != nil {
+		t.Fatal("zero-value bulk queries should return nil")
+	}
+	g.View(func(v *ReadView) {
+		if v.NodeCount() != 0 || v.EdgeCount() != 0 {
+			t.Fatal("View on zero-value graph should see zero counts")
+		}
+	})
+	mustAssertConsistent(t, &g)
+
+	uid, err := g.AddNode(Node{Kind: KindFunction, Name: "Foo", QName: "pkg::Foo", File: "a.go", StartLine: 5})
+	if err != nil || uid.IsZero() {
+		t.Fatalf("AddNode on zero-value graph failed: (%v, %v)", uid, err)
+	}
+	if g.NodeCount() != 1 {
+		t.Fatalf("NodeCount() = %d, want 1", g.NodeCount())
+	}
+	mustAssertConsistent(t, &g)
+}
+
+func TestGraphNodeCRUDImmutabilityAndOverloads(t *testing.T) {
 	g := New()
 	mustAssertConsistent(t, g)
 
-	// Invalid add
-	if err := g.AddNode(nil); !errors.Is(err, ErrNilNode) {
-		t.Fatalf("AddNode(nil) = %v, want ErrNilNode", err)
-	}
-	if err := g.UpsertNode(nil); !errors.Is(err, ErrNilNode) {
-		t.Fatalf("UpsertNode(nil) = %v, want ErrNilNode", err)
-	}
-
-	fileNode := &Node{
+	fileNode := Node{
 		Kind:      KindFile,
 		Name:      "server.go",
-		QName:     "file::cmd/server.go",
 		File:      "cmd/server.go",
 		StartLine: 1,
 		Language:  "go",
 	}
-	fn1 := &Node{
+	fn1 := Node{
+		Kind:          KindFunction,
+		Name:          "Start",
+		QName:         "cmd::Server::Start",
+		File:          "cmd/server.go",
+		StartLine:     25,
+		EndLine:       40,
+		Params:        []Param{{Name: "addr", Type: "string"}},
+		ReturnType:    "error",
+		SignatureHash: ComputeSignatureHash([]Param{{Name: "addr", Type: "string"}}, "error"),
+	}
+	fn2 := Node{
+		Kind:      KindFunction,
+		Name:      "Start", // same short name, different QName
+		QName:     "cmd::Worker::Start",
+		File:      "cmd/worker.go",
+		StartLine: 10,
+		EndLine:   20,
+	}
+	// Legal Go duplicate init() functions or overloaded methods: same QName, distinct Occurrence
+	init0 := Node{
 		Kind:       KindFunction,
-		Name:       "Start",
-		QName:      "cmd::Server::Start",
+		Name:       "init",
+		QName:      "cmd::init",
+		Occurrence: 0,
 		File:       "cmd/server.go",
-		StartLine:  25,
-		EndLine:    40,
-		Params:     []Param{{Name: "addr", Type: "string"}},
-		ReturnType: "error",
+		StartLine:  5,
+		Params:     []Param{{Name: "s", Type: "string"}},
 	}
-	fn2 := &Node{
+	init1 := Node{
 		Kind:       KindFunction,
-		Name:       "Start", // same short name, different QName
-		QName:      "cmd::Worker::Start",
+		Name:       "init",
+		QName:      "cmd::init",
+		Occurrence: 1,
 		File:       "cmd/worker.go",
-		StartLine:  10,
-		EndLine:    20,
-		Params:     []Param{},
-		ReturnType: "",
+		StartLine:  5,
+		Params:     []Param{{Name: "b", Type: "[]byte"}},
 	}
-	// Overloaded methods sharing QName, differing signature
-	overload1 := &Node{
-		Kind:      KindFunction,
-		Name:      "Parse",
-		QName:     "parser::Parse",
-		File:      "parser.go",
-		StartLine: 5,
-		Params:    []Param{{Name: "s", Type: "string"}},
-	}
-	overload2 := &Node{
-		Kind:      KindFunction,
-		Name:      "Parse",
-		QName:     "parser::Parse",
-		File:      "parser.go",
-		StartLine: 15,
-		Params:    []Param{{Name: "b", Type: "[]byte"}},
-	}
-	extMod := &Node{
-		Kind:  KindModule,
-		Name:  "fmt",
-		QName: "fmt",
-		// File intentionally empty for external module
+	extNode := Node{
+		Kind:  KindExternal,
+		Name:  "Println",
+		QName: "fmt.Println",
 	}
 
-	for _, n := range []*Node{fileNode, fn1, fn2, overload1, overload2, extMod} {
-		if err := g.AddNode(n); err != nil {
+	var uids []UID
+	for _, n := range []Node{fileNode, fn1, fn2, init0, init1, extNode} {
+		uid, err := g.AddNode(n)
+		if err != nil {
 			t.Fatalf("AddNode(%s) failed: %v", n.Name, err)
 		}
+		uids = append(uids, uid)
 	}
+	fileUID, fn1UID, _, init0UID, init1UID, _ := uids[0], uids[1], uids[2], uids[3], uids[4], uids[5]
 	mustAssertConsistent(t, g)
 
 	if g.NodeCount() != 6 {
 		t.Fatalf("NodeCount() = %d, want 6", g.NodeCount())
 	}
 
-	// Duplicate AddNode fails
-	dup := fn1.Clone()
-	if err := g.AddNode(dup); !errors.Is(err, ErrNodeExists) {
+	// Duplicate AddNode fails and includes existing File:StartLine
+	_, err := g.AddNode(fn1)
+	if !errors.Is(err, ErrNodeExists) {
 		t.Fatalf("duplicate AddNode error = %v, want ErrNodeExists", err)
 	}
+	if !strings.Contains(err.Error(), "cmd/server.go:25") {
+		t.Fatalf("ErrNodeExists message %q missing existing File:StartLine", err.Error())
+	}
 
-	// Mutating original input slice must not mutate graph node
+	// Mutating caller slice or returned getter slice MUST NOT corrupt graph or indexes
 	fn1.Params[0].Type = "mutated"
-	gotFn1, ok := g.GetNode(fn1.UID)
+	gotFn1, ok := g.GetNode(fn1UID)
 	if !ok || gotFn1.Params[0].Type != "string" {
 		t.Fatal("mutating caller Node after AddNode affected stored node")
 	}
-
-	// Zero-UID lookups return false / nil
-	if _, ok := g.GetNode(ZeroUID); ok {
-		t.Fatal("GetNode(ZeroUID) should return false")
-	}
-	if g.HasNode(ZeroUID) {
-		t.Fatal("HasNode(ZeroUID) should return false")
-	}
-	if !g.HasNode(fn1.UID) {
-		t.Fatal("HasNode(fn1.UID) = false, want true")
+	gotFn1.Params[0].Type = "corrupted"
+	gotFn1.Name = "Corrupted"
+	gotAgain, _ := g.GetNode(fn1UID)
+	if gotAgain.Params[0].Type != "string" || gotAgain.Name != "Start" {
+		t.Fatal("mutating Node returned by GetNode affected graph")
 	}
 
-	// Index lookups: ByName, ByFile, ByQName
-	if got := g.GetByName(""); got != nil {
-		t.Fatal("GetByName empty should return nil")
-	}
 	byStart := g.GetByName("Start")
 	if len(byStart) != 2 || byStart[0].QName != "cmd::Server::Start" || byStart[1].QName != "cmd::Worker::Start" {
 		t.Fatalf("GetByName(Start) unexpected: %+v", byStart)
 	}
+	byStart[0].Name = "Hacked"
+	mustAssertConsistent(t, g)
 
-	if got := g.GetByFile(""); got != nil {
-		t.Fatal("GetByFile empty should return nil")
+	// Overload / sibling honesty: GetByQName returns all, GetUniqueByQName rejects ambiguity
+	inits := g.GetByQName("cmd::init")
+	if len(inits) != 2 || inits[0].UID != init0UID || inits[1].UID != init1UID {
+		t.Fatalf("GetByQName(cmd::init) unexpected: %+v", inits)
 	}
-	byServerFile := g.GetByFile("cmd/server.go")
-	if len(byServerFile) != 2 || byServerFile[0].StartLine != 1 || byServerFile[1].StartLine != 25 {
-		t.Fatalf("GetByFile(cmd/server.go) unexpected: %+v", byServerFile)
+	if _, err := g.GetUniqueByQName("cmd::init"); !errors.Is(err, ErrAmbiguousQName) {
+		t.Fatalf("GetUniqueByQName ambiguous = %v, want ErrAmbiguousQName", err)
 	}
-
-	if _, ok := g.GetByQName(""); ok {
-		t.Fatal("GetByQName empty should return false")
+	if _, err := g.GetUniqueByQName("does::not::exist"); !errors.Is(err, ErrNodeNotFound) {
+		t.Fatalf("GetUniqueByQName missing = %v, want ErrNodeNotFound", err)
 	}
-	if _, ok := g.GetByQName("does::not::exist"); ok {
-		t.Fatal("GetByQName missing should return false")
-	}
-	if got := g.GetAllByQName(""); got != nil {
-		t.Fatal("GetAllByQName empty should return nil")
-	}
-	if got, ok := g.GetByQName("cmd::Server::Start"); !ok || got.UID != fn1.UID {
-		t.Fatalf("GetByQName single mismatch: (%+v, %v)", got, ok)
-	}
-	if first, ok := g.GetByQName("parser::Parse"); !ok || first.UID != overload1.UID {
-		t.Fatalf("GetByQName overloaded mismatch: (%+v, %v)", first, ok)
-	}
-	overloads := g.GetAllByQName("parser::Parse")
-	if len(overloads) != 2 || overloads[0].StartLine != 5 || overloads[1].StartLine != 15 {
-		t.Fatalf("GetAllByQName(parser::Parse) unexpected: %+v", overloads)
+	uniqueStart, err := g.GetUniqueByQName("cmd::Server::Start")
+	if err != nil || uniqueStart.UID != fn1UID {
+		t.Fatalf("GetUniqueByQName single mismatch: (%+v, %v)", uniqueStart, err)
 	}
 
-	// Add CONTAINS edge fileNode -> fn1 so UpsertNode can test updating contains pointer
-	if err := g.AddEdge(&Edge{Source: fileNode.UID, Target: fn1.UID, Kind: EdgeContains, Confidence: 1.0}); err != nil {
+	// Add CONTAINS edge fileUID -> fn1UID then UpsertNode to verify index consistency & edge preservation
+	if err := g.AddEdge(Edge{Source: fileUID, Target: fn1UID, Kind: EdgeContains, Tier: TierStructural}); err != nil {
 		t.Fatalf("AddEdge CONTAINS failed: %v", err)
 	}
 
-	// UpsertNode updates existing node's Name, File, QName, StartLine while preserving UID & edges
-	updatedFn1 := gotFn1.Clone()
+	updatedFn1 := gotAgain.Clone()
 	updatedFn1.Name = "Serve"
 	updatedFn1.QName = "cmd::Server::Serve"
 	updatedFn1.File = "cmd/serve_new.go"
 	updatedFn1.StartLine = 50
 	updatedFn1.EndLine = 70
-	if err := g.UpsertNode(updatedFn1); err != nil {
+	if _, err := g.UpsertNode(updatedFn1); err != nil {
 		t.Fatalf("UpsertNode existing failed: %v", err)
 	}
 	mustAssertConsistent(t, g)
 
-	if len(g.GetByName("Start")) != 1 {
-		t.Fatal("old Name index entry not removed on UpsertNode")
-	}
-	if len(g.GetByName("Serve")) != 1 {
-		t.Fatal("new Name index entry not added on UpsertNode")
+	if len(g.GetByName("Start")) != 1 || len(g.GetByName("Serve")) != 1 {
+		t.Fatal("Name index not updated properly on UpsertNode")
 	}
 	if len(g.GetByFile("cmd/serve_new.go")) != 1 {
-		t.Fatal("new File index entry not added on UpsertNode")
+		t.Fatal("File index not updated on UpsertNode")
 	}
-	if _, ok := g.GetByQName("cmd::Server::Start"); ok {
-		t.Fatal("old QName index entry not removed on UpsertNode")
+	if len(g.GetByQName("cmd::Server::Start")) != 0 || len(g.GetByQName("cmd::Server::Serve")) != 1 {
+		t.Fatal("QName index not updated on UpsertNode")
 	}
-	if got, ok := g.GetByQName("cmd::Server::Serve"); !ok || got.StartLine != 50 {
-		t.Fatal("new QName index entry missing or stale")
-	}
-	children := g.GetContains(fileNode.UID)
+	children := g.GetContains(fileUID)
 	if len(children) != 1 || children[0].Name != "Serve" {
-		t.Fatalf("contains index pointer not updated on UpsertNode: %+v", children)
+		t.Fatalf("contains query not updated on UpsertNode: %+v", children)
 	}
 
-	// UpsertNode inserts a brand new node when UID absent (and computes UID if zero)
-	brandNew := &Node{
-		Kind:  KindStruct,
-		Name:  "Options",
-		QName: "cmd::Options",
-		File:  "cmd/options.go",
-	}
-	if err := g.UpsertNode(brandNew); err != nil {
-		t.Fatalf("UpsertNode new failed: %v", err)
-	}
-	if brandNew.UID.IsZero() || !g.HasNode(brandNew.UID) {
-		t.Fatal("UpsertNode new did not assign UID or store node")
+	// Remove one sibling leaves the other intact under GetUniqueByQName
+	if err := g.RemoveNode(init0UID); err != nil {
+		t.Fatalf("RemoveNode(init0) failed: %v", err)
 	}
 	mustAssertConsistent(t, g)
-
-	// Remove one overload preserves the other overload under QName
-	if err := g.RemoveNode(overload1.UID); err != nil {
-		t.Fatalf("RemoveNode(overload1) failed: %v", err)
-	}
-	mustAssertConsistent(t, g)
-	if remaining := g.GetAllByQName("parser::Parse"); len(remaining) != 1 || remaining[0].UID != overload2.UID {
-		t.Fatalf("overloaded QName corrupted after removing one overload: %+v", remaining)
+	remInit, err := g.GetUniqueByQName("cmd::init")
+	if err != nil || remInit.UID != init1UID {
+		t.Fatalf("GetUniqueByQName after removing sibling = (%+v, %v)", remInit, err)
 	}
 
-	// AllNodes deterministic ordering
-	all := g.AllNodes()
-	for i := 1; i < len(all); i++ {
-		if all[i-1].UID.Compare(all[i].UID) >= 0 {
-			t.Fatal("AllNodes not sorted strictly by UID")
-		}
-	}
-
-	// Remove missing / zero node errors
-	if err := g.RemoveNode(ZeroUID); !errors.Is(err, ErrNodeNotFound) {
-		t.Fatalf("RemoveNode(ZeroUID) = %v, want ErrNodeNotFound", err)
-	}
-	if err := g.RemoveNode(overload1.UID); !errors.Is(err, ErrNodeNotFound) {
-		t.Fatalf("RemoveNode(missing) = %v, want ErrNodeNotFound", err)
-	}
-
-	// Clear resets graph completely
+	// Clear resets everything
 	g.Clear()
-	if g.NodeCount() != 0 || g.EdgeCount() != 0 {
-		t.Fatalf("Clear left nodes=%d edges=%d", g.NodeCount(), g.EdgeCount())
+	if g.NodeCount() != 0 || g.EdgeCount() != 0 || g.CallSiteCount() != 0 {
+		t.Fatal("Clear did not reset counts")
 	}
 	mustAssertConsistent(t, g)
 }
 
-func TestGraphEdgeCRUDIndexesAndCascadeRemoval(t *testing.T) {
+func TestMultiSiteEdgesAndCascadeRemoval(t *testing.T) {
 	g := New()
 
-	fileA := &Node{Kind: KindFile, Name: "a.go", QName: "file::a.go", File: "a.go", StartLine: 1}
-	fileB := &Node{Kind: KindFile, Name: "b.go", QName: "file::b.go", File: "b.go", StartLine: 1}
-	fnA := &Node{Kind: KindFunction, Name: "Caller", QName: "pkg::Caller", File: "a.go", StartLine: 5}
-	fnB := &Node{Kind: KindFunction, Name: "Target", QName: "pkg::Target", File: "b.go", StartLine: 10}
-	fnC := &Node{Kind: KindFunction, Name: "Helper", QName: "pkg::Helper", File: "a.go", StartLine: 20}
+	fileA := Node{Kind: KindFile, Name: "a.go", File: "a.go", StartLine: 1}
+	fileB := Node{Kind: KindFile, Name: "b.go", File: "b.go", StartLine: 1}
+	fnA := Node{Kind: KindFunction, Name: "Caller", QName: "pkg::Caller", File: "a.go", StartLine: 5}
+	fnB := Node{Kind: KindFunction, Name: "Target", QName: "pkg::Target", File: "b.go", StartLine: 10}
+	fnC := Node{Kind: KindFunction, Name: "Helper", QName: "pkg::Helper", File: "a.go", StartLine: 20}
 
-	for _, n := range []*Node{fileA, fileB, fnA, fnB, fnC} {
-		if err := g.AddNode(n); err != nil {
-			t.Fatalf("AddNode failed: %v", err)
-		}
-	}
+	uFileA, _ := g.AddNode(fileA)
+	uFileB, _ := g.AddNode(fileB)
+	uA, _ := g.AddNode(fnA)
+	uB, _ := g.AddNode(fnB)
+	uC, _ := g.AddNode(fnC)
 
-	// Edge validation & missing endpoint checks
-	if err := g.AddEdge(nil); !errors.Is(err, ErrNilEdge) {
-		t.Fatalf("AddEdge(nil) = %v, want ErrNilEdge", err)
+	// Multi-site UpsertEdge merges call sites without losing earlier lines and upgrades Tier
+	if err := g.AddEdge(Edge{
+		Source: uA,
+		Target: uB,
+		Kind:   EdgeCalls,
+		Tier:   TierSamePackage,
+		Label:  "same pkg",
+		Sites:  []CallSiteRef{{Line: 7, Column: 4}},
+	}); err != nil {
+		t.Fatalf("AddEdge 1st site failed: %v", err)
 	}
-	if err := g.UpsertEdge(nil); !errors.Is(err, ErrNilEdge) {
-		t.Fatalf("UpsertEdge(nil) = %v, want ErrNilEdge", err)
+	if err := g.UpsertEdge(Edge{
+		Source: uA,
+		Target: uB,
+		Kind:   EdgeCalls,
+		Tier:   TierQualifiedImport,
+		Label:  "qualified import",
+		Sites:  []CallSiteRef{{Line: 15, Column: 9}},
+	}); err != nil {
+		t.Fatalf("UpsertEdge 2nd site failed: %v", err)
 	}
-
-	missingUID := GenerateUID("missing", "1")
-	if err := g.AddEdge(&Edge{Source: missingUID, Target: fnB.UID, Kind: EdgeCalls, Confidence: 1}); !errors.Is(err, ErrNodeNotFound) {
-		t.Fatalf("missing source error = %v, want ErrNodeNotFound", err)
-	}
-	if err := g.AddEdge(&Edge{Source: fnA.UID, Target: missingUID, Kind: EdgeCalls, Confidence: 1}); !errors.Is(err, ErrNodeNotFound) {
-		t.Fatalf("missing target error = %v, want ErrNodeNotFound", err)
-	}
-	if err := g.UpsertEdge(&Edge{Source: missingUID, Target: fnB.UID, Kind: EdgeCalls, Confidence: 1}); !errors.Is(err, ErrNodeNotFound) {
-		t.Fatalf("UpsertEdge missing source = %v, want ErrNodeNotFound", err)
-	}
-	if err := g.UpsertEdge(&Edge{Source: fnA.UID, Target: missingUID, Kind: EdgeCalls, Confidence: 1}); !errors.Is(err, ErrNodeNotFound) {
-		t.Fatalf("UpsertEdge missing target = %v, want ErrNodeNotFound", err)
-	}
-
-	edges := []*Edge{
-		{Source: fileA.UID, Target: fnA.UID, Kind: EdgeContains, Confidence: 1.0},
-		{Source: fileA.UID, Target: fnC.UID, Kind: EdgeContains, Confidence: 1.0},
-		{Source: fileB.UID, Target: fnB.UID, Kind: EdgeContains, Confidence: 1.0},
-		{Source: fileA.UID, Target: fileB.UID, Kind: EdgeImports, Confidence: 1.0},
-		{Source: fnA.UID, Target: fnB.UID, Kind: EdgeCalls, Confidence: 0.95, Tier: 3, Line: 7, Label: "qualified import"},
-		{Source: fnC.UID, Target: fnB.UID, Kind: EdgeLikelyCalls, Confidence: 0.60, Tier: 7, Line: 22, Label: "type narrowed"},
-		{Source: fnA.UID, Target: fnB.UID, Kind: EdgeImports, Confidence: 1.0}, // second dependency edge between fnA -> fnB
-		{Source: fnB.UID, Target: fnB.UID, Kind: EdgeCalls, Confidence: 1.0, Tier: 2, Line: 12, Label: "recursive"},
-	}
-	for _, e := range edges {
-		if err := g.AddEdge(e); err != nil {
-			t.Fatalf("AddEdge(%v) failed: %v", e, err)
-		}
-	}
-	mustAssertConsistent(t, g)
-
-	if g.EdgeCount() != len(edges) {
-		t.Fatalf("EdgeCount() = %d, want %d", g.EdgeCount(), len(edges))
-	}
-
 	// Duplicate AddEdge rejected
-	if err := g.AddEdge(&Edge{Source: fnA.UID, Target: fnB.UID, Kind: EdgeCalls, Confidence: 0.9}); !errors.Is(err, ErrEdgeExists) {
+	if err := g.AddEdge(Edge{Source: uA, Target: uB, Kind: EdgeCalls, Tier: TierLocal}); !errors.Is(err, ErrEdgeExists) {
 		t.Fatalf("duplicate AddEdge = %v, want ErrEdgeExists", err)
 	}
 
-	// Edge lookups & sorting
-	if _, ok := g.GetEdge(ZeroUID, fnB.UID, EdgeCalls); ok {
-		t.Fatal("GetEdge with ZeroUID should return false")
+	gotEdge, ok := g.GetEdge(uA, uB, EdgeCalls)
+	if !ok {
+		t.Fatal("GetEdge failed")
 	}
-	if !g.HasEdge(fnA.UID, fnB.UID, EdgeCalls) {
-		t.Fatal("HasEdge(fnA -> fnB, CALLS) = false, want true")
+	if gotEdge.Tier != TierQualifiedImport || gotEdge.ConfidenceLabel() != "certain" {
+		t.Fatalf("expected upgraded tier=%v, got %v", TierQualifiedImport, gotEdge.Tier)
 	}
-
-	// Callers of fnB: fnB (1.0), fnA (0.95), fnC (0.60)
-	callers := g.GetCallers(fnB.UID)
-	if len(callers) != 3 || callers[0].Source != fnB.UID || callers[1].Source != fnA.UID || callers[2].Source != fnC.UID {
-		t.Fatalf("GetCallers(fnB) order/content unexpected: %+v", callers)
+	if len(gotEdge.Sites) != 2 || gotEdge.Sites[0].Line != 7 || gotEdge.Sites[1].Line != 15 {
+		t.Fatalf("multi-site provenance lost: %+v", gotEdge.Sites)
 	}
-	callees := g.GetCallees(fnA.UID)
-	if len(callees) != 1 || callees[0].Target != fnB.UID {
-		t.Fatalf("GetCallees(fnA) unexpected: %+v", callees)
-	}
-
-	// Zero UID queries return nil
-	if g.GetCallers(ZeroUID) != nil || g.GetCallees(ZeroUID) != nil ||
-		g.GetIncomingEdges(ZeroUID) != nil || g.GetOutgoingEdges(ZeroUID) != nil ||
-		g.GetContains(ZeroUID) != nil || g.GetRevDeps(ZeroUID) != nil ||
-		g.GetDependentFiles(ZeroUID) != nil {
-		t.Fatal("zero UID index lookups should return nil")
+	// Mutating returned Sites does not affect graph
+	gotEdge.Sites[0].Line = 999
+	checkEdge, _ := g.GetEdge(uA, uB, EdgeCalls)
+	if checkEdge.Sites[0].Line != 7 {
+		t.Fatal("mutating Edge.Sites returned by GetEdge affected graph")
 	}
 
-	// Incoming / Outgoing filters
-	if in := g.GetIncomingEdges(fnB.UID, EdgeCalls); len(in) != 2 {
-		t.Fatalf("GetIncomingEdges(fnB, EdgeCalls) = %d, want 2", len(in))
+	// ReplaceEdge overwrites completely
+	if err := g.ReplaceEdge(Edge{
+		Source: uA,
+		Target: uB,
+		Kind:   EdgeCalls,
+		Tier:   TierLocal,
+		Sites:  []CallSiteRef{{Line: 25}},
+	}); err != nil {
+		t.Fatalf("ReplaceEdge failed: %v", err)
 	}
-	if inAll := g.GetIncomingEdges(fnB.UID); len(inAll) != 5 {
-		t.Fatalf("GetIncomingEdges(fnB) = %d, want 5", len(inAll))
-	}
-	if out := g.GetOutgoingEdges(fnA.UID, EdgeImports); len(out) != 1 {
-		t.Fatalf("GetOutgoingEdges(fnA, EdgeImports) = %d, want 1", len(out))
-	}
-	if none := g.GetOutgoingEdges(fnC.UID, EdgeInherits); len(none) != 0 {
-		t.Fatalf("expected 0 inherits edges, got %d", len(none))
+	replaced, _ := g.GetEdge(uA, uB, EdgeCalls)
+	if len(replaced.Sites) != 1 || replaced.Sites[0].Line != 25 || replaced.Tier != TierLocal {
+		t.Fatalf("ReplaceEdge did not replace completely: %+v", replaced)
 	}
 
-	// Contains ordering (by StartLine)
-	contained := g.GetContains(fileA.UID)
-	if len(contained) != 2 || contained[0].UID != fnA.UID || contained[1].UID != fnC.UID {
-		t.Fatalf("GetContains(fileA) unexpected: %+v", contained)
+	// Add structural & multiple dependency edges
+	_ = g.AddEdge(Edge{Source: uFileA, Target: uA, Kind: EdgeContains, Tier: TierStructural})
+	_ = g.AddEdge(Edge{Source: uFileA, Target: uC, Kind: EdgeContains, Tier: TierStructural})
+	_ = g.AddEdge(Edge{Source: uFileB, Target: uB, Kind: EdgeContains, Tier: TierStructural})
+	_ = g.AddEdge(Edge{Source: uA, Target: uB, Kind: EdgeImports, Tier: TierStructural})
+	_ = g.AddEdge(Edge{Source: uC, Target: uB, Kind: EdgeLikelyCalls, Tier: TierTypeNarrowed, Sites: []CallSiteRef{{Line: 22}}})
+	_ = g.AddEdge(Edge{Source: uB, Target: uB, Kind: EdgeCalls, Tier: TierLocal, Sites: []CallSiteRef{{Line: 12}}})
+	mustAssertConsistent(t, g)
+
+	// Callers sorted stronger tier first
+	callers := g.GetCallers(uB)
+	if len(callers) != 3 || callers[0].Tier != TierLocal || callers[1].Tier != TierLocal || callers[2].Tier != TierTypeNarrowed {
+		t.Fatalf("GetCallers ordering unexpected: %+v", callers)
 	}
 
 	// RevDeps & DependentFiles
-	revDeps := g.GetRevDeps(fnB.UID)
-	if len(revDeps) != 3 { // fnA, fnB, fnC
-		t.Fatalf("GetRevDeps(fnB) len = %d, want 3", len(revDeps))
+	if deps := g.GetRevDeps(uB); len(deps) != 3 {
+		t.Fatalf("GetRevDeps(uB) = %v, want 3 entries", deps)
 	}
-	depFiles := g.GetDependentFiles(fnB.UID)
-	if len(depFiles) != 2 || depFiles[0] != "a.go" || depFiles[1] != "b.go" {
-		t.Fatalf("GetDependentFiles(fnB) = %v, want [a.go b.go]", depFiles)
+	if files := g.GetDependentFiles(uB); len(files) != 2 || files[0] != "a.go" || files[1] != "b.go" {
+		t.Fatalf("GetDependentFiles(uB) = %v, want [a.go b.go]", files)
 	}
-	if g.GetRevDeps(fnA.UID) != nil || g.GetDependentFiles(fnA.UID) != nil {
-		t.Fatal("fnA has only CONTAINS incoming edge, should have no RevDeps")
+	if g.GetRevDeps(uA) != nil {
+		t.Fatal("uA only has CONTAINS incoming edge, should have no RevDeps")
 	}
 
-	// UpsertEdge updates existing edge metadata without duplicating
-	if err := g.UpsertEdge(&Edge{
-		Source:     fnC.UID,
-		Target:     fnB.UID,
-		Kind:       EdgeLikelyCalls,
-		Confidence: 0.75,
-		Tier:       7,
-		Line:       23,
-		Label:      "upgraded",
-	}); err != nil {
-		t.Fatalf("UpsertEdge existing failed: %v", err)
+	// Removing 1 of 2 dependency edges uA->uB preserves uA in RevDeps[uB]
+	if err := g.RemoveEdge(uA, uB, EdgeCalls); err != nil {
+		t.Fatalf("RemoveEdge failed: %v", err)
 	}
-	mustAssertConsistent(t, g)
-	upEdge, _ := g.GetEdge(fnC.UID, fnB.UID, EdgeLikelyCalls)
-	if upEdge.Confidence != 0.75 || upEdge.Label != "upgraded" {
-		t.Fatalf("UpsertEdge did not update edge: %+v", upEdge)
+	if !slices.Contains(g.GetRevDeps(uB), uA) {
+		t.Fatal("uA dropped from RevDeps while IMPORTS still exists")
 	}
-
-	// UpsertEdge adds new edge when absent
-	if err := g.UpsertEdge(&Edge{Source: fnA.UID, Target: fnC.UID, Kind: EdgeCalls, Confidence: 0.98, Tier: 2}); err != nil {
-		t.Fatalf("UpsertEdge new failed: %v", err)
+	_ = g.RemoveEdge(uA, uB, EdgeImports)
+	if slices.Contains(g.GetRevDeps(uB), uA) {
+		t.Fatal("uA remained in RevDeps after all dependency edges removed")
 	}
 	mustAssertConsistent(t, g)
 
-	// Removing 1 of 2 dependency edges between fnA -> fnB MUST keep fnA in RevDeps[fnB]
-	if err := g.RemoveEdge(fnA.UID, fnB.UID, EdgeCalls); err != nil {
-		t.Fatalf("RemoveEdge(fnA->fnB, CALLS) failed: %v", err)
+	// RemoveNode & free-list slot reuse
+	if err := g.RemoveNode(uB); err != nil {
+		t.Fatalf("RemoveNode failed: %v", err)
 	}
 	mustAssertConsistent(t, g)
-	if !containsUID(g.GetRevDeps(fnB.UID), fnA.UID) {
-		t.Fatal("fnA dropped from RevDeps[fnB] while IMPORTS edge still exists")
+	if g.HasEdge(uB, uB, EdgeCalls) || g.HasEdge(uFileB, uB, EdgeContains) {
+		t.Fatal("incident edges remained after RemoveNode")
 	}
 
-	// Removing the 2nd dependency edge between fnA -> fnB MUST remove fnA from RevDeps[fnB]
-	if err := g.RemoveEdge(fnA.UID, fnB.UID, EdgeImports); err != nil {
-		t.Fatalf("RemoveEdge(fnA->fnB, IMPORTS) failed: %v", err)
+	// Re-insert into free slot and verify consistency
+	newUID, err := g.AddNode(Node{Kind: KindFunction, Name: "NewTarget", QName: "pkg::NewTarget", File: "b.go", StartLine: 15})
+	if err != nil || newUID.IsZero() {
+		t.Fatalf("AddNode reusing free slot failed: %v", err)
 	}
-	mustAssertConsistent(t, g)
-	if containsUID(g.GetRevDeps(fnB.UID), fnA.UID) {
-		t.Fatal("fnA remained in RevDeps[fnB] after all dependency edges removed")
-	}
-
-	// RemoveEdge errors
-	if err := g.RemoveEdge(ZeroUID, fnB.UID, EdgeCalls); !errors.Is(err, ErrEdgeNotFound) {
-		t.Fatalf("RemoveEdge(ZeroUID) = %v, want ErrEdgeNotFound", err)
-	}
-	if err := g.RemoveEdge(fnA.UID, fnB.UID, EdgeCalls); !errors.Is(err, ErrEdgeNotFound) {
-		t.Fatalf("RemoveEdge(missing) = %v, want ErrEdgeNotFound", err)
-	}
-
-	// RemoveEdge CONTAINS cleans up contains index
-	if err := g.RemoveEdge(fileA.UID, fnC.UID, EdgeContains); err != nil {
-		t.Fatalf("RemoveEdge CONTAINS failed: %v", err)
-	}
-	mustAssertConsistent(t, g)
-	if len(g.GetContains(fileA.UID)) != 1 {
-		t.Fatal("contains index not updated after RemoveEdge CONTAINS")
-	}
-
-	// AllEdges deterministic ordering
-	allEdges := g.AllEdges()
-	for i := 1; i < len(allEdges); i++ {
-		if compareEdgesCanonical(allEdges[i-1], allEdges[i]) >= 0 {
-			t.Fatal("AllEdges not sorted canonically")
-		}
-	}
-
-	// RemoveNode cascades self-loops, callers, callees, contains, revDeps
-	if err := g.RemoveNode(fnB.UID); err != nil {
-		t.Fatalf("RemoveNode(fnB) failed: %v", err)
-	}
-	mustAssertConsistent(t, g)
-	if g.HasEdge(fnB.UID, fnB.UID, EdgeCalls) || g.HasEdge(fileB.UID, fnB.UID, EdgeContains) {
-		t.Fatal("incident edges remained after RemoveNode(fnB)")
-	}
-
-	// RemoveFile removes all remaining nodes in a.go and their edges
-	if n := g.RemoveFile(""); n != 0 {
-		t.Fatalf("RemoveFile('') = %d, want 0", n)
-	}
-	removed := g.RemoveFile("a.go")
-	if removed != 3 { // fileA, fnA, fnC
-		t.Fatalf("RemoveFile('a.go') = %d, want 3", removed)
-	}
-	mustAssertConsistent(t, g)
-	if g.NodeCount() != 1 || g.EdgeCount() != 0 { // only fileB remains
-		t.Fatalf("after RemoveFile('a.go'), nodes=%d edges=%d, want 1, 0", g.NodeCount(), g.EdgeCount())
-	}
-
-	// RebuildIndexes preserves everything cleanly
-	if err := g.AddNode(fnA); err != nil {
-		t.Fatalf("AddNode failed: %v", err)
-	}
-	if err := g.AddEdge(&Edge{Source: fileB.UID, Target: fnA.UID, Kind: EdgeImports, Confidence: 1}); err != nil {
-		t.Fatalf("AddEdge failed: %v", err)
-	}
-	g.RebuildIndexes()
 	mustAssertConsistent(t, g)
 }
 
-func TestGraphVerifyIndexConsistencyDetectsCorruption(t *testing.T) {
-	buildSample := func() (*Graph, *Node, *Node, *Edge) {
+func TestAtomicReplaceFileAndNegativeDependencies(t *testing.T) {
+	g := New()
+
+	// Setup a.go defining Caller + Helper, and b.go defining Target and calling Caller,
+	// plus an unresolved CallSite in b.go looking for "NewFeature".
+	sigV1 := ComputeSignatureHash([]Param{{Name: "x", Type: "int"}}, "int")
+	sigV2 := ComputeSignatureHash([]Param{{Name: "x", Type: "string"}}, "int")
+
+	fileANode := Node{Kind: KindFile, Name: "a.go", File: "a.go", StartLine: 1}
+	callerNode := Node{Kind: KindFunction, Name: "Caller", QName: "pkg::Caller", File: "a.go", StartLine: 5, SignatureHash: sigV1}
+	vanishingNode := Node{Kind: KindFunction, Name: "OldHelper", QName: "pkg::OldHelper", File: "a.go", StartLine: 15}
+	fileBNode := Node{Kind: KindFile, Name: "b.go", File: "b.go", StartLine: 1}
+	bFuncNode := Node{Kind: KindFunction, Name: "UseA", QName: "pkg::UseA", File: "b.go", StartLine: 5}
+
+	uFileA, _ := g.AddNode(fileANode)
+	uCaller, _ := g.AddNode(callerNode)
+	uVanish, _ := g.AddNode(vanishingNode)
+	uFileB, _ := g.AddNode(fileBNode)
+	uBFunc, _ := g.AddNode(bFuncNode)
+
+	_ = g.AddEdge(Edge{Source: uFileA, Target: uCaller, Kind: EdgeContains, Tier: TierStructural})
+	_ = g.AddEdge(Edge{Source: uFileA, Target: uVanish, Kind: EdgeContains, Tier: TierStructural})
+	_ = g.AddEdge(Edge{Source: uFileB, Target: uBFunc, Kind: EdgeContains, Tier: TierStructural})
+	// Cross-file incoming dependencies from b.go -> Caller (survivor) and OldHelper (will vanish)
+	_ = g.AddEdge(Edge{Source: uBFunc, Target: uCaller, Kind: EdgeCalls, Tier: TierSamePackage, Sites: []CallSiteRef{{Line: 7}}})
+	_ = g.AddEdge(Edge{Source: uBFunc, Target: uVanish, Kind: EdgeCalls, Tier: TierSamePackage, Sites: []CallSiteRef{{Line: 9}}})
+	// Old outgoing edge from Caller -> OldHelper (should be removed on ReplaceFile)
+	_ = g.AddEdge(Edge{Source: uCaller, Target: uVanish, Kind: EdgeCalls, Tier: TierLocal, Sites: []CallSiteRef{{Line: 6}}})
+
+	// Unresolved call site in b.go looking for "NewFeature"
+	if err := g.AddCallSite(CallSite{
+		Caller:     uBFunc,
+		File:       "b.go",
+		Line:       11,
+		CalleeExpr: "NewFeature()",
+		LookupKey:  "pkg::NewFeature",
+		Status:     CallStatusUnresolved,
+		Tier:       TierUnresolved,
+	}); err != nil {
+		t.Fatalf("AddCallSite failed: %v", err)
+	}
+	mustAssertConsistent(t, g)
+
+	// Invalid ReplaceFile (dangling target) MUST NOT mutate graph at all
+	_, err := g.ReplaceFile("a.go", []Node{fileANode}, []Edge{
+		{Source: uFileA, Target: GenerateNodeUID(KindFunction, "missing", 0), Kind: EdgeContains, Tier: TierStructural},
+	}, nil)
+	if !errors.Is(err, ErrNodeNotFound) {
+		t.Fatalf("expected atomic ErrNodeNotFound on invalid ReplaceFile, got %v", err)
+	}
+	if !g.HasNode(uVanish) || !g.HasEdge(uBFunc, uCaller, EdgeCalls) {
+		t.Fatal("failed ReplaceFile partially mutated graph")
+	}
+
+	// Valid ReplaceFile on a.go:
+	// - Caller survives (line moved 5->12, signature changed sigV1->sigV2)
+	// - OldHelper vanishes
+	// - NewFeature is added (matches unresolved CallSite in b.go!)
+	updatedCaller := callerNode
+	updatedCaller.StartLine = 12
+	updatedCaller.SignatureHash = sigV2
+	newFeature := Node{Kind: KindFunction, Name: "NewFeature", QName: "pkg::NewFeature", File: "a.go", StartLine: 30}
+	uNewFeat := ComputeNodeUID(newFeature)
+
+	res, err := g.ReplaceFile(
+		"a.go",
+		[]Node{fileANode, updatedCaller, newFeature},
+		[]Edge{
+			{Source: uFileA, Target: uCaller, Kind: EdgeContains, Tier: TierStructural},
+			{Source: uFileA, Target: uNewFeat, Kind: EdgeContains, Tier: TierStructural},
+			{Source: uCaller, Target: uNewFeat, Kind: EdgeCalls, Tier: TierLocal, Sites: []CallSiteRef{{Line: 14}}},
+		},
+		nil,
+	)
+	if err != nil {
+		t.Fatalf("ReplaceFile failed: %v", err)
+	}
+	mustAssertConsistent(t, g)
+
+	if res.Added != 1 || res.Updated != 2 || res.Removed != 1 {
+		t.Fatalf("unexpected ReplaceResult counts: %+v", res)
+	}
+	// Surviving UID keeps incoming cross-file edge from b.go!
+	if !g.HasEdge(uBFunc, uCaller, EdgeCalls) {
+		t.Fatal("ReplaceFile lost incoming cross-file edge onto surviving UID")
+	}
+	if gotCaller, _ := g.GetNode(uCaller); gotCaller.StartLine != 12 {
+		t.Fatalf("surviving node not updated in place: StartLine=%d", gotCaller.StartLine)
+	}
+	// Lost dependents collected BEFORE deletion
+	if len(res.LostCallerUIDs) != 1 || res.LostCallerUIDs[0] != uBFunc {
+		t.Fatalf("LostCallerUIDs = %v, want [%s]", res.LostCallerUIDs, uBFunc)
+	}
+	// Signature change detected
+	if len(res.SignatureChanged) != 1 || res.SignatureChanged[0] != uCaller {
+		t.Fatalf("SignatureChanged = %v, want [%s]", res.SignatureChanged, uCaller)
+	}
+	// Negative dependency matched unresolved CallSite in b.go!
+	if len(res.PotentiallyResolvedCallSites) != 1 || res.PotentiallyResolvedCallSites[0].Caller != uBFunc {
+		t.Fatalf("PotentiallyResolvedCallSites = %+v", res.PotentiallyResolvedCallSites)
+	}
+	if len(res.AffectedLookupKeys) != 1 || res.AffectedLookupKeys[0] != "pkg::NewFeature" {
+		t.Fatalf("AffectedLookupKeys = %v", res.AffectedLookupKeys)
+	}
+	if len(res.AffectedFiles) != 1 || res.AffectedFiles[0] != "b.go" {
+		t.Fatalf("AffectedFiles = %v, want [b.go]", res.AffectedFiles)
+	}
+}
+
+func TestViewConsistencyAgainstConcurrentReplaceFile(t *testing.T) {
+	g := New()
+	fileA := Node{Kind: KindFile, Name: "a.go", File: "a.go", StartLine: 1}
+	fn1 := Node{Kind: KindFunction, Name: "V1", QName: "pkg::V1", File: "a.go", StartLine: 5}
+	fn2 := Node{Kind: KindFunction, Name: "V2", QName: "pkg::V2", File: "a.go", StartLine: 20}
+	uFileA := ComputeNodeUID(fileA)
+	uFn1 := ComputeNodeUID(fn1)
+	uFn2 := ComputeNodeUID(fn2)
+
+	_, err := g.ReplaceFile("a.go", []Node{fileA, fn1}, []Edge{
+		{Source: uFileA, Target: uFn1, Kind: EdgeContains, Tier: TierStructural},
+	}, nil)
+	if err != nil {
+		t.Fatalf("initial ReplaceFile failed: %v", err)
+	}
+
+	var stop atomic.Bool
+	var writerWG sync.WaitGroup
+	writerWG.Add(1)
+	go func() {
+		defer writerWG.Done()
+		for i := 0; i < 1500; i++ {
+			if i%2 == 0 {
+				_, _ = g.ReplaceFile("a.go", []Node{fileA, fn2}, []Edge{
+					{Source: uFileA, Target: uFn2, Kind: EdgeContains, Tier: TierStructural},
+				}, nil)
+			} else {
+				_, _ = g.ReplaceFile("a.go", []Node{fileA, fn1}, []Edge{
+					{Source: uFileA, Target: uFn1, Kind: EdgeContains, Tier: TierStructural},
+				}, nil)
+			}
+		}
+		stop.Store(true)
+	}()
+
+	var tornReads atomic.Int64
+	var readerWG sync.WaitGroup
+	for r := 0; r < 4; r++ {
+		readerWG.Add(1)
+		go func() {
+			defer readerWG.Done()
+			for !stop.Load() {
+				g.View(func(v *ReadView) {
+					nodes := v.GetByFile("a.go")
+					children := v.GetContains(uFileA)
+					if len(nodes) != 2 || len(children) != 1 || v.NodeCount() != 2 || v.EdgeCount() != 1 {
+						tornReads.Add(1)
+					}
+				})
+			}
+		}()
+	}
+
+	writerWG.Wait()
+	readerWG.Wait()
+	if torn := tornReads.Load(); torn != 0 {
+		t.Fatalf("observed %d torn reads during View()", torn)
+	}
+	mustAssertConsistent(t, g)
+}
+
+func TestMergeFragmentsParallelAndAtomic(t *testing.T) {
+	var g Graph
+
+	const numFiles = 12
+	frags := make([]FileFragment, numFiles)
+	var wg sync.WaitGroup
+	for i := 0; i < numFiles; i++ {
+		wg.Add(1)
+		go func(idx int) {
+			defer wg.Done()
+			file := fmt.Sprintf("pkg/f%d.go", idx)
+			fn := Node{
+				Kind:      KindFunction,
+				Name:      fmt.Sprintf("Fn%d", idx),
+				QName:     fmt.Sprintf("pkg::Fn%d", idx),
+				File:      file,
+				StartLine: 10,
+			}
+			fNode := Node{Kind: KindFile, Name: fmt.Sprintf("f%d.go", idx), File: file, StartLine: 1}
+			uFile := ComputeNodeUID(fNode)
+			uFn := ComputeNodeUID(fn)
+			edges := []Edge{{Source: uFile, Target: uFn, Kind: EdgeContains, Tier: TierStructural}}
+			if idx > 0 {
+				prevTarget := GenerateNodeUID(KindFunction, fmt.Sprintf("pkg::Fn%d", idx-1), 0)
+				edges = append(edges, Edge{
+					Source: uFn,
+					Target: prevTarget,
+					Kind:   EdgeCalls,
+					Tier:   TierSamePackage,
+					Sites:  []CallSiteRef{{Line: 12}},
+				})
+			}
+			frags[idx] = FileFragment{
+				File:  file,
+				Nodes: []Node{fNode, fn},
+				Edges: edges,
+				CallSites: []CallSite{{
+					Caller:    uFn,
+					File:      file,
+					Line:      14,
+					LookupKey: "fmt.Println",
+					Status:    CallStatusExternal,
+					Tier:      TierUnresolved,
+				}},
+			}
+		}(i)
+	}
+	wg.Wait()
+
+	if err := g.MergeFragments(frags); err != nil {
+		t.Fatalf("MergeFragments failed: %v", err)
+	}
+	mustAssertConsistent(t, &g)
+	if g.NodeCount() != numFiles*2 || g.EdgeCount() != numFiles+(numFiles-1) || g.CallSiteCount() != numFiles {
+		t.Fatalf("unexpected counts after MergeFragments: nodes=%d edges=%d sites=%d", g.NodeCount(), g.EdgeCount(), g.CallSiteCount())
+	}
+	if !g.HasCallSiteForLookup("fmt.Println") || len(g.GetCallSitesByLookupKey("fmt.Println")) != numFiles {
+		t.Fatal("CallSites not indexed properly during MergeFragments")
+	}
+
+	// Atomicity test on missing endpoint
+	bad := []FileFragment{{
+		File:  "bad.go",
+		Nodes: []Node{{Kind: KindFile, Name: "bad.go", File: "bad.go"}},
+		Edges: []Edge{{
+			Source: GenerateNodeUID(KindFile, "bad.go", 0),
+			Target: GenerateNodeUID(KindFunction, "nonexistent", 0),
+			Kind:   EdgeContains,
+			Tier:   TierStructural,
+		}},
+	}}
+	if err := g.MergeFragments(bad); !errors.Is(err, ErrNodeNotFound) {
+		t.Fatalf("expected ErrNodeNotFound, got %v", err)
+	}
+	if g.NodeCount() != numFiles*2 {
+		t.Fatal("failed MergeFragments partially mutated graph")
+	}
+}
+
+func TestVerifyIndexConsistencyDetectsCorruption(t *testing.T) {
+	buildSample := func() (*Graph, UID, UID) {
 		g := New()
-		n1 := &Node{Kind: KindFile, Name: "a.go", QName: "file::a.go", File: "a.go", StartLine: 1}
-		n2 := &Node{Kind: KindFunction, Name: "Foo", QName: "pkg::Foo", File: "a.go", StartLine: 5}
-		_ = g.AddNode(n1)
-		_ = g.AddNode(n2)
-		e1 := &Edge{Source: n1.UID, Target: n2.UID, Kind: EdgeContains, Confidence: 1}
-		e2 := &Edge{Source: n2.UID, Target: n1.UID, Kind: EdgeImports, Confidence: 1}
-		_ = g.AddEdge(e1)
-		_ = g.AddEdge(e2)
-		return g, n1, n2, e1
+		u1, _ := g.AddNode(Node{Kind: KindFile, Name: "a.go", File: "a.go", StartLine: 1})
+		u2, _ := g.AddNode(Node{Kind: KindFunction, Name: "Foo", QName: "pkg::Foo", File: "a.go", StartLine: 5})
+		_ = g.AddEdge(Edge{Source: u1, Target: u2, Kind: EdgeContains, Tier: TierStructural})
+		_ = g.AddEdge(Edge{Source: u2, Target: u1, Kind: EdgeImports, Tier: TierStructural})
+		return g, u1, u2
 	}
 
-	// Corrupt nodes map
-	g, n1, n2, _ := buildSample()
-	g.nodes[n1.UID] = nil
+	g, u1, _ := buildSample()
+	g.uidToID[u1] = 99
 	if err := g.VerifyIndexConsistency(); err == nil {
-		t.Fatal("expected error for nil node in g.nodes")
+		t.Fatal("expected error for uidToID mismatch")
 	}
 
-	g, n1, _, _ = buildSample()
-	wrongUID := GenerateUID("other", "x")
-	g.nodes[wrongUID] = n1
-	if err := g.VerifyIndexConsistency(); err == nil {
-		t.Fatal("expected error for UID key mismatch")
-	}
-
-	// Corrupt byName
-	g, _, _, _ = buildSample()
-	g.byName["empty"] = []*Node{}
-	if err := g.VerifyIndexConsistency(); err == nil {
-		t.Fatal("expected error for empty byName slice")
-	}
-
-	g, n1, _, _ = buildSample()
-	g.byName["wrong"] = []*Node{n1}
+	g, _, _ = buildSample()
+	g.byName["wrong"] = idList{hasFirst: true, first: 0}
 	if err := g.VerifyIndexConsistency(); err == nil {
 		t.Fatal("expected error for byName key mismatch")
 	}
 
-	g, n1, _, _ = buildSample()
-	g.byName[n1.Name] = append(g.byName[n1.Name], n1)
-	if err := g.VerifyIndexConsistency(); err == nil {
-		t.Fatal("expected error for duplicate in byName")
-	}
-
-	g, _, _, _ = buildSample()
-	g.byName["ghost"] = []*Node{{UID: GenerateUID("ghost", "1"), Name: "ghost"}}
-	if err := g.VerifyIndexConsistency(); err == nil {
-		t.Fatal("expected error for unknown node in byName")
-	}
-
-	g, _, n2, _ = buildSample()
+	g, _, _ = buildSample()
 	delete(g.byFile, "a.go")
 	if err := g.VerifyIndexConsistency(); err == nil {
-		t.Fatal("expected error for missing byFile entries")
-	}
-	_ = n2
-
-	g, _, _, _ = buildSample()
-	delete(g.byQName, "pkg::Foo")
-	if err := g.VerifyIndexConsistency(); err == nil {
-		t.Fatal("expected error for missing byQName entries")
+		t.Fatal("expected error for missing byFile entry")
 	}
 
-	// Corrupt edges & edge indexes
-	g, n1, n2, _ = buildSample()
-	g.edges[edgeKey{source: n1.UID, target: n2.UID, kind: EdgeContains}] = nil
-	if err := g.VerifyIndexConsistency(); err == nil {
-		t.Fatal("expected error for nil edge")
-	}
-
-	g, n1, n2, _ = buildSample()
-	g.edges[edgeKey{source: n2.UID, target: n1.UID, kind: EdgeCalls}] = &Edge{Source: n1.UID, Target: n2.UID, Kind: EdgeCalls}
-	if err := g.VerifyIndexConsistency(); err == nil {
-		t.Fatal("expected error for edgeKey mismatch")
-	}
-
-	g, _, n2, _ = buildSample()
-	delete(g.nodes, n2.UID)
+	g, _, _ = buildSample()
+	g.edges[0].target = 99
 	if err := g.VerifyIndexConsistency(); err == nil {
 		t.Fatal("expected error for dangling edge target")
 	}
 
-	g, n1, _, _ = buildSample()
-	delete(g.nodes, n1.UID)
+	g, _, _ = buildSample()
+	g.outgoing[0] = append(g.outgoing[0], 0)
 	if err := g.VerifyIndexConsistency(); err == nil {
-		t.Fatal("expected error for dangling edge source")
+		t.Fatal("expected error for duplicate outgoing adjacency")
 	}
 
-	// Corrupt outgoing/incoming/callers/callees
-	g, n1, _, _ = buildSample()
-	g.outgoing[n1.UID] = []*Edge{}
-	if err := g.VerifyIndexConsistency(); err == nil {
-		t.Fatal("expected error for empty outgoing slice")
-	}
-
-	g, n1, _, _ = buildSample()
-	g.incoming[n1.UID] = append(g.incoming[n1.UID], g.incoming[n1.UID][0])
-	if err := g.VerifyIndexConsistency(); err == nil {
-		t.Fatal("expected error for duplicate incoming edge")
-	}
-
-	g, n1, n2, _ = buildSample()
-	_ = g.AddEdge(&Edge{Source: n2.UID, Target: n2.UID, Kind: EdgeCalls, Confidence: 1})
-	g.callers[n1.UID] = []*Edge{{Source: n2.UID, Target: n2.UID, Kind: EdgeCalls, Confidence: 1}}
-	if err := g.VerifyIndexConsistency(); err == nil {
-		t.Fatal("expected error for callers stale/key mismatch")
-	}
-
-	g, _, n2, _ = buildSample()
-	_ = g.AddEdge(&Edge{Source: n2.UID, Target: n2.UID, Kind: EdgeCalls, Confidence: 1})
-	delete(g.callees, n2.UID)
-	if err := g.VerifyIndexConsistency(); err == nil {
-		t.Fatal("expected error for callees count mismatch")
-	}
-
-	// Corrupt contains
-	g, n1, _, _ = buildSample()
-	g.contains[n1.UID] = []*Node{}
-	if err := g.VerifyIndexConsistency(); err == nil {
-		t.Fatal("expected error for empty contains slice")
-	}
-
-	g, n1, _, _ = buildSample()
-	g.contains[n1.UID] = []*Node{nil}
-	if err := g.VerifyIndexConsistency(); err == nil {
-		t.Fatal("expected error for nil in contains")
-	}
-
-	g, n1, n2, _ = buildSample()
-	g.contains[n1.UID] = []*Node{n2.Clone()}
-	if err := g.VerifyIndexConsistency(); err == nil {
-		t.Fatal("expected error for stale pointer in contains")
-	}
-
-	g, n1, n2, _ = buildSample()
-	g.contains[n1.UID] = append(g.contains[n1.UID], g.nodes[n2.UID])
-	if err := g.VerifyIndexConsistency(); err == nil {
-		t.Fatal("expected error for duplicate in contains")
-	}
-
-	g, n1, n2, _ = buildSample()
-	g.contains[n2.UID] = []*Node{g.nodes[n1.UID]}
-	if err := g.VerifyIndexConsistency(); err == nil {
-		t.Fatal("expected error for contains without CONTAINS edge")
-	}
-
-	g, n1, _, _ = buildSample()
-	delete(g.contains, n1.UID)
-	if err := g.VerifyIndexConsistency(); err == nil {
-		t.Fatal("expected error for contains count mismatch")
-	}
-
-	// Corrupt revDeps
-	g, n1, n2, _ = buildSample()
-	delete(g.revDeps, n1.UID)
-	if err := g.VerifyIndexConsistency(); err == nil {
-		t.Fatal("expected error for revDeps key count mismatch")
-	}
-
-	g, n1, _, _ = buildSample()
-	g.revDeps[n1.UID][n1.UID] = struct{}{}
-	if err := g.VerifyIndexConsistency(); err == nil {
-		t.Fatal("expected error for revDeps size mismatch")
-	}
-
-	g, n1, n2, _ = buildSample()
-	delete(g.revDeps[n1.UID], n2.UID)
-	g.revDeps[n1.UID][n1.UID] = struct{}{}
-	if err := g.VerifyIndexConsistency(); err == nil {
-		t.Fatal("expected error for revDeps source mismatch")
-	}
-}
-
-func TestGraphConcurrency(t *testing.T) {
-	g := New()
-	const workers = 8
-	const perWorker = 50
-
-	var wg sync.WaitGroup
-	for w := 0; w < workers; w++ {
-		wg.Add(1)
-		go func(id int) {
-			defer wg.Done()
-			file := fmt.Sprintf("pkg/file_%d.go", id)
-			var prev *Node
-			for i := 0; i < perWorker; i++ {
-				n := &Node{
-					Kind:      KindFunction,
-					Name:      fmt.Sprintf("Fn_%d_%d", id, i),
-					QName:     fmt.Sprintf("pkg::Fn_%d_%d", id, i),
-					File:      file,
-					StartLine: uint32(i + 1),
-				}
-				if err := g.AddNode(n); err != nil {
-					t.Errorf("AddNode failed: %v", err)
-					return
-				}
-				if prev != nil {
-					_ = g.UpsertEdge(&Edge{
-						Source:     prev.UID,
-						Target:     n.UID,
-						Kind:       EdgeCalls,
-						Confidence: 0.95,
-						Tier:       2,
-					})
-				}
-				prev = n
-				_ = g.GetByName(n.Name)
-				_ = g.GetByFile(file)
-				_, _ = g.GetByQName(n.QName)
-				_ = g.GetCallers(n.UID)
-				_ = g.GetCallees(n.UID)
-			}
-			// Update one node and verify Reads/Writes don't race
-			if prev != nil {
-				cp := prev.Clone()
-				cp.EndLine = cp.StartLine + 10
-				_ = g.UpsertNode(cp)
-			}
-		}(w)
-	}
-	wg.Wait()
-
-	mustAssertConsistent(t, g)
-	if g.NodeCount() != workers*perWorker {
-		t.Fatalf("NodeCount() = %d, want %d", g.NodeCount(), workers*perWorker)
-	}
-
-	// Concurrent removals & reads
-	wg = sync.WaitGroup{}
-	for w := 0; w < workers; w++ {
-		wg.Add(1)
-		go func(id int) {
-			defer wg.Done()
-			if id%2 == 0 {
-				g.RemoveFile(fmt.Sprintf("pkg/file_%d.go", id))
-			} else {
-				_ = g.AllNodes()
-				_ = g.AllEdges()
-			}
-		}(w)
-	}
-	wg.Wait()
-
-	mustAssertConsistent(t, g)
-	if g.NodeCount() != (workers/2)*perWorker {
-		t.Fatalf("NodeCount() after concurrent RemoveFile = %d, want %d", g.NodeCount(), (workers/2)*perWorker)
-	}
-}
-
-func TestGraphSortingTieBreakersAndEdgeCases(t *testing.T) {
-	g := New()
-
-	// Multiple nodes in same file & start line to exercise every tie-breaker in sortNodesByLocation
-	n1 := &Node{Kind: KindFunction, Name: "Alpha", QName: "pkg::Alpha", File: "a.go", StartLine: 10, EndLine: 20}
-	n2 := &Node{Kind: KindFunction, Name: "Alpha", QName: "pkg::Alpha2", File: "a.go", StartLine: 10, EndLine: 25}
-	n3 := &Node{Kind: KindStruct, Name: "Alpha", QName: "pkg::StructAlpha", File: "a.go", StartLine: 10, EndLine: 25}
-	n4 := &Node{Kind: KindFunction, Name: "Alpha", QName: "pkg::Alpha_overload", File: "a.go", StartLine: 10, EndLine: 25, Params: []Param{{Name: "x", Type: "int"}}}
-	n5 := &Node{Kind: KindFunction, Name: "Beta", QName: "pkg::Beta", File: "a.go", StartLine: 10, EndLine: 25}
-	// External node without File depending on n1
-	ext := &Node{Kind: KindModule, Name: "ext", QName: "ext"}
-
-	for _, n := range []*Node{n1, n2, n3, n4, n5, ext} {
-		if err := g.AddNode(n); err != nil {
-			t.Fatalf("AddNode failed: %v", err)
-		}
-	}
-
-	byName := g.GetByName("Alpha")
-	if len(byName) != 4 {
-		t.Fatalf("len(GetByName(Alpha)) = %d, want 4", len(byName))
-	}
-
-	// Fileless dependent edge: ext -> n1 (IMPORTS)
-	if err := g.AddEdge(&Edge{Source: ext.UID, Target: n1.UID, Kind: EdgeImports, Confidence: 1}); err != nil {
-		t.Fatalf("AddEdge failed: %v", err)
-	}
-	if files := g.GetDependentFiles(n1.UID); files != nil {
-		t.Fatalf("expected nil GetDependentFiles for fileless dependent, got %v", files)
-	}
-
-	// Empty incoming/outgoing edges return nil
-	if edges := g.GetIncomingEdges(n5.UID, EdgeCalls); edges != nil {
-		t.Fatalf("expected nil incoming edges, got %v", edges)
-	}
-
-	// Multiple callers with identical confidence -> exercise Tier, Line, Source tie-breakers in sortCallEdges
-	_ = g.AddEdge(&Edge{Source: n2.UID, Target: n1.UID, Kind: EdgeCalls, Confidence: 0.90, Tier: 4, Line: 30})
-	_ = g.AddEdge(&Edge{Source: n3.UID, Target: n1.UID, Kind: EdgeCalls, Confidence: 0.90, Tier: 3, Line: 50})
-	_ = g.AddEdge(&Edge{Source: n4.UID, Target: n1.UID, Kind: EdgeCalls, Confidence: 0.90, Tier: 4, Line: 10})
-	_ = g.AddEdge(&Edge{Source: n5.UID, Target: n1.UID, Kind: EdgeCalls, Confidence: 0.90, Tier: 4, Line: 10})
-
-	callers := g.GetCallers(n1.UID)
-	if len(callers) != 4 {
-		t.Fatalf("len(GetCallers) = %d, want 4", len(callers))
-	}
-	// First caller must be tier 3 (n3)
-	if callers[0].Source != n3.UID {
-		t.Fatalf("expected tier-3 caller first, got tier %d", callers[0].Tier)
-	}
-	// Last caller must be line 30 (n2)
-	if callers[3].Source != n2.UID {
-		t.Fatalf("expected line-30 caller last, got line %d", callers[3].Line)
-	}
-
-	// VerifyIndexConsistency check for nil edge in edge index
-	g.outgoing[n2.UID][0] = nil
-	if err := g.VerifyIndexConsistency(); err == nil {
-		t.Fatal("expected error for nil edge in outgoing index")
-	}
 	g.RebuildIndexes()
 	mustAssertConsistent(t, g)
 }
 
-func containsUID(list []UID, target UID) bool {
-	for _, u := range list {
-		if u == target {
-			return true
-		}
-	}
-	return false
-}
+func TestQueriesReadViewRemoveFileAndErrorPaths(t *testing.T) {
+	g := NewWithCapacity(10, 10)
+	n1 := Node{Kind: KindFile, Name: "x.go", File: "x.go", StartLine: 1}
+	n2 := Node{Kind: KindFunction, Name: "F1", QName: "pkg::F1", File: "x.go", StartLine: 5, EndLine: 10, Decorators: []string{"@a"}, Bases: []string{"B"}}
+	n3 := Node{Kind: KindFunction, Name: "F1", QName: "pkg::F1_other", File: "x.go", StartLine: 5, EndLine: 12}
+	n4 := Node{Kind: KindStruct, Name: "F1", QName: "pkg::S1", File: "x.go", StartLine: 5, EndLine: 12}
+	n5 := Node{Kind: KindFunction, Name: "G1", QName: "pkg::G1", File: "y.go", StartLine: 5, EndLine: 12}
 
+	u1, _ := g.AddNode(n1)
+	u2, _ := g.AddNode(n2)
+	u3, _ := g.AddNode(n3)
+	u4, _ := g.AddNode(n4)
+	u5, _ := g.AddNode(n5)
+
+	_ = g.AddEdge(Edge{Source: u1, Target: u2, Kind: EdgeContains, Tier: TierStructural})
+	_ = g.AddEdge(Edge{Source: u2, Target: u5, Kind: EdgeCalls, Tier: TierLocal, Sites: []CallSiteRef{{Line: 7, Label: "direct"}}})
+	_ = g.AddEdge(Edge{Source: u2, Target: u5, Kind: EdgeImports, Tier: TierStructural})
+	_ = g.UpsertEdge(Edge{Source: u3, Target: u5, Kind: EdgeCalls, Tier: TierSamePackage, Sites: []CallSiteRef{{Line: 8}}})
+	_ = g.UpsertEdge(Edge{Source: u2, Target: u5, Kind: EdgeCalls, Tier: TierLocal, Sites: []CallSiteRef{{Line: 7, Label: "updated"}}})
+
+	_ = g.AddCallSite(CallSite{Caller: u2, File: "x.go", Line: 9, LookupKey: "Missing", Status: CallStatusUnresolved, Tier: TierUnresolved})
+	_ = g.AddCallSite(CallSite{Caller: u5, File: "y.go", Line: 10, LookupKey: "Missing2", Status: CallStatusExternal, Tier: TierUnresolved})
+
+	// Bulk & directional queries on Graph and ReadView
+	if len(g.AllNodes()) != 5 || len(g.AllEdges()) != 4 {
+		t.Fatalf("unexpected AllNodes/AllEdges counts: %d/%d", len(g.AllNodes()), len(g.AllEdges()))
+	}
+	if len(g.GetByName("F1")) != 3 {
+		t.Fatalf("expected 3 nodes named F1, got %d", len(g.GetByName("F1")))
+	}
+	if len(g.GetCallees(u2)) != 1 {
+		t.Fatalf("expected 1 callee edge from u2, got %d", len(g.GetCallees(u2)))
+	}
+	if len(g.GetIncomingEdges(u5)) != 3 || len(g.GetIncomingEdges(u5, EdgeImports)) != 1 {
+		t.Fatal("GetIncomingEdges mismatch")
+	}
+	if len(g.GetOutgoingEdges(u2)) != 2 || len(g.GetOutgoingEdges(u2, EdgeCalls)) != 1 {
+		t.Fatal("GetOutgoingEdges mismatch")
+	}
+	if len(g.GetCallSites()) != 2 || len(g.GetCallSitesByFile("x.go")) != 1 {
+		t.Fatal("GetCallSites/GetCallSitesByFile mismatch")
+	}
+
+	g.View(func(v *ReadView) {
+		if v.NodeCount() != 5 || v.EdgeCount() != 4 || v.CallSiteCount() != 2 {
+			t.Fatal("ReadView count mismatch")
+		}
+		if n, ok := v.GetNode(u2); !ok || n.Name != "F1" || !v.HasNode(u2) {
+			t.Fatal("ReadView node lookup mismatch")
+		}
+		if e, ok := v.GetEdge(u2, u5, EdgeCalls); !ok || !v.HasEdge(u2, u5, EdgeCalls) || len(e.Sites) != 1 || e.Sites[0].Label != "updated" {
+			t.Fatalf("ReadView edge lookup mismatch: %+v", e)
+		}
+		if len(v.AllNodes()) != 5 || len(v.AllEdges()) != 4 || len(v.GetByQName("pkg::F1")) != 1 {
+			t.Fatal("ReadView bulk lookup mismatch")
+		}
+		if _, err := v.GetUniqueByQName("pkg::F1"); err != nil {
+			t.Fatalf("ReadView.GetUniqueByQName failed: %v", err)
+		}
+		if len(v.GetCallers(u5)) != 2 || len(v.GetCallees(u2)) != 1 {
+			t.Fatal("ReadView callers/callees mismatch")
+		}
+		if len(v.GetIncomingEdges(u5, EdgeCalls)) != 2 || len(v.GetOutgoingEdges(u2, EdgeImports)) != 1 {
+			t.Fatal("ReadView incoming/outgoing mismatch")
+		}
+		if len(v.GetRevDeps(u5)) != 2 || len(v.GetDependentFiles(u5)) != 1 {
+			t.Fatal("ReadView revDeps/dependentFiles mismatch")
+		}
+		if len(v.GetCallSites()) != 2 || len(v.GetCallSitesByFile("x.go")) != 1 || len(v.GetCallSitesByLookupKey("Missing")) != 1 || !v.HasCallSiteForLookup("Missing") {
+			t.Fatal("ReadView call site lookup mismatch")
+		}
+	})
+
+	// Error branches for edge & node CRUD
+	missing := GenerateNodeUID(KindFunction, "missing::X", 0)
+	if _, err := g.AddNode(Node{}); !errors.Is(err, ErrInvalidNode) {
+		t.Fatalf("expected ErrInvalidNode, got %v", err)
+	}
+	if _, err := g.UpsertNode(Node{}); !errors.Is(err, ErrInvalidNode) {
+		t.Fatalf("expected ErrInvalidNode on UpsertNode, got %v", err)
+	}
+	if _, err := g.UpsertNode(Node{Kind: KindFunction, Name: "BrandNew", QName: "pkg::BrandNew", File: "y.go", StartLine: 20}); err != nil {
+		t.Fatalf("UpsertNode new failed: %v", err)
+	}
+	if err := g.RemoveNode(ZeroUID); !errors.Is(err, ErrNodeNotFound) {
+		t.Fatalf("RemoveNode(ZeroUID) = %v, want ErrNodeNotFound", err)
+	}
+	if err := g.RemoveNode(missing); !errors.Is(err, ErrNodeNotFound) {
+		t.Fatalf("RemoveNode(missing) = %v, want ErrNodeNotFound", err)
+	}
+	if err := g.AddEdge(Edge{Source: missing, Target: u5, Kind: EdgeCalls, Tier: TierLocal}); !errors.Is(err, ErrNodeNotFound) {
+		t.Fatalf("AddEdge missing src = %v", err)
+	}
+	if err := g.AddEdge(Edge{Source: u5, Target: missing, Kind: EdgeCalls, Tier: TierLocal}); !errors.Is(err, ErrNodeNotFound) {
+		t.Fatalf("AddEdge missing tgt = %v", err)
+	}
+	if err := g.UpsertEdge(Edge{Source: missing, Target: u5, Kind: EdgeCalls, Tier: TierLocal}); !errors.Is(err, ErrNodeNotFound) {
+		t.Fatalf("UpsertEdge missing src = %v", err)
+	}
+	if err := g.ReplaceEdge(Edge{Source: missing, Target: u5, Kind: EdgeCalls, Tier: TierLocal}); !errors.Is(err, ErrNodeNotFound) {
+		t.Fatalf("ReplaceEdge missing src = %v", err)
+	}
+	if err := g.ReplaceEdge(Edge{Source: u4, Target: u5, Kind: EdgeCalls, Tier: TierLocal}); err != nil {
+		t.Fatalf("ReplaceEdge insert new failed: %v", err)
+	}
+	if err := g.RemoveEdge(u5, u2, EdgeCalls); !errors.Is(err, ErrEdgeNotFound) {
+		t.Fatalf("RemoveEdge missing = %v, want ErrEdgeNotFound", err)
+	}
+	if err := g.AddCallSite(CallSite{}); !errors.Is(err, ErrInvalidCallSite) {
+		t.Fatalf("AddCallSite invalid = %v, want ErrInvalidCallSite", err)
+	}
+
+	// RemoveFile batch deletion removes nodes, edges & call sites cleanly
+	if n := g.RemoveFile("x.go"); n != 4 {
+		t.Fatalf("RemoveFile(x.go) = %d, want 4", n)
+	}
+	if g.CallSiteCount() != 1 {
+		t.Fatalf("CallSiteCount after RemoveFile = %d, want 1", g.CallSiteCount())
+	}
+	mustAssertConsistent(t, g)
+}

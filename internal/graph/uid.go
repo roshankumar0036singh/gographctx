@@ -9,8 +9,8 @@ import (
 	"strings"
 )
 
-// UID is a stable 128-bit identifier for a graph node, derived from the node's
-// qualified name and signature hash rather than volatile line numbers.
+// UID is a stable 128-bit identifier for a graph node, derived from (Kind, QName, Occurrence).
+// Line numbers and parameter type annotations are excluded so routine edits preserve identity.
 type UID [16]byte
 
 // ZeroUID represents an unset or invalid UID.
@@ -63,12 +63,47 @@ func ParseUID(s string) (UID, error) {
 	return uid, nil
 }
 
-// SignatureHash computes a stable hash of a function's parameter types and return type.
-// Parameter names are intentionally ignored so renaming parameters preserves identity,
-// while parameter count and types (or arity alone for untyped functions) distinguish signatures.
-func SignatureHash(params []Param, returnType string) string {
+// SigHash is a 128-bit digest of a symbol's signature (parameter count/types and return type),
+// stored separately from UID to detect API signature changes across edits.
+type SigHash [16]byte
+
+// ZeroSigHash represents an unset or non-applicable signature hash.
+var ZeroSigHash SigHash
+
+// IsZero reports whether the SigHash is the zero value.
+func (s SigHash) IsZero() bool {
+	return s == ZeroSigHash
+}
+
+// String returns the 32-character lowercase hex representation of the signature hash.
+func (s SigHash) String() string {
+	return hex.EncodeToString(s[:])
+}
+
+// MarshalText implements encoding.TextMarshaler.
+func (s SigHash) MarshalText() ([]byte, error) {
+	return []byte(s.String()), nil
+}
+
+// UnmarshalText implements encoding.TextUnmarshaler.
+func (s *SigHash) UnmarshalText(text []byte) error {
+	if len(text) != hex.EncodedLen(len(ZeroSigHash)) {
+		return fmt.Errorf("invalid signature hash length %d: expected %d hex characters", len(text), hex.EncodedLen(len(ZeroSigHash)))
+	}
+	var out SigHash
+	if _, err := hex.Decode(out[:], text); err != nil {
+		return fmt.Errorf("invalid signature hash hex: %w", err)
+	}
+	*s = out
+	return nil
+}
+
+// ComputeSignatureHash computes a stable digest of a function's parameter arity/types and return type.
+// Parameter names are ignored so renaming parameters preserves the signature digest, while adding
+// type annotations or changing parameter count/types updates the digest for API-change detection.
+func ComputeSignatureHash(params []Param, returnType string) SigHash {
 	h := sha256.New()
-	writeLenPrefixed(h, "sig:v1")
+	writeLenPrefixed(h, "sig:v2")
 
 	var countBuf [4]byte
 	binary.BigEndian.PutUint32(countBuf[:], uint32(len(params)))
@@ -79,46 +114,41 @@ func SignatureHash(params []Param, returnType string) string {
 	}
 	writeLenPrefixed(h, strings.TrimSpace(returnType))
 
-	sum := h.Sum(nil)
-	return hex.EncodeToString(sum[:16])
+	var out SigHash
+	copy(out[:], h.Sum(nil)[:16])
+	return out
 }
 
-// GenerateUID computes a deterministic 128-bit UID from a qualified name and signature hash.
-func GenerateUID(qualifiedName, signatureHash string) UID {
+// GenerateNodeUID computes a deterministic 128-bit UID from node kind, qualified name,
+// and same-QName sibling occurrence index.
+func GenerateNodeUID(kind NodeKind, qualifiedName string, occurrence uint16) UID {
 	h := sha256.New()
-	writeLenPrefixed(h, "uid:v1")
+	writeLenPrefixed(h, "uid:v2")
+
+	var meta [3]byte
+	meta[0] = byte(kind)
+	binary.BigEndian.PutUint16(meta[1:3], occurrence)
+	_, _ = h.Write(meta[:])
+
 	writeLenPrefixed(h, qualifiedName)
-	writeLenPrefixed(h, signatureHash)
 
 	var uid UID
 	copy(uid[:], h.Sum(nil)[:16])
 	return uid
 }
 
-// ComputeNodeUID computes the stable UID for a Node.
-// Line numbers are intentionally excluded so moving code within a file preserves identity.
-func ComputeNodeUID(n *Node) UID {
-	if n == nil {
+// ComputeNodeUID computes the stable UID for a Node using (Kind, QName, Occurrence).
+// Only KindFile nodes fall back to n.File when n.QName is empty; all other node kinds
+// require an explicit QName.
+func ComputeNodeUID(n Node) UID {
+	qname := strings.TrimSpace(n.QName)
+	if qname == "" && n.Kind == KindFile {
+		qname = strings.TrimSpace(n.File)
+	}
+	if !n.Kind.IsValid() || qname == "" {
 		return ZeroUID
 	}
-
-	qname := n.QName
-	if qname == "" {
-		if n.File != "" {
-			qname = n.File + "::" + n.Name
-		} else {
-			qname = n.Name
-		}
-	}
-
-	var sigHash string
-	if n.Kind == KindFunction {
-		sigHash = SignatureHash(n.Params, n.ReturnType)
-	} else {
-		sigHash = "kind:" + n.Kind.String()
-	}
-
-	return GenerateUID(qname, sigHash)
+	return GenerateNodeUID(n.Kind, qname, n.Occurrence)
 }
 
 func writeLenPrefixed(h interface{ Write([]byte) (int, error) }, s string) {
@@ -127,4 +157,3 @@ func writeLenPrefixed(h interface{ Write([]byte) (int, error) }, s string) {
 	_, _ = h.Write(lenBuf[:])
 	_, _ = h.Write([]byte(s))
 }
-

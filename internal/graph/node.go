@@ -23,9 +23,11 @@ const (
 	KindProperty
 	KindTypeAlias
 	KindDecorator
+	KindExternal
+	numNodeKinds
 )
 
-var nodeKindNames = [...]string{
+var nodeKindNames = [numNodeKinds]string{
 	KindUnknown:   "Unknown",
 	KindFile:      "File",
 	KindModule:    "Module",
@@ -39,34 +41,26 @@ var nodeKindNames = [...]string{
 	KindProperty:  "Property",
 	KindTypeAlias: "TypeAlias",
 	KindDecorator: "Decorator",
+	KindExternal:  "External",
 }
 
-// AllNodeKinds returns all 12 valid NodeKind values in canonical order.
+// AllNodeKinds returns all defined valid NodeKind values in canonical order.
 func AllNodeKinds() []NodeKind {
-	return []NodeKind{
-		KindFile,
-		KindModule,
-		KindFunction,
-		KindClass,
-		KindStruct,
-		KindInterface,
-		KindEnum,
-		KindVariable,
-		KindParameter,
-		KindProperty,
-		KindTypeAlias,
-		KindDecorator,
+	out := make([]NodeKind, 0, int(numNodeKinds)-1)
+	for kind := KindFile; kind < numNodeKinds; kind++ {
+		out = append(out, kind)
 	}
+	return out
 }
 
-// IsValid reports whether k is one of the 12 defined node kinds.
+// IsValid reports whether k is one of the defined valid node kinds.
 func (k NodeKind) IsValid() bool {
-	return k >= KindFile && k <= KindDecorator
+	return k >= KindFile && k < numNodeKinds
 }
 
 // String returns the canonical human-readable name of the NodeKind.
 func (k NodeKind) String() string {
-	if int(k) < len(nodeKindNames) {
+	if k < numNodeKinds {
 		return nodeKindNames[k]
 	}
 	return "Unknown"
@@ -93,7 +87,7 @@ func (k *NodeKind) UnmarshalText(text []byte) error {
 // ParseNodeKind converts a string into a NodeKind (case-insensitive).
 func ParseNodeKind(s string) (NodeKind, error) {
 	trimmed := strings.TrimSpace(s)
-	for kind := KindFile; kind <= KindDecorator; kind++ {
+	for kind := KindFile; kind < numNodeKinds; kind++ {
 		if strings.EqualFold(nodeKindNames[kind], trimmed) {
 			return kind, nil
 		}
@@ -111,37 +105,43 @@ type Param struct {
 }
 
 // Node represents a symbol or structural entity in the code graph.
-// Nodes stored in a Graph are immutable snapshots; callers must not mutate returned *Node values.
 type Node struct {
-	UID        UID      `json:"uid"`
-	Kind       NodeKind `json:"kind"`
-	Name       string   `json:"name"`
-	QName      string   `json:"qualified_name"`
-	File       string   `json:"file,omitempty"`
-	StartLine  uint32   `json:"start_line,omitempty"`
-	EndLine    uint32   `json:"end_line,omitempty"`
-	Language   string   `json:"language,omitempty"`
-	Type       string   `json:"type,omitempty"`
-	Receiver   string   `json:"receiver,omitempty"`
-	Exported   bool     `json:"exported,omitempty"`
-	Params     []Param  `json:"params,omitempty"`
-	ReturnType string   `json:"return_type,omitempty"`
-	Decorators []string `json:"decorators,omitempty"`
-	Docstring  string   `json:"docstring,omitempty"`
-	Complexity uint16   `json:"complexity,omitempty"`
-	Bases      []string `json:"bases,omitempty"`
+	UID           UID      `json:"uid"`
+	Kind          NodeKind `json:"kind"`
+	Name          string   `json:"name"`
+	QName         string   `json:"qualified_name"`
+	Occurrence    uint16   `json:"occurrence,omitempty"`
+	SignatureHash SigHash  `json:"signature_hash,omitempty"`
+	File          string   `json:"file,omitempty"`
+	StartLine     uint32   `json:"start_line,omitempty"`
+	EndLine       uint32   `json:"end_line,omitempty"`
+	Language      string   `json:"language,omitempty"`
+	Type          string   `json:"type,omitempty"`
+	Receiver      string   `json:"receiver,omitempty"`
+	Exported      bool     `json:"exported,omitempty"`
+	Params        []Param  `json:"params,omitempty"`
+	ReturnType    string   `json:"return_type,omitempty"`
+	Decorators    []string `json:"decorators,omitempty"`
+	Docstring     string   `json:"docstring,omitempty"`
+	Complexity    uint16   `json:"complexity,omitempty"`
+	Bases         []string `json:"bases,omitempty"`
 }
 
 // Validate checks that the node satisfies structural invariants.
-func (n *Node) Validate() error {
-	if n == nil {
-		return ErrNilNode
-	}
+// Non-File nodes must supply an explicit non-empty QName.
+func (n Node) Validate() error {
 	if !n.Kind.IsValid() {
 		return fmt.Errorf("%w: unknown node kind %d", ErrInvalidNode, n.Kind)
 	}
 	if strings.TrimSpace(n.Name) == "" {
 		return fmt.Errorf("%w: empty node name", ErrInvalidNode)
+	}
+	if n.Kind == KindFile {
+		if strings.TrimSpace(n.QName) == "" && strings.TrimSpace(n.File) == "" {
+			return fmt.Errorf("%w: file node requires file path or qualified name", ErrInvalidNode)
+		}
+	} else if strings.TrimSpace(n.QName) == "" {
+		return fmt.Errorf("%w: %s node %q requires qualified_name", ErrInvalidNode, n.Kind, n.Name)
 	}
 	if n.EndLine != 0 && n.EndLine < n.StartLine {
 		return fmt.Errorf("%w: end_line (%d) < start_line (%d)", ErrInvalidNode, n.EndLine, n.StartLine)
@@ -150,14 +150,10 @@ func (n *Node) Validate() error {
 }
 
 // Clone returns a deep copy of the Node.
-func (n *Node) Clone() *Node {
-	if n == nil {
-		return nil
-	}
-	cp := *n
+func (n Node) Clone() Node {
+	cp := n
 	cp.Params = slices.Clone(n.Params)
 	cp.Decorators = slices.Clone(n.Decorators)
 	cp.Bases = slices.Clone(n.Bases)
-	return &cp
+	return cp
 }
-

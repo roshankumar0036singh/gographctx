@@ -7,285 +7,343 @@ import (
 )
 
 func (g *Graph) initIndexesLocked() {
-	g.byName = make(map[string][]*Node)
-	g.byFile = make(map[string][]*Node)
-	g.byQName = make(map[string][]*Node)
-	g.callers = make(map[UID][]*Edge)
-	g.callees = make(map[UID][]*Edge)
-	g.incoming = make(map[UID][]*Edge)
-	g.outgoing = make(map[UID][]*Edge)
-	g.contains = make(map[UID][]*Node)
-	g.revDeps = make(map[UID]map[UID]struct{})
+	g.byName = make(map[string]idList)
+	g.byFile = make(map[string]idList)
+	g.byQName = make(map[string]idList)
 }
 
-func (g *Graph) indexNodeLocked(n *Node) {
+func (g *Graph) indexNodeLocked(id uint32, n *Node) {
 	if n.Name != "" {
-		g.byName[n.Name] = append(g.byName[n.Name], n)
+		l := g.byName[n.Name]
+		l.add(id)
+		g.byName[n.Name] = l
 	}
 	if n.File != "" {
-		g.byFile[n.File] = append(g.byFile[n.File], n)
+		l := g.byFile[n.File]
+		l.add(id)
+		g.byFile[n.File] = l
 	}
 	if n.QName != "" {
-		g.byQName[n.QName] = append(g.byQName[n.QName], n)
+		l := g.byQName[n.QName]
+		l.add(id)
+		g.byQName[n.QName] = l
 	}
 }
 
-func (g *Graph) unindexNodeLocked(n *Node) {
+func (g *Graph) unindexNodeLocked(id uint32, n *Node) {
 	if n.Name != "" {
-		g.byName[n.Name] = removeNodeFromSlice(g.byName[n.Name], n.UID)
-		if len(g.byName[n.Name]) == 0 {
-			delete(g.byName, n.Name)
+		if l, ok := g.byName[n.Name]; ok {
+			if l.remove(id) {
+				delete(g.byName, n.Name)
+			} else {
+				g.byName[n.Name] = l
+			}
 		}
 	}
 	if n.File != "" {
-		g.byFile[n.File] = removeNodeFromSlice(g.byFile[n.File], n.UID)
-		if len(g.byFile[n.File]) == 0 {
-			delete(g.byFile, n.File)
+		if l, ok := g.byFile[n.File]; ok {
+			if l.remove(id) {
+				delete(g.byFile, n.File)
+			} else {
+				g.byFile[n.File] = l
+			}
 		}
 	}
 	if n.QName != "" {
-		g.byQName[n.QName] = removeNodeFromSlice(g.byQName[n.QName], n.UID)
-		if len(g.byQName[n.QName]) == 0 {
-			delete(g.byQName, n.QName)
-		}
-	}
-}
-
-func (g *Graph) updateContainsNodePtrLocked(uid UID, oldNode, newNode *Node) {
-	for _, e := range g.incoming[uid] {
-		if e.Kind != EdgeContains {
-			continue
-		}
-		children := g.contains[e.Source]
-		for i, child := range children {
-			if child == oldNode || child.UID == uid {
-				children[i] = newNode
+		if l, ok := g.byQName[n.QName]; ok {
+			if l.remove(id) {
+				delete(g.byQName, n.QName)
+			} else {
+				g.byQName[n.QName] = l
 			}
 		}
 	}
 }
 
-func (g *Graph) indexEdgeLocked(e *Edge) {
-	g.outgoing[e.Source] = append(g.outgoing[e.Source], e)
-	g.incoming[e.Target] = append(g.incoming[e.Target], e)
-
-	if e.Kind.IsCall() {
-		g.callees[e.Source] = append(g.callees[e.Source], e)
-		g.callers[e.Target] = append(g.callers[e.Target], e)
+func (g *Graph) collectIDsFromList(l idList) []uint32 {
+	n := l.len()
+	if n == 0 {
+		return nil
 	}
-	if e.Kind == EdgeContains {
-		if targetNode, ok := g.nodes[e.Target]; ok {
-			g.contains[e.Source] = append(g.contains[e.Source], targetNode)
-		}
-	}
-	if e.Kind.IsDependency() {
-		deps := g.revDeps[e.Target]
-		if deps == nil {
-			deps = make(map[UID]struct{})
-			g.revDeps[e.Target] = deps
-		}
-		deps[e.Source] = struct{}{}
-	}
+	out := make([]uint32, 0, n)
+	return l.appendTo(out)
 }
 
-func (g *Graph) unindexEdgeLocked(e *Edge) {
-	g.outgoing[e.Source] = removeEdgeFromSlice(g.outgoing[e.Source], e)
-	if len(g.outgoing[e.Source]) == 0 {
-		delete(g.outgoing, e.Source)
+func (g *Graph) collectNodesFromListLocked(l idList) []Node {
+	n := l.len()
+	if n == 0 {
+		return nil
 	}
-
-	g.incoming[e.Target] = removeEdgeFromSlice(g.incoming[e.Target], e)
-	if len(g.incoming[e.Target]) == 0 {
-		delete(g.incoming, e.Target)
-	}
-
-	if e.Kind.IsCall() {
-		g.callees[e.Source] = removeEdgeFromSlice(g.callees[e.Source], e)
-		if len(g.callees[e.Source]) == 0 {
-			delete(g.callees, e.Source)
-		}
-
-		g.callers[e.Target] = removeEdgeFromSlice(g.callers[e.Target], e)
-		if len(g.callers[e.Target]) == 0 {
-			delete(g.callers, e.Target)
+	out := make([]Node, 0, n)
+	if l.hasFirst {
+		out = append(out, g.nodes[l.first].Clone())
+		for _, id := range l.rest {
+			out = append(out, g.nodes[id].Clone())
 		}
 	}
-
-	if e.Kind == EdgeContains {
-		g.contains[e.Source] = removeNodeFromSlice(g.contains[e.Source], e.Target)
-		if len(g.contains[e.Source]) == 0 {
-			delete(g.contains, e.Source)
-		}
-	}
-
-	if e.Kind.IsDependency() {
-		stillDepends := false
-		for _, rem := range g.outgoing[e.Source] {
-			if rem.Target == e.Target && rem.Kind.IsDependency() {
-				stillDepends = true
-				break
-			}
-		}
-		if !stillDepends {
-			if deps := g.revDeps[e.Target]; deps != nil {
-				delete(deps, e.Source)
-				if len(deps) == 0 {
-					delete(g.revDeps, e.Target)
-				}
-			}
-		}
-	}
+	sortNodesByLocation(out)
+	return out
 }
 
-func (g *Graph) replaceEdgePtrLocked(oldEdge, newEdge *Edge) {
-	replacePtrInEdgeSlice(g.outgoing[newEdge.Source], oldEdge, newEdge)
-	replacePtrInEdgeSlice(g.incoming[newEdge.Target], oldEdge, newEdge)
-	if newEdge.Kind.IsCall() {
-		replacePtrInEdgeSlice(g.callees[newEdge.Source], oldEdge, newEdge)
-		replacePtrInEdgeSlice(g.callers[newEdge.Target], oldEdge, newEdge)
-	}
-}
-
-// GetByName returns all nodes with the given short Name, sorted deterministically.
-func (g *Graph) GetByName(name string) []*Node {
+// GetByName returns copies of all nodes with the given short Name, sorted deterministically.
+func (g *Graph) GetByName(name string) []Node {
 	if name == "" {
 		return nil
 	}
 	g.mu.RLock()
 	defer g.mu.RUnlock()
-
-	nodes := slices.Clone(g.byName[name])
-	sortNodesByLocation(nodes)
-	return nodes
+	return g.getByNameLocked(name)
 }
 
-// GetByFile returns all nodes defined in the given file path, sorted by source location.
-func (g *Graph) GetByFile(file string) []*Node {
+func (g *Graph) getByNameLocked(name string) []Node {
+	if !g.init || name == "" {
+		return nil
+	}
+	return g.collectNodesFromListLocked(g.byName[name])
+}
+
+// GetByFile returns copies of all nodes defined in the given file path, sorted by source location.
+func (g *Graph) GetByFile(file string) []Node {
 	if file == "" {
 		return nil
 	}
 	g.mu.RLock()
 	defer g.mu.RUnlock()
-
-	nodes := slices.Clone(g.byFile[file])
-	sortNodesByLocation(nodes)
-	return nodes
+	return g.getByFileLocked(file)
 }
 
-// GetByQName returns the first node matching the qualified name in deterministic order.
-func (g *Graph) GetByQName(qname string) (*Node, bool) {
-	if qname == "" {
-		return nil, false
+func (g *Graph) getByFileLocked(file string) []Node {
+	if !g.init || file == "" {
+		return nil
 	}
-	g.mu.RLock()
-	defer g.mu.RUnlock()
-
-	nodes := g.byQName[qname]
-	if len(nodes) == 0 {
-		return nil, false
-	}
-	if len(nodes) == 1 {
-		return nodes[0], true
-	}
-	cp := slices.Clone(nodes)
-	sortNodesByLocation(cp)
-	return cp[0], true
+	return g.collectNodesFromListLocked(g.byFile[file])
 }
 
-// GetAllByQName returns all nodes sharing the given qualified name (e.g. overloaded methods).
-func (g *Graph) GetAllByQName(qname string) []*Node {
+// GetByQName returns copies of all nodes matching the given qualified name, sorted by source location.
+// Unlike GetUniqueByQName, it never silently picks a single overload or sibling.
+func (g *Graph) GetByQName(qname string) []Node {
 	if qname == "" {
 		return nil
 	}
 	g.mu.RLock()
 	defer g.mu.RUnlock()
-
-	nodes := slices.Clone(g.byQName[qname])
-	sortNodesByLocation(nodes)
-	return nodes
+	return g.getByQNameLocked(qname)
 }
 
-// GetCallers returns incoming CALLS and LIKELY_CALLS edges for the target node,
-// sorted by confidence descending, then call line and source UID.
-func (g *Graph) GetCallers(uid UID) []*Edge {
+func (g *Graph) getByQNameLocked(qname string) []Node {
+	if !g.init || qname == "" {
+		return nil
+	}
+	return g.collectNodesFromListLocked(g.byQName[qname])
+}
+
+// GetUniqueByQName returns the single node matching qname, or ErrNodeNotFound / ErrAmbiguousQName.
+func (g *Graph) GetUniqueByQName(qname string) (Node, error) {
+	if qname == "" {
+		return Node{}, fmt.Errorf("%w: empty qualified name", ErrNodeNotFound)
+	}
+	g.mu.RLock()
+	defer g.mu.RUnlock()
+	return g.getUniqueByQNameLocked(qname)
+}
+
+func (g *Graph) getUniqueByQNameLocked(qname string) (Node, error) {
+	if !g.init || qname == "" {
+		return Node{}, fmt.Errorf("%w: %q", ErrNodeNotFound, qname)
+	}
+	l := g.byQName[qname]
+	count := l.len()
+	if count == 0 {
+		return Node{}, fmt.Errorf("%w: %q", ErrNodeNotFound, qname)
+	}
+	if count > 1 {
+		return Node{}, fmt.Errorf("%w: %q matched %d symbols", ErrAmbiguousQName, qname, count)
+	}
+	return g.nodes[l.first].Clone(), nil
+}
+
+// GetCallers returns copies of incoming CALLS and LIKELY_CALLS edges for the target node,
+// sorted by stronger tier first, then first call line and source UID.
+func (g *Graph) GetCallers(uid UID) []Edge {
 	if uid.IsZero() {
 		return nil
 	}
 	g.mu.RLock()
 	defer g.mu.RUnlock()
-
-	edges := slices.Clone(g.callers[uid])
-	sortCallEdges(edges)
-	return edges
+	return g.getCallersLocked(uid)
 }
 
-// GetCallees returns outgoing CALLS and LIKELY_CALLS edges from the source node,
-// sorted by confidence descending, then call line and target UID.
-func (g *Graph) GetCallees(uid UID) []*Edge {
+func (g *Graph) getCallersLocked(uid UID) []Edge {
+	if !g.init || uid.IsZero() {
+		return nil
+	}
+	id, ok := g.uidToID[uid]
+	if !ok {
+		return nil
+	}
+	var out []Edge
+	for _, eid := range g.incoming[id] {
+		e := &g.edges[eid]
+		if e.alive() && e.kind.IsCall() {
+			out = append(out, g.materializeEdgeLocked(eid))
+		}
+	}
+	sortCallEdges(out)
+	return out
+}
+
+// GetCallees returns copies of outgoing CALLS and LIKELY_CALLS edges from the source node,
+// sorted by stronger tier first, then first call line and target UID.
+func (g *Graph) GetCallees(uid UID) []Edge {
 	if uid.IsZero() {
 		return nil
 	}
 	g.mu.RLock()
 	defer g.mu.RUnlock()
-
-	edges := slices.Clone(g.callees[uid])
-	sortCallEdges(edges)
-	return edges
+	return g.getCalleesLocked(uid)
 }
 
-// GetIncomingEdges returns incoming edges to uid, optionally filtered by kinds.
-func (g *Graph) GetIncomingEdges(uid UID, kinds ...EdgeKind) []*Edge {
+func (g *Graph) getCalleesLocked(uid UID) []Edge {
+	if !g.init || uid.IsZero() {
+		return nil
+	}
+	id, ok := g.uidToID[uid]
+	if !ok {
+		return nil
+	}
+	var out []Edge
+	for _, eid := range g.outgoing[id] {
+		e := &g.edges[eid]
+		if e.alive() && e.kind.IsCall() {
+			out = append(out, g.materializeEdgeLocked(eid))
+		}
+	}
+	sortCallEdges(out)
+	return out
+}
+
+// GetIncomingEdges returns copies of incoming edges to uid, optionally filtered by kinds.
+func (g *Graph) GetIncomingEdges(uid UID, kinds ...EdgeKind) []Edge {
 	if uid.IsZero() {
 		return nil
 	}
 	g.mu.RLock()
 	defer g.mu.RUnlock()
-
-	edges := filterEdgesByKind(g.incoming[uid], kinds)
-	slices.SortFunc(edges, compareEdgesCanonical)
-	return edges
+	return g.getIncomingEdgesLocked(uid, kinds...)
 }
 
-// GetOutgoingEdges returns outgoing edges from uid, optionally filtered by kinds.
-func (g *Graph) GetOutgoingEdges(uid UID, kinds ...EdgeKind) []*Edge {
+func (g *Graph) getIncomingEdgesLocked(uid UID, kinds ...EdgeKind) []Edge {
+	if !g.init || uid.IsZero() {
+		return nil
+	}
+	id, ok := g.uidToID[uid]
+	if !ok {
+		return nil
+	}
+	out := g.collectFilteredEdgesLocked(g.incoming[id], kinds)
+	slices.SortFunc(out, compareEdgesCanonical)
+	return out
+}
+
+// GetOutgoingEdges returns copies of outgoing edges from uid, optionally filtered by kinds.
+func (g *Graph) GetOutgoingEdges(uid UID, kinds ...EdgeKind) []Edge {
 	if uid.IsZero() {
 		return nil
 	}
 	g.mu.RLock()
 	defer g.mu.RUnlock()
-
-	edges := filterEdgesByKind(g.outgoing[uid], kinds)
-	slices.SortFunc(edges, compareEdgesCanonical)
-	return edges
+	return g.getOutgoingEdgesLocked(uid, kinds...)
 }
 
-// GetContains returns all direct child nodes contained by parentUID, sorted by source location.
-func (g *Graph) GetContains(parentUID UID) []*Node {
+func (g *Graph) getOutgoingEdgesLocked(uid UID, kinds ...EdgeKind) []Edge {
+	if !g.init || uid.IsZero() {
+		return nil
+	}
+	id, ok := g.uidToID[uid]
+	if !ok {
+		return nil
+	}
+	out := g.collectFilteredEdgesLocked(g.outgoing[id], kinds)
+	slices.SortFunc(out, compareEdgesCanonical)
+	return out
+}
+
+func (g *Graph) collectFilteredEdgesLocked(eids []uint32, kinds []EdgeKind) []Edge {
+	if len(eids) == 0 {
+		return nil
+	}
+	var out []Edge
+	for _, eid := range eids {
+		e := &g.edges[eid]
+		if !e.alive() {
+			continue
+		}
+		if len(kinds) == 0 || slices.Contains(kinds, e.kind) {
+			out = append(out, g.materializeEdgeLocked(eid))
+		}
+	}
+	return out
+}
+
+// GetContains returns copies of all direct child nodes contained by parentUID, sorted by source location.
+func (g *Graph) GetContains(parentUID UID) []Node {
 	if parentUID.IsZero() {
 		return nil
 	}
 	g.mu.RLock()
 	defer g.mu.RUnlock()
-
-	nodes := slices.Clone(g.contains[parentUID])
-	sortNodesByLocation(nodes)
-	return nodes
+	return g.getContainsLocked(parentUID)
 }
 
-// GetRevDeps returns the sorted list of node UIDs that depend on targetUID.
+func (g *Graph) getContainsLocked(parentUID UID) []Node {
+	if !g.init || parentUID.IsZero() {
+		return nil
+	}
+	id, ok := g.uidToID[parentUID]
+	if !ok {
+		return nil
+	}
+	var out []Node
+	for _, eid := range g.outgoing[id] {
+		e := &g.edges[eid]
+		if e.alive() && e.kind == EdgeContains {
+			out = append(out, g.nodes[e.target].Clone())
+		}
+	}
+	sortNodesByLocation(out)
+	return out
+}
+
+// GetRevDeps returns the sorted unique list of node UIDs that depend on targetUID.
 func (g *Graph) GetRevDeps(targetUID UID) []UID {
 	if targetUID.IsZero() {
 		return nil
 	}
 	g.mu.RLock()
 	defer g.mu.RUnlock()
+	return g.getRevDepsLocked(targetUID)
+}
 
-	deps := g.revDeps[targetUID]
-	if len(deps) == 0 {
+func (g *Graph) getRevDepsLocked(targetUID UID) []UID {
+	if !g.init || targetUID.IsZero() {
 		return nil
 	}
-	result := make([]UID, 0, len(deps))
-	for srcUID := range deps {
+	id, ok := g.uidToID[targetUID]
+	if !ok {
+		return nil
+	}
+	seen := make(map[UID]struct{})
+	for _, eid := range g.incoming[id] {
+		e := &g.edges[eid]
+		if e.alive() && e.kind.IsDependency() {
+			seen[g.nodes[e.source].UID] = struct{}{}
+		}
+	}
+	if len(seen) == 0 {
+		return nil
+	}
+	result := make([]UID, 0, len(seen))
+	for srcUID := range seen {
 		result = append(result, srcUID)
 	}
 	slices.SortFunc(result, func(a, b UID) int {
@@ -301,15 +359,24 @@ func (g *Graph) GetDependentFiles(targetUID UID) []string {
 	}
 	g.mu.RLock()
 	defer g.mu.RUnlock()
+	return g.getDependentFilesLocked(targetUID)
+}
 
-	deps := g.revDeps[targetUID]
-	if len(deps) == 0 {
+func (g *Graph) getDependentFilesLocked(targetUID UID) []string {
+	if !g.init || targetUID.IsZero() {
+		return nil
+	}
+	id, ok := g.uidToID[targetUID]
+	if !ok {
 		return nil
 	}
 	seen := make(map[string]struct{})
-	for srcUID := range deps {
-		if n, ok := g.nodes[srcUID]; ok && n.File != "" {
-			seen[n.File] = struct{}{}
+	for _, eid := range g.incoming[id] {
+		e := &g.edges[eid]
+		if e.alive() && e.kind.IsDependency() {
+			if f := g.nodes[e.source].File; f != "" {
+				seen[f] = struct{}{}
+			}
 		}
 	}
 	if len(seen) == 0 {
@@ -323,35 +390,88 @@ func (g *Graph) GetDependentFiles(targetUID UID) []string {
 	return files
 }
 
-// RebuildIndexes clears and reconstructs all secondary indexes from the stored nodes and edges.
+// RebuildIndexes clears and reconstructs all secondary and adjacency indexes from canonical storage.
 func (g *Graph) RebuildIndexes() {
 	g.mu.Lock()
 	defer g.mu.Unlock()
+	g.ensureInitLocked()
 
 	g.initIndexesLocked()
-	for _, n := range g.nodes {
-		g.indexNodeLocked(n)
+	g.uidToID = make(map[UID]uint32, g.nodeCount)
+	for i := range g.outgoing {
+		g.outgoing[i] = g.outgoing[i][:0]
 	}
-	for _, e := range g.edges {
-		g.indexEdgeLocked(e)
+	for i := range g.incoming {
+		g.incoming[i] = g.incoming[i][:0]
 	}
+	for id := range g.nodes {
+		n := &g.nodes[id]
+		if n.Kind.IsValid() {
+			g.uidToID[n.UID] = uint32(id)
+			g.indexNodeLocked(uint32(id), n)
+		}
+	}
+
+	g.edgeToID = make(map[compactEdgeKey]uint32, g.edgeCount)
+	for eid := range g.edges {
+		e := &g.edges[eid]
+		if e.alive() {
+			g.edgeToID[compactEdgeKey{source: e.source, target: e.target, kind: e.kind}] = uint32(eid)
+			g.outgoing[e.source] = append(g.outgoing[e.source], uint32(eid))
+			g.incoming[e.target] = append(g.incoming[e.target], uint32(eid))
+		}
+	}
+
+	g.rebuildCallSiteIndexesLocked()
 }
 
-// VerifyIndexConsistency checks that every secondary index matches the canonical nodes and edges maps.
+// VerifyIndexConsistency checks that every secondary index and adjacency list matches canonical storage.
 func (g *Graph) VerifyIndexConsistency() error {
 	g.mu.RLock()
 	defer g.mu.RUnlock()
 
+	if !g.init {
+		if g.nodeCount != 0 || g.edgeCount != 0 {
+			return fmt.Errorf("uninitialized graph has non-zero counts")
+		}
+		return nil
+	}
+
+	if len(g.outgoing) != len(g.nodes) || len(g.incoming) != len(g.nodes) {
+		return fmt.Errorf("adjacency length mismatch: nodes=%d out=%d in=%d", len(g.nodes), len(g.outgoing), len(g.incoming))
+	}
+
+	freeNodeSet := make(map[uint32]struct{}, len(g.freeNodeIDs))
+	for _, fid := range g.freeNodeIDs {
+		if int(fid) >= len(g.nodes) {
+			return fmt.Errorf("free node ID %d out of range", fid)
+		}
+		if _, dup := freeNodeSet[fid]; dup {
+			return fmt.Errorf("duplicate free node ID %d", fid)
+		}
+		freeNodeSet[fid] = struct{}{}
+	}
+
+	aliveNodes := 0
 	expectedNameCount := 0
 	expectedFileCount := 0
 	expectedQNameCount := 0
-	for uid, n := range g.nodes {
-		if n == nil {
-			return fmt.Errorf("nil node stored for UID %s", uid)
+	for id := range g.nodes {
+		uid32 := uint32(id)
+		n := &g.nodes[id]
+		if !n.Kind.IsValid() {
+			if _, ok := freeNodeSet[uid32]; !ok {
+				return fmt.Errorf("dead node slot %d missing from freeNodeIDs", id)
+			}
+			continue
 		}
-		if n.UID != uid {
-			return fmt.Errorf("node UID mismatch: key %s != node.UID %s", uid, n.UID)
+		if _, isFree := freeNodeSet[uid32]; isFree {
+			return fmt.Errorf("alive node slot %d listed in freeNodeIDs", id)
 		}
+		if mappedID, ok := g.uidToID[n.UID]; !ok || mappedID != uid32 {
+			return fmt.Errorf("uidToID mismatch for %s: mapped=%d ok=%v want=%d", n.UID, mappedID, ok, id)
+		}
+		aliveNodes++
 		if n.Name != "" {
 			expectedNameCount++
 		}
@@ -362,123 +482,90 @@ func (g *Graph) VerifyIndexConsistency() error {
 			expectedQNameCount++
 		}
 	}
-
-	if err := verifyNodeIndexMap("byName", g.byName, g.nodes, expectedNameCount, func(n *Node) string { return n.Name }); err != nil {
-		return err
-	}
-	if err := verifyNodeIndexMap("byFile", g.byFile, g.nodes, expectedFileCount, func(n *Node) string { return n.File }); err != nil {
-		return err
-	}
-	if err := verifyNodeIndexMap("byQName", g.byQName, g.nodes, expectedQNameCount, func(n *Node) string { return n.QName }); err != nil {
-		return err
+	if aliveNodes != g.nodeCount || len(g.uidToID) != g.nodeCount {
+		return fmt.Errorf("node count mismatch: counted=%d nodeCount=%d uidToID=%d", aliveNodes, g.nodeCount, len(g.uidToID))
 	}
 
-	expectedCallCount := 0
-	expectedContainsCount := 0
-	expectedRevDeps := make(map[UID]map[UID]struct{})
-	for key, e := range g.edges {
-		if e == nil {
-			return fmt.Errorf("nil edge stored for key %v", key)
-		}
-		if e.Source != key.source || e.Target != key.target || e.Kind != key.kind {
-			return fmt.Errorf("edge key mismatch")
-		}
-		if _, ok := g.nodes[e.Source]; !ok {
-			return fmt.Errorf("dangling edge source %s", e.Source)
-		}
-		if _, ok := g.nodes[e.Target]; !ok {
-			return fmt.Errorf("dangling edge target %s", e.Target)
-		}
-		if e.Kind.IsCall() {
-			expectedCallCount++
-		}
-		if e.Kind == EdgeContains {
-			expectedContainsCount++
-		}
-		if e.Kind.IsDependency() {
-			if expectedRevDeps[e.Target] == nil {
-				expectedRevDeps[e.Target] = make(map[UID]struct{})
-			}
-			expectedRevDeps[e.Target][e.Source] = struct{}{}
-		}
-	}
-
-	if err := verifyEdgeIndexMap("outgoing", g.outgoing, g.edges, len(g.edges), func(e *Edge) UID { return e.Source }); err != nil {
+	if err := verifyIDIndexMap("byName", g.byName, g.nodes, expectedNameCount, func(n *Node) string { return n.Name }); err != nil {
 		return err
 	}
-	if err := verifyEdgeIndexMap("incoming", g.incoming, g.edges, len(g.edges), func(e *Edge) UID { return e.Target }); err != nil {
+	if err := verifyIDIndexMap("byFile", g.byFile, g.nodes, expectedFileCount, func(n *Node) string { return n.File }); err != nil {
 		return err
 	}
-	if err := verifyEdgeIndexMap("callees", g.callees, g.edges, expectedCallCount, func(e *Edge) UID { return e.Source }); err != nil {
-		return err
-	}
-	if err := verifyEdgeIndexMap("callers", g.callers, g.edges, expectedCallCount, func(e *Edge) UID { return e.Target }); err != nil {
+	if err := verifyIDIndexMap("byQName", g.byQName, g.nodes, expectedQNameCount, func(n *Node) string { return n.QName }); err != nil {
 		return err
 	}
 
-	actualContainsCount := 0
-	for parentUID, children := range g.contains {
-		if len(children) == 0 {
-			return fmt.Errorf("contains index has empty slice for parent %s", parentUID)
+	freeEdgeSet := make(map[uint32]struct{}, len(g.freeEdgeIDs))
+	for _, fid := range g.freeEdgeIDs {
+		if int(fid) >= len(g.edges) {
+			return fmt.Errorf("free edge ID %d out of range", fid)
 		}
-		seen := make(map[UID]struct{}, len(children))
-		for _, child := range children {
-			if child == nil {
-				return fmt.Errorf("contains index has nil child for parent %s", parentUID)
-			}
-			if g.nodes[child.UID] != child {
-				return fmt.Errorf("contains index has stale pointer for child %s", child.UID)
-			}
-			if _, dup := seen[child.UID]; dup {
-				return fmt.Errorf("contains index has duplicate child %s for parent %s", child.UID, parentUID)
-			}
-			seen[child.UID] = struct{}{}
-			if _, ok := g.edges[edgeKey{source: parentUID, target: child.UID, kind: EdgeContains}]; !ok {
-				return fmt.Errorf("contains index has entry %s -> %s without CONTAINS edge", parentUID, child.UID)
-			}
-			actualContainsCount++
+		if _, dup := freeEdgeSet[fid]; dup {
+			return fmt.Errorf("duplicate free edge ID %d", fid)
 		}
-	}
-	if actualContainsCount != expectedContainsCount {
-		return fmt.Errorf("contains index count %d != expected %d", actualContainsCount, expectedContainsCount)
+		freeEdgeSet[fid] = struct{}{}
 	}
 
-	if len(g.revDeps) != len(expectedRevDeps) {
-		return fmt.Errorf("revDeps key count %d != expected %d", len(g.revDeps), len(expectedRevDeps))
-	}
-	for target, expectedSrcs := range expectedRevDeps {
-		actualSrcs := g.revDeps[target]
-		if len(actualSrcs) != len(expectedSrcs) {
-			return fmt.Errorf("revDeps[%s] size %d != expected %d", target, len(actualSrcs), len(expectedSrcs))
-		}
-		for src := range expectedSrcs {
-			if _, ok := actualSrcs[src]; !ok {
-				return fmt.Errorf("revDeps[%s] missing source %s", target, src)
+	aliveEdges := 0
+	for eid := range g.edges {
+		eid32 := uint32(eid)
+		e := &g.edges[eid]
+		if !e.alive() {
+			if _, ok := freeEdgeSet[eid32]; !ok {
+				return fmt.Errorf("dead edge slot %d missing from freeEdgeIDs", eid)
 			}
+			continue
 		}
+		if _, isFree := freeEdgeSet[eid32]; isFree {
+			return fmt.Errorf("alive edge slot %d listed in freeEdgeIDs", eid)
+		}
+		if int(e.source) >= len(g.nodes) || !g.nodes[e.source].Kind.IsValid() {
+			return fmt.Errorf("dangling edge %d source id %d", eid, e.source)
+		}
+		if int(e.target) >= len(g.nodes) || !g.nodes[e.target].Kind.IsValid() {
+			return fmt.Errorf("dangling edge %d target id %d", eid, e.target)
+		}
+		ek := compactEdgeKey{source: e.source, target: e.target, kind: e.kind}
+		if mappedEID, ok := g.edgeToID[ek]; !ok || mappedEID != eid32 {
+			return fmt.Errorf("edgeToID mismatch for %v", ek)
+		}
+		aliveEdges++
+	}
+	if aliveEdges != g.edgeCount || len(g.edgeToID) != g.edgeCount {
+		return fmt.Errorf("edge count mismatch: counted=%d edgeCount=%d edgeToID=%d", aliveEdges, g.edgeCount, len(g.edgeToID))
+	}
+
+	if err := verifyAdjacency("outgoing", g.outgoing, g.nodes, g.edges, g.edgeCount, func(e *edgeEntry) uint32 { return e.source }); err != nil {
+		return err
+	}
+	if err := verifyAdjacency("incoming", g.incoming, g.nodes, g.edges, g.edgeCount, func(e *edgeEntry) uint32 { return e.target }); err != nil {
+		return err
 	}
 
 	return nil
 }
 
-func verifyNodeIndexMap(name string, index map[string][]*Node, canonical map[UID]*Node, expectedTotal int, keyFn func(*Node) string) error {
+func verifyIDIndexMap(name string, index map[string]idList, nodes []Node, expectedTotal int, keyFn func(*Node) string) error {
 	actualTotal := 0
-	for k, list := range index {
-		if len(list) == 0 {
-			return fmt.Errorf("%s index has empty slice for key %q", name, k)
+	for k, l := range index {
+		if l.len() == 0 {
+			return fmt.Errorf("%s index has empty entry for key %q", name, k)
 		}
-		seen := make(map[UID]struct{}, len(list))
-		for _, n := range list {
-			if n == nil || canonical[n.UID] != n {
-				return fmt.Errorf("%s index has stale or unknown node for key %q", name, k)
+		ids := make([]uint32, 0, l.len())
+		ids = l.appendTo(ids)
+		seen := make(map[uint32]struct{}, len(ids))
+		for _, id := range ids {
+			if int(id) >= len(nodes) || !nodes[id].Kind.IsValid() {
+				return fmt.Errorf("%s index has stale or out-of-range node ID %d for key %q", name, id, k)
 			}
-			if keyFn(n) != k {
-				return fmt.Errorf("%s index key mismatch: got %q, want %q", name, k, keyFn(n))
+			if keyFn(&nodes[id]) != k {
+				return fmt.Errorf("%s index key mismatch: got %q, want %q", name, k, keyFn(&nodes[id]))
 			}
-			if _, dup := seen[n.UID]; dup {
-				return fmt.Errorf("%s index has duplicate UID %s under key %q", name, n.UID, k)
+			if _, dup := seen[id]; dup {
+				return fmt.Errorf("%s index has duplicate node ID %d under key %q", name, id, k)
 			}
-			seen[n.UID] = struct{}{}
+			seen[id] = struct{}{}
 			actualTotal++
 		}
 	}
@@ -488,88 +575,35 @@ func verifyNodeIndexMap(name string, index map[string][]*Node, canonical map[UID
 	return nil
 }
 
-func verifyEdgeIndexMap(name string, index map[UID][]*Edge, canonical map[edgeKey]*Edge, expectedTotal int, keyFn func(*Edge) UID) error {
+func verifyAdjacency(name string, adj [][]uint32, nodes []Node, edges []edgeEntry, expectedTotal int, endpointFn func(*edgeEntry) uint32) error {
 	actualTotal := 0
-	for uid, list := range index {
-		if len(list) == 0 {
-			return fmt.Errorf("%s index has empty slice for UID %s", name, uid)
+	for nid, eids := range adj {
+		if !nodes[nid].Kind.IsValid() && len(eids) > 0 {
+			return fmt.Errorf("%s adjacency non-empty for dead node %d", name, nid)
 		}
-		seen := make(map[edgeKey]struct{}, len(list))
-		for _, e := range list {
-			if e == nil {
-				return fmt.Errorf("%s index has nil edge for UID %s", name, uid)
+		seen := make(map[uint32]struct{}, len(eids))
+		for _, eid := range eids {
+			if int(eid) >= len(edges) || !edges[eid].alive() {
+				return fmt.Errorf("%s[%d] references invalid/dead edge %d", name, nid, eid)
 			}
-			ek := edgeKey{source: e.Source, target: e.Target, kind: e.Kind}
-			if canonical[ek] != e {
-				return fmt.Errorf("%s index has stale or unknown edge %v", name, ek)
+			if endpointFn(&edges[eid]) != uint32(nid) {
+				return fmt.Errorf("%s[%d] references mismatched edge %d", name, nid, eid)
 			}
-			if keyFn(e) != uid {
-				return fmt.Errorf("%s index key mismatch for UID %s", name, uid)
+			if _, dup := seen[eid]; dup {
+				return fmt.Errorf("%s[%d] has duplicate edge %d", name, nid, eid)
 			}
-			if _, dup := seen[ek]; dup {
-				return fmt.Errorf("%s index has duplicate edge %v", name, ek)
-			}
-			seen[ek] = struct{}{}
+			seen[eid] = struct{}{}
 			actualTotal++
 		}
 	}
 	if actualTotal != expectedTotal {
-		return fmt.Errorf("%s index count %d != expected %d", name, actualTotal, expectedTotal)
+		return fmt.Errorf("%s adjacency count %d != expected %d", name, actualTotal, expectedTotal)
 	}
 	return nil
 }
 
-func removeNodeFromSlice(list []*Node, uid UID) []*Node {
-	for i, n := range list {
-		if n.UID == uid {
-			last := len(list) - 1
-			list[i] = list[last]
-			list[last] = nil
-			return list[:last]
-		}
-	}
-	return list
-}
-
-func removeEdgeFromSlice(list []*Edge, target *Edge) []*Edge {
-	for i, e := range list {
-		if e == target || (e.Source == target.Source && e.Target == target.Target && e.Kind == target.Kind) {
-			last := len(list) - 1
-			list[i] = list[last]
-			list[last] = nil
-			return list[:last]
-		}
-	}
-	return list
-}
-
-func replacePtrInEdgeSlice(list []*Edge, oldEdge, newEdge *Edge) {
-	for i, e := range list {
-		if e == oldEdge {
-			list[i] = newEdge
-			return
-		}
-	}
-}
-
-func filterEdgesByKind(list []*Edge, kinds []EdgeKind) []*Edge {
-	if len(list) == 0 {
-		return nil
-	}
-	if len(kinds) == 0 {
-		return slices.Clone(list)
-	}
-	var out []*Edge
-	for _, e := range list {
-		if slices.Contains(kinds, e.Kind) {
-			out = append(out, e)
-		}
-	}
-	return out
-}
-
-func sortNodesByLocation(nodes []*Node) {
-	slices.SortFunc(nodes, func(a, b *Node) int {
+func sortNodesByLocation(nodes []Node) {
+	slices.SortFunc(nodes, func(a, b Node) int {
 		if c := cmp.Compare(a.File, b.File); c != 0 {
 			return c
 		}
@@ -589,20 +623,22 @@ func sortNodesByLocation(nodes []*Node) {
 	})
 }
 
-func sortCallEdges(edges []*Edge) {
-	slices.SortFunc(edges, func(a, b *Edge) int {
-		// Higher confidence first
-		if c := cmp.Compare(b.Confidence, a.Confidence); c != 0 {
-			return c
-		}
-		// Lower tier number (stronger tier) first
+func sortCallEdges(edges []Edge) {
+	slices.SortFunc(edges, func(a, b Edge) int {
+		// Lower tier number (stronger tier / higher confidence) first.
 		if c := cmp.Compare(a.Tier, b.Tier); c != 0 {
 			return c
 		}
-		if c := cmp.Compare(a.Line, b.Line); c != 0 {
+		var aLine, bLine uint32
+		if len(a.Sites) > 0 {
+			aLine = a.Sites[0].Line
+		}
+		if len(b.Sites) > 0 {
+			bLine = b.Sites[0].Line
+		}
+		if c := cmp.Compare(aLine, bLine); c != 0 {
 			return c
 		}
 		return compareEdgesCanonical(a, b)
 	})
 }
-
