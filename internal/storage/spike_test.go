@@ -362,4 +362,3 @@ func BenchmarkPersistenceSpike150kNodes600kEdges(b *testing.B) {
 		}
 	})
 }
-

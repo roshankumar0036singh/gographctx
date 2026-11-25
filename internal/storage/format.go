@@ -546,4 +546,3 @@ func readCallSiteRecord(r *binReader, tbl []string) (graph.CallSite, error) {
 	}
 	return cs, nil
 }
-

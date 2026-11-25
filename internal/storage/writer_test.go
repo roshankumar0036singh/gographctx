@@ -338,4 +338,3 @@ func TestWALAppendReplayCrashRecoveryAndCompaction(t *testing.T) {
 		t.Fatalf("expected ErrClosed on closed Store, got %v", err)
 	}
 }
-
