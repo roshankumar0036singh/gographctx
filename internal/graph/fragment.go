@@ -162,3 +162,72 @@ func (g *Graph) MergeFragments(fragments []FileFragment) error {
 
 	return nil
 }
+
+// BulkLoad validates and inserts a complete set of nodes, edges, and call sites
+// (such as from a deserialized snapshot) without requiring per-file fragment grouping.
+func (g *Graph) BulkLoad(nodes []Node, edges []Edge, sites []CallSite) error {
+	nodeUIDs := make(map[UID]struct{}, len(nodes))
+	prepNodes := make([]Node, len(nodes))
+	for i := range nodes {
+		n := nodes[i].Clone()
+		if err := n.Validate(); err != nil {
+			return fmt.Errorf("node %d: %w", i, err)
+		}
+		if n.UID.IsZero() {
+			n.UID = ComputeNodeUID(n)
+		}
+		nodeUIDs[n.UID] = struct{}{}
+		prepNodes[i] = n
+	}
+
+	for i := range edges {
+		if err := edges[i].Validate(); err != nil {
+			return fmt.Errorf("edge %d: %w", i, err)
+		}
+	}
+	for i := range sites {
+		if err := sites[i].Validate(); err != nil {
+			return fmt.Errorf("call site %d: %w", i, err)
+		}
+	}
+
+	g.mu.Lock()
+	defer g.mu.Unlock()
+
+	if !g.init {
+		g.initWithCapacityLocked(len(prepNodes), len(edges))
+	}
+
+	endpointExists := func(uid UID) bool {
+		if _, ok := nodeUIDs[uid]; ok {
+			return true
+		}
+		_, ok := g.uidToID[uid]
+		return ok
+	}
+	for i := range edges {
+		e := &edges[i]
+		if !endpointExists(e.Source) {
+			return fmt.Errorf("%w: edge %d source %s", ErrNodeNotFound, i, e.Source)
+		}
+		if !endpointExists(e.Target) {
+			return fmt.Errorf("%w: edge %d target %s", ErrNodeNotFound, i, e.Target)
+		}
+	}
+
+	for i := range prepNodes {
+		n := prepNodes[i]
+		if existingID, exists := g.uidToID[n.UID]; exists {
+			g.updateExistingNodeLocked(existingID, n)
+		} else {
+			g.insertNewNodeLocked(n)
+		}
+	}
+	for i := range edges {
+		g.upsertEdgeLocked(edges[i])
+	}
+	for i := range sites {
+		g.addCallSiteLocked(sites[i])
+	}
+	return nil
+}
