@@ -187,12 +187,16 @@ func (v *ReadView) Stats() RepoStats                           { return v.g.stat
 // ---------- Internal Query Implementations (Lock Held) ----------
 
 func (g *Graph) callChainLocked(uid UID, opts CallChainOptions) CallChainResult {
+	normalizedDepth := opts.MaxDepth
+	if normalizedDepth < 0 {
+		normalizedDepth = 0
+	}
 	res := CallChainResult{
 		RootUID:   uid,
 		Direction: opts.Direction,
-		MaxDepth:  opts.MaxDepth,
+		MaxDepth:  normalizedDepth,
 	}
-	if !g.init || uid.IsZero() || opts.MaxDepth <= 0 {
+	if !g.init || uid.IsZero() || normalizedDepth == 0 {
 		return res
 	}
 	startID, ok := g.uidToID[uid]
@@ -200,13 +204,16 @@ func (g *Graph) callChainLocked(uid UID, opts CallChainOptions) CallChainResult 
 		return res
 	}
 
+	// Because emitted chains are simple paths, depth cannot exceed nodeCount.
+	effectiveMaxDepth := min(normalizedDepth, g.nodeCount)
+
 	maxPaths := opts.MaxPaths
 	if maxPaths <= 0 {
 		maxPaths = defaultMaxCallPaths
 	}
 
 	onPath := map[uint32]bool{startID: true}
-	path := make([]Edge, 0, min(opts.MaxDepth, 16))
+	path := make([]Edge, 0, min(effectiveMaxDepth, 16))
 
 	emitChain := func(chain []Edge) {
 		if len(chain) == 0 || res.Truncated {
@@ -224,7 +231,7 @@ func (g *Graph) callChainLocked(uid UID, opts CallChainOptions) CallChainResult 
 		if res.Truncated {
 			return
 		}
-		if depth == opts.MaxDepth {
+		if depth == effectiveMaxDepth {
 			if len(path) > 0 {
 				cp := make([]Edge, len(path))
 				for i := range path {
@@ -333,8 +340,11 @@ func (g *Graph) sortEdgeIDsForTraversal(eids []uint32, dir CallDirection) {
 }
 
 func (g *Graph) impactAnalysisLocked(uid UID, maxDepth int) ImpactResult {
+	if maxDepth < 0 {
+		maxDepth = 0
+	}
 	res := ImpactResult{MaxDepth: maxDepth}
-	if !g.init || uid.IsZero() || maxDepth <= 0 {
+	if !g.init || uid.IsZero() || maxDepth == 0 {
 		return res
 	}
 	startID, ok := g.uidToID[uid]
@@ -345,62 +355,29 @@ func (g *Graph) impactAnalysisLocked(uid UID, maxDepth int) ImpactResult {
 	res.Target = g.nodes[startID].Clone()
 	res.Found = true
 
-	bestDepth := map[uint32]int{startID: 0}
-	bestTier := make(map[uint32]ResolutionTier)
-	viaEdges := make(map[uint32][]Edge)
-	directCallers := make(map[uint32]struct{})
+	// Pass 1: shortest paths using only certain dependency edges.
+	// Pass 2: shortest paths across all dependency edges to capture likely-only impacts & all direct callers.
+	// Certain paths strictly supersede shorter likely-only paths without frontier-order sensitivity.
+	certainState := g.runImpactBFS(startID, maxDepth, true)
+	allState := g.runImpactBFS(startID, maxDepth, false)
 
-	frontier := []uint32{startID}
-	for depth := 1; depth <= maxDepth && len(frontier) > 0; depth++ {
-		var nextFrontier []uint32
-		for _, currID := range frontier {
-			for _, eid := range g.incoming[currID] {
-				e := &g.edges[eid]
-				if !e.alive() || !e.kind.IsDependency() {
-					continue
-				}
-				srcID := e.source
-				if srcID == startID {
-					continue
-				}
-
-				if depth == 1 && e.kind.IsCall() {
-					directCallers[srcID] = struct{}{}
-				}
-
-				pathTier := e.tier
-				if currID != startID {
-					if parentTier := bestTier[currID]; parentTier > pathTier {
-						// A transitive path is only as certain as its weakest hop.
-						pathTier = parentTier
-					}
-				}
-
-				prevDepth, visited := bestDepth[srcID]
-				if !visited {
-					bestDepth[srcID] = depth
-					bestTier[srcID] = pathTier
-					viaEdges[srcID] = []Edge{g.materializeEdgeLocked(eid)}
-					nextFrontier = append(nextFrontier, srcID)
-				} else if prevDepth == depth {
-					viaEdges[srcID] = append(viaEdges[srcID], g.materializeEdgeLocked(eid))
-					if pathTier < bestTier[srcID] {
-						bestTier[srcID] = pathTier
-					}
-				}
-			}
-		}
-		frontier = nextFrontier
-	}
-
-	if len(viaEdges) == 0 {
+	res.DirectCallers = len(allState.directCallers)
+	if len(allState.viaEdges) == 0 {
 		return res
 	}
 
-	impacted := make([]ImpactNode, 0, len(viaEdges))
+	impacted := make([]ImpactNode, 0, len(allState.viaEdges))
 	affectedFileSet := make(map[string]struct{})
-	for nid, edges := range viaEdges {
-		tier := bestTier[nid]
+	for nid := range allState.viaEdges {
+		depth := allState.bestDepth[nid]
+		tier := allState.bestTier[nid]
+		edges := allState.viaEdges[nid]
+		if _, hasCertain := certainState.viaEdges[nid]; hasCertain {
+			depth = certainState.bestDepth[nid]
+			tier = certainState.bestTier[nid]
+			edges = certainState.viaEdges[nid]
+		}
+
 		certain := tier.IsCertain()
 		if certain {
 			res.CertainCount++
@@ -414,7 +391,7 @@ func (g *Graph) impactAnalysisLocked(uid UID, maxDepth int) ImpactResult {
 		}
 		impacted = append(impacted, ImpactNode{
 			Node:          nodeCopy,
-			Depth:         bestDepth[nid],
+			Depth:         depth,
 			EffectiveTier: tier,
 			Certain:       certain,
 			Via:           edges,
@@ -437,11 +414,74 @@ func (g *Graph) impactAnalysisLocked(uid UID, maxDepth int) ImpactResult {
 	}
 	slices.Sort(affectedFiles)
 
-	res.DirectCallers = len(directCallers)
 	res.TotalImpacted = len(impacted)
 	res.Impacted = impacted
 	res.AffectedFiles = affectedFiles
 	return res
+}
+
+type impactBFSState struct {
+	bestDepth     map[uint32]int
+	bestTier      map[uint32]ResolutionTier
+	viaEdges      map[uint32][]Edge
+	directCallers map[uint32]struct{}
+}
+
+func (g *Graph) runImpactBFS(startID uint32, maxDepth int, certainOnly bool) impactBFSState {
+	st := impactBFSState{
+		bestDepth:     map[uint32]int{startID: 0},
+		bestTier:      make(map[uint32]ResolutionTier),
+		viaEdges:      make(map[uint32][]Edge),
+		directCallers: make(map[uint32]struct{}),
+	}
+
+	frontier := []uint32{startID}
+	for depth := 1; depth <= maxDepth && len(frontier) > 0; depth++ {
+		var nextFrontier []uint32
+		for _, currID := range frontier {
+			for _, eid := range g.incoming[currID] {
+				e := &g.edges[eid]
+				if !e.alive() || !e.kind.IsDependency() {
+					continue
+				}
+				if certainOnly && !e.tier.IsCertain() {
+					continue
+				}
+				srcID := e.source
+				if srcID == startID {
+					continue
+				}
+
+				if depth == 1 && e.kind.IsCall() {
+					st.directCallers[srcID] = struct{}{}
+				}
+
+				// Larger ResolutionTier number = weaker confidence; a path is limited by its weakest hop.
+				pathTier := e.tier
+				if currID != startID {
+					if parentTier := st.bestTier[currID]; parentTier > pathTier {
+						pathTier = parentTier
+					}
+				}
+
+				prevDepth, visited := st.bestDepth[srcID]
+				if !visited {
+					st.bestDepth[srcID] = depth
+					st.bestTier[srcID] = pathTier
+					st.viaEdges[srcID] = []Edge{g.materializeEdgeLocked(eid)}
+					nextFrontier = append(nextFrontier, srcID)
+				} else if prevDepth == depth {
+					st.viaEdges[srcID] = append(st.viaEdges[srcID], g.materializeEdgeLocked(eid))
+					// Smaller ResolutionTier number = stronger confidence.
+					if pathTier < st.bestTier[srcID] {
+						st.bestTier[srcID] = pathTier
+					}
+				}
+			}
+		}
+		frontier = nextFrontier
+	}
+	return st
 }
 
 func (g *Graph) traverseHierarchyLocked(uid UID, upward bool) []Node {
@@ -538,11 +578,11 @@ func (g *Graph) searchLocked(q SearchQuery) SearchResult {
 	qnamePat := strings.TrimSpace(q.QNamePattern)
 	filePat := strings.TrimSpace(q.FilePattern)
 
-	type scoredNode struct {
-		node  Node
+	type scoredMatch struct {
+		idx   int
 		score int
 	}
-	var matches []scoredNode
+	var matches []scoredMatch
 
 	for i := range g.nodes {
 		n := &g.nodes[i]
@@ -584,17 +624,17 @@ func (g *Graph) searchLocked(q SearchQuery) SearchResult {
 			score = sc
 		}
 
-		matches = append(matches, scoredNode{
-			node:  n.Clone(),
+		matches = append(matches, scoredMatch{
+			idx:   i,
 			score: score,
 		})
 	}
 
-	slices.SortFunc(matches, func(a, b scoredNode) int {
+	slices.SortFunc(matches, func(a, b scoredMatch) int {
 		if c := cmp.Compare(a.score, b.score); c != 0 {
 			return c
 		}
-		return compareNodesByLocation(a.node, b.node)
+		return compareNodesByLocation(g.nodes[a.idx], g.nodes[b.idx])
 	})
 
 	res.Total = len(matches)
@@ -607,21 +647,18 @@ func (g *Graph) searchLocked(q SearchQuery) SearchResult {
 		start = 0
 	}
 	if start >= res.Total {
-		res.Truncated = false
 		return res
 	}
 
 	end := res.Total
 	if q.Limit > 0 && start+q.Limit < end {
 		end = start + q.Limit
-		res.Truncated = true
-	} else if start > 0 && end < res.Total {
-		res.Truncated = true
 	}
+	res.Truncated = end < res.Total
 
 	res.Nodes = make([]Node, 0, end-start)
 	for i := start; i < end; i++ {
-		res.Nodes = append(res.Nodes, matches[i].node)
+		res.Nodes = append(res.Nodes, g.nodes[matches[i].idx].Clone())
 	}
 	res.Returned = len(res.Nodes)
 	return res

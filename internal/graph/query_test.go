@@ -128,6 +128,12 @@ func TestCallChainDirectionsCyclesAndOptions(t *testing.T) {
 
 	g, uids := buildQueryTestGraph(t)
 
+	// Negative MaxDepth is clamped to 0 in result
+	negRes := g.CallChainWithOptions(uids["main"], CallChainOptions{Direction: DirectionCallees, MaxDepth: -1})
+	if negRes.MaxDepth != 0 || len(negRes.Chains) != 0 {
+		t.Fatalf("expected negative MaxDepth clamped to 0, got %+v", negRes)
+	}
+
 	// Depth <= 0 or missing node returns nil
 	if chains := g.CallChain(uids["main"], 0, DirectionCallees); chains != nil {
 		t.Fatalf("CallChain depth 0 should be nil, got %+v", chains)
@@ -200,13 +206,11 @@ func TestImpactAnalysisPropagationAndCycleSafety(t *testing.T) {
 	}
 
 	// Impact of changing execSQL up to depth 3:
-	// Depth 1: saveUser (certain: TierLocal), audit (likely: TierTypeNarrowed)
-	// Depth 2: handleReq (certain via saveUser), main (certain via audit? NO! audit->execSQL was likely, so at depth 2 main via audit is likely;
-	//          Wait: main also calls audit at depth 2 and handleAdm calls audit at depth 2, then main is depth 3 via handleReq->saveUser!)
-	// Let's trace exact shortest depth:
 	// Depth 1: saveUser (TierLocal, certain), audit (TierTypeNarrowed, likely)
-	// Depth 2: handleReq (via saveUser, TierQualifiedImport, certain), main (via audit -> execSQL, effective TierTypeNarrowed = likely!), handleAdm (via audit -> execSQL, effective TierTypeNarrowed = likely!)
-	// Depth 3: testSvc (imports handleReq -> saveUser -> execSQL, TierQualifiedImport, certain!)
+	// Depth 2: handleReq (via saveUser, TierQualifiedImport, certain),
+	//          handleAdm (only via audit, TierTypeNarrowed, likely)
+	// Depth 3: main reaches execSQL via likely audit at depth 2 AND certain handleReq->saveUser at depth 3 -> upgraded to Certain: true!
+	//          testSvc (imports handleReq -> saveUser -> execSQL, TierQualifiedImport, certain)
 	res := g.ImpactAnalysis(uids["execSQL"], 3)
 	if !res.Found || res.Target.UID != uids["execSQL"] {
 		t.Fatal("ImpactAnalysis target mismatch")
@@ -216,6 +220,9 @@ func TestImpactAnalysisPropagationAndCycleSafety(t *testing.T) {
 	}
 	if res.TotalImpacted != 6 {
 		t.Fatalf("TotalImpacted = %d, want 6; got %+v", res.TotalImpacted, res.Impacted)
+	}
+	if res.CertainCount != 4 || res.LikelyCount != 2 { // certain: saveUser, handleReq, main, testSvc; likely: audit, handleAdm
+		t.Fatalf("CertainCount/LikelyCount = %d/%d, want 4/2", res.CertainCount, res.LikelyCount)
 	}
 
 	byKey := make(map[UID]ImpactNode, len(res.Impacted))
@@ -228,15 +235,31 @@ func TestImpactAnalysisPropagationAndCycleSafety(t *testing.T) {
 	if byKey[uids["audit"]].Certain || byKey[uids["audit"]].EffectiveTier != TierTypeNarrowed {
 		t.Fatalf("audit impact should be likely/TierTypeNarrowed: %+v", byKey[uids["audit"]])
 	}
-	// Honesty check (P2): main reaches execSQL in 2 hops via likely audit->execSQL, so EffectiveTier must be TierTypeNarrowed (likely), NOT certain!
-	if byKey[uids["main"]].Depth != 2 || byKey[uids["main"]].Certain || byKey[uids["main"]].EffectiveTier != TierTypeNarrowed {
-		t.Fatalf("main transitive certainty leaked across likely hop: %+v", byKey[uids["main"]])
+	if byKey[uids["handleAdm"]].Depth != 2 || byKey[uids["handleAdm"]].Certain || byKey[uids["handleAdm"]].EffectiveTier != TierTypeNarrowed {
+		t.Fatalf("handleAdm (only reachable via likely edge) unexpected: %+v", byKey[uids["handleAdm"]])
 	}
-	// Decorator edge makes handleAdm impacted when decorator changes (let's verify below),
-	// and IMPORTS edge makes testSvc impacted at depth 3 when execSQL changes!
+	// Deeper certain path (depth 3 via handleReq->saveUser) upgrades shorter likely path (depth 2 via audit)!
+	if byKey[uids["main"]].Depth != 3 || !byKey[uids["main"]].Certain || byKey[uids["main"]].EffectiveTier != TierQualifiedImport {
+		t.Fatalf("main should be upgraded to depth-3 certain path: %+v", byKey[uids["main"]])
+	}
 	if byKey[uids["testSvc"]].Depth != 3 || !byKey[uids["testSvc"]].Certain {
 		t.Fatalf("testSvc impact via IMPORTS unexpected: %+v", byKey[uids["testSvc"]])
 	}
+
+	// Cascading downstream upgrade: node calling main at depth 4 inherits main's upgraded depth-3 certain path!
+	cliUID, _ := g.AddNode(Node{Kind: KindFunction, Name: "cli", QName: "cmd::cli", File: "cmd/main.go", StartLine: 1})
+	_ = g.AddEdge(Edge{Source: cliUID, Target: uids["main"], Kind: EdgeCalls, Tier: TierLocal, Sites: []CallSiteRef{{Line: 2}}})
+	cascaded := g.ImpactAnalysis(uids["execSQL"], 4)
+	var cliImpact ImpactNode
+	for _, imp := range cascaded.Impacted {
+		if imp.Node.UID == cliUID {
+			cliImpact = imp
+		}
+	}
+	if !cliImpact.Certain || cliImpact.Depth != 4 || cliImpact.EffectiveTier != TierQualifiedImport {
+		t.Fatalf("cascaded downstream impact failed to inherit upgraded certain path: %+v", cliImpact)
+	}
+	_ = g.RemoveNode(cliUID)
 
 	expectedFiles := []string{"cmd/main.go", "pkg/repo/repo.go", "pkg/service/service.go", "pkg/service/service_test.go"}
 	if !slices.Equal(res.AffectedFiles, expectedFiles) {
@@ -356,6 +379,23 @@ func TestSearchFiltersGlobsRankingAndPagination(t *testing.T) {
 	})
 	if page1.Total != 10 || page1.Returned != 3 || !page1.Truncated {
 		t.Fatalf("SearchWithStats pagination mismatch: total=%d returned=%d truncated=%v", page1.Total, page1.Returned, page1.Truncated)
+	}
+	// Last page with Offset > 0 and no trailing omitted results must set Truncated=false
+	lastPage := g.SearchWithStats(SearchQuery{
+		Kinds:  []NodeKind{KindFunction},
+		Offset: 7,
+		Limit:  10,
+	})
+	if lastPage.Total != 10 || lastPage.Returned != 3 || lastPage.Truncated {
+		t.Fatalf("SearchWithStats tail page mismatch: total=%d returned=%d truncated=%v", lastPage.Total, lastPage.Returned, lastPage.Truncated)
+	}
+	exactEndPage := g.SearchWithStats(SearchQuery{
+		Kinds:  []NodeKind{KindFunction},
+		Offset: 7,
+		Limit:  3,
+	})
+	if exactEndPage.Total != 10 || exactEndPage.Returned != 3 || exactEndPage.Truncated {
+		t.Fatalf("SearchWithStats exact-end page mismatch: total=%d returned=%d truncated=%v", exactEndPage.Total, exactEndPage.Returned, exactEndPage.Truncated)
 	}
 	outOfRange := g.SearchWithStats(SearchQuery{Offset: 999, Limit: 5})
 	if outOfRange.Total == 0 || outOfRange.Returned != 0 || len(outOfRange.Nodes) != 0 {
