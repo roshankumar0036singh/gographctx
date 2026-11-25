@@ -1,6 +1,7 @@
 package storage
 
 import (
+	"bufio"
 	"bytes"
 	"encoding/binary"
 	"errors"
@@ -189,6 +190,20 @@ func (w *binWriter) writeString(s string) {
 	_, _ = w.buf.WriteString(s)
 }
 
+type recordReader interface {
+	readU8() (uint8, error)
+	readU16() (uint16, error)
+	readU32() (uint32, error)
+	readUvarint() (uint64, error)
+	readExact(dst []byte) error
+	readString() (string, error)
+	lookupTableString(tbl []string) (string, error)
+	checkCount(count, minBytes uint64, what string) error
+	safePreallocCap(count uint64) int
+}
+
+const maxStreamPrealloc = 4096
+
 type binReader struct {
 	data []byte
 	pos  int
@@ -277,8 +292,194 @@ func (r *binReader) checkCount(count, minBytes uint64, what string) error {
 	return nil
 }
 
+func (r *binReader) safePreallocCap(count uint64) int {
+	return int(count)
+}
+
 func (r *binReader) lookupTableString(tbl []string) (string, error) {
 	idx, err := r.readUvarint()
+	if err != nil {
+		return "", err
+	}
+	if idx >= uint64(len(tbl)) {
+		return "", fmt.Errorf("%w: string table index %d out of bounds (%d)", ErrInvalidFormat, idx, len(tbl))
+	}
+	return tbl[idx], nil
+}
+
+// streamReader decodes binary records sequentially from a bufio.Reader without buffering
+// the entire uncompressed payload at once.
+type streamReader struct {
+	br       *bufio.Reader
+	hasBound bool
+	remBytes uint64
+	strBuf   []byte
+}
+
+func newStreamReader(r io.Reader, bound uint64, hasBound bool) *streamReader {
+	br, ok := r.(*bufio.Reader)
+	if !ok {
+		br = bufio.NewReaderSize(r, 256*1024)
+	}
+	return &streamReader{
+		br:       br,
+		hasBound: hasBound,
+		remBytes: bound,
+	}
+}
+
+func (s *streamReader) consume(n uint64) error {
+	if s.hasBound {
+		if n > s.remBytes {
+			return io.ErrUnexpectedEOF
+		}
+		s.remBytes -= n
+	}
+	return nil
+}
+
+func (s *streamReader) ReadByte() (byte, error) {
+	b, err := s.br.ReadByte()
+	if err != nil {
+		if errors.Is(err, io.EOF) {
+			return 0, io.ErrUnexpectedEOF
+		}
+		return 0, err
+	}
+	if err := s.consume(1); err != nil {
+		return 0, err
+	}
+	return b, nil
+}
+
+func (s *streamReader) readU8() (uint8, error) {
+	return s.ReadByte()
+}
+
+func (s *streamReader) readU16() (uint16, error) {
+	var b [2]byte
+	if err := s.readExact(b[:]); err != nil {
+		return 0, err
+	}
+	return binary.LittleEndian.Uint16(b[:]), nil
+}
+
+func (s *streamReader) readU32() (uint32, error) {
+	var b [4]byte
+	if err := s.readExact(b[:]); err != nil {
+		return 0, err
+	}
+	return binary.LittleEndian.Uint32(b[:]), nil
+}
+
+func (s *streamReader) readUvarint() (uint64, error) {
+	var x uint64
+	var shift uint
+	for i := 0; i < binary.MaxVarintLen64; i++ {
+		b, err := s.br.ReadByte()
+		if err != nil {
+			if errors.Is(err, io.EOF) {
+				return 0, io.ErrUnexpectedEOF
+			}
+			return 0, err
+		}
+		if s.hasBound {
+			if s.remBytes == 0 {
+				return 0, io.ErrUnexpectedEOF
+			}
+			s.remBytes--
+		}
+		if b < 0x80 {
+			if i == binary.MaxVarintLen64-1 && b > 1 {
+				return 0, fmt.Errorf("%w: varint overflow", ErrInvalidFormat)
+			}
+			return x | uint64(b)<<shift, nil
+		}
+		x |= uint64(b&0x7f) << shift
+		shift += 7
+	}
+	return 0, fmt.Errorf("%w: varint overflow", ErrInvalidFormat)
+}
+
+func (s *streamReader) readExact(dst []byte) error {
+	if err := s.consume(uint64(len(dst))); err != nil {
+		return err
+	}
+	_, err := io.ReadFull(s.br, dst)
+	if errors.Is(err, io.EOF) {
+		return io.ErrUnexpectedEOF
+	}
+	return err
+}
+
+func (s *streamReader) readString() (string, error) {
+	n, err := s.readUvarint()
+	if err != nil {
+		return "", err
+	}
+	if n == 0 {
+		return "", nil
+	}
+	if err := s.checkCount(n, 1, "string"); err != nil {
+		return "", err
+	}
+	if n <= 1024*1024 || s.hasBound {
+		ni := int(n)
+		if cap(s.strBuf) < ni {
+			s.strBuf = make([]byte, ni)
+		} else {
+			s.strBuf = s.strBuf[:ni]
+		}
+		if err := s.readExact(s.strBuf); err != nil {
+			return "", err
+		}
+		return string(s.strBuf), nil
+	}
+	// Compressed unbounded stream: read in chunks so huge bogus varint fails on EOF without OOM.
+	var sb strings.Builder
+	sb.Grow(4096)
+	var chunk [4096]byte
+	rem := n
+	for rem > 0 {
+		take := min(rem, uint64(len(chunk)))
+		if err := s.readExact(chunk[:take]); err != nil {
+			return "", err
+		}
+		sb.Write(chunk[:take])
+		rem -= take
+	}
+	return sb.String(), nil
+}
+
+func (s *streamReader) checkCount(count, minBytes uint64, what string) error {
+	if count == 0 {
+		return nil
+	}
+	if minBytes == 0 {
+		minBytes = 1
+	}
+	if s.hasBound && count > s.remBytes/minBytes {
+		return fmt.Errorf("%w: %s count %d exceeds remaining %d bytes", ErrInvalidFormat, what, count, s.remBytes)
+	}
+	// Even for unbounded compressed streams, reject blatantly absurd > 1e9 counts immediately.
+	if count > 1<<30 {
+		return fmt.Errorf("%w: %s count %d exceeds sanity limit", ErrInvalidFormat, what, count)
+	}
+	return nil
+}
+
+func (s *streamReader) safePreallocCap(count uint64) int {
+	if s.hasBound {
+		return int(count)
+	}
+	if count > maxStreamPrealloc {
+		return maxStreamPrealloc
+	}
+	return int(count)
+}
+
+func (s *streamReader) lookupTableString(tbl []string) (string, error) {
+	idx, err := s.readUvarint()
 	if err != nil {
 		return "", err
 	}
@@ -331,7 +532,7 @@ func writeNodeRecord(w *binWriter, n *graph.Node, st *stringTable) {
 	w.writeString(n.Docstring)
 }
 
-func readNodeRecord(r *binReader, tbl []string) (graph.Node, error) {
+func readNodeRecord(r recordReader, tbl []string) (graph.Node, error) {
 	var n graph.Node
 	if err := r.readExact(n.UID[:]); err != nil {
 		return n, err
@@ -392,14 +593,16 @@ func readNodeRecord(r *binReader, tbl []string) (graph.Node, error) {
 		if err := r.checkCount(paramCount, 2, "param"); err != nil {
 			return n, err
 		}
-		n.Params = make([]graph.Param, paramCount)
+		n.Params = make([]graph.Param, 0, r.safePreallocCap(paramCount))
 		for i := uint64(0); i < paramCount; i++ {
-			if n.Params[i].Name, err = r.readString(); err != nil {
+			var p graph.Param
+			if p.Name, err = r.readString(); err != nil {
 				return n, err
 			}
-			if n.Params[i].Type, err = r.lookupTableString(tbl); err != nil {
+			if p.Type, err = r.lookupTableString(tbl); err != nil {
 				return n, err
 			}
+			n.Params = append(n.Params, p)
 		}
 	}
 
@@ -411,11 +614,13 @@ func readNodeRecord(r *binReader, tbl []string) (graph.Node, error) {
 		if err := r.checkCount(decCount, 1, "decorator"); err != nil {
 			return n, err
 		}
-		n.Decorators = make([]string, decCount)
+		n.Decorators = make([]string, 0, r.safePreallocCap(decCount))
 		for i := uint64(0); i < decCount; i++ {
-			if n.Decorators[i], err = r.lookupTableString(tbl); err != nil {
+			dec, err := r.lookupTableString(tbl)
+			if err != nil {
 				return n, err
 			}
+			n.Decorators = append(n.Decorators, dec)
 		}
 	}
 
@@ -427,11 +632,13 @@ func readNodeRecord(r *binReader, tbl []string) (graph.Node, error) {
 		if err := r.checkCount(baseCount, 1, "base"); err != nil {
 			return n, err
 		}
-		n.Bases = make([]string, baseCount)
+		n.Bases = make([]string, 0, r.safePreallocCap(baseCount))
 		for i := uint64(0); i < baseCount; i++ {
-			if n.Bases[i], err = r.lookupTableString(tbl); err != nil {
+			base, err := r.lookupTableString(tbl)
+			if err != nil {
 				return n, err
 			}
+			n.Bases = append(n.Bases, base)
 		}
 	}
 
@@ -451,7 +658,7 @@ func writeEdgeSites(w *binWriter, sites []graph.CallSiteRef, st *stringTable) {
 	}
 }
 
-func readEdgeSites(r *binReader, tbl []string) ([]graph.CallSiteRef, error) {
+func readEdgeSites(r recordReader, tbl []string) ([]graph.CallSiteRef, error) {
 	cnt, err := r.readUvarint()
 	if err != nil {
 		return nil, err
@@ -462,32 +669,71 @@ func readEdgeSites(r *binReader, tbl []string) ([]graph.CallSiteRef, error) {
 	if err := r.checkCount(cnt, 5, "edge site"); err != nil {
 		return nil, err
 	}
-	sites := make([]graph.CallSiteRef, cnt)
+	sites := make([]graph.CallSiteRef, 0, r.safePreallocCap(cnt))
 	for i := uint64(0); i < cnt; i++ {
-		line, err := r.readUvarint()
+		site, err := readSingleEdgeSite(r, tbl)
 		if err != nil {
 			return nil, err
 		}
-		col, err := r.readU16()
-		if err != nil {
-			return nil, err
-		}
-		tier, err := r.readU8()
-		if err != nil {
-			return nil, err
-		}
-		lbl, err := r.lookupTableString(tbl)
-		if err != nil {
-			return nil, err
-		}
-		sites[i] = graph.CallSiteRef{
-			Line:   uint32(line),
-			Column: col,
-			Tier:   graph.ResolutionTier(tier),
-			Label:  lbl,
-		}
+		sites = append(sites, site)
 	}
 	return sites, nil
+}
+
+func readDenseEdgeSites(r recordReader, tbl []string, dst *graph.DenseEdge) error {
+	cnt, err := r.readUvarint()
+	if err != nil {
+		return err
+	}
+	if cnt == 0 {
+		return nil
+	}
+	if err := r.checkCount(cnt, 5, "edge site"); err != nil {
+		return err
+	}
+	site0, err := readSingleEdgeSite(r, tbl)
+	if err != nil {
+		return err
+	}
+	dst.HasPrimary = true
+	dst.PrimarySite = site0
+	if cnt == 1 {
+		return nil
+	}
+	dst.Sites = make([]graph.CallSiteRef, 0, r.safePreallocCap(cnt-1))
+	for i := uint64(1); i < cnt; i++ {
+		site, err := readSingleEdgeSite(r, tbl)
+		if err != nil {
+			return err
+		}
+		dst.Sites = append(dst.Sites, site)
+	}
+	return nil
+}
+
+func readSingleEdgeSite(r recordReader, tbl []string) (graph.CallSiteRef, error) {
+	line, err := r.readUvarint()
+	if err != nil {
+		return graph.CallSiteRef{}, err
+	}
+	col, err := r.readU16()
+	if err != nil {
+		return graph.CallSiteRef{}, err
+	}
+	tier, err := r.readU8()
+	if err != nil {
+		return graph.CallSiteRef{}, err
+	}
+	lbl, err := r.lookupTableString(tbl)
+	if err != nil {
+		return graph.CallSiteRef{}, err
+	}
+	return graph.CallSiteRef{
+		Line:   uint32(line),
+		Column: col,
+		Tier:   graph.ResolutionTier(tier),
+		Label:  lbl,
+	}, nil
 }
 
 func writeCallSiteRecord(w *binWriter, cs *graph.CallSite, st *stringTable) {
@@ -507,7 +753,7 @@ func writeCallSiteRecord(w *binWriter, cs *graph.CallSite, st *stringTable) {
 	}
 }
 
-func readCallSiteRecord(r *binReader, tbl []string) (graph.CallSite, error) {
+func readCallSiteRecord(r recordReader, tbl []string) (graph.CallSite, error) {
 	var cs graph.CallSite
 	var err error
 	if err = r.readExact(cs.Caller[:]); err != nil {
@@ -551,11 +797,13 @@ func readCallSiteRecord(r *binReader, tbl []string) (graph.CallSite, error) {
 		if err := r.checkCount(candCount, 16, "candidate"); err != nil {
 			return cs, err
 		}
-		cs.Candidates = make([]graph.UID, candCount)
+		cs.Candidates = make([]graph.UID, 0, r.safePreallocCap(candCount))
 		for i := uint64(0); i < candCount; i++ {
-			if err = r.readExact(cs.Candidates[i][:]); err != nil {
+			var u graph.UID
+			if err = r.readExact(u[:]); err != nil {
 				return cs, err
 			}
+			cs.Candidates = append(cs.Candidates, u)
 		}
 	}
 	return cs, nil

@@ -231,3 +231,219 @@ func (g *Graph) BulkLoad(nodes []Node, edges []Edge, sites []CallSite) error {
 	}
 	return nil
 }
+
+// DenseEdge represents an edge referencing 0-based node indices into a parallel []Node slice
+// (used for zero-lookup bulk loading from snapshot decoders).
+// Single-site edges can populate HasPrimary + PrimarySite to avoid per-edge slice allocations.
+type DenseEdge struct {
+	SourceIdx   uint32
+	TargetIdx   uint32
+	Kind        EdgeKind
+	Tier        ResolutionTier
+	Label       string
+	HasPrimary  bool
+	PrimarySite CallSiteRef
+	Sites       []CallSiteRef
+}
+
+// LoadDense validates and bulk-loads nodes, index-addressed edges, and call sites
+// directly into pre-sized graph storage, eliminating per-edge UID map lookups and
+// intermediate adjacency slice reallocations on empty graphs.
+func (g *Graph) LoadDense(nodes []Node, edges []DenseEdge, sites []CallSite) error {
+	for i := range nodes {
+		if err := nodes[i].Validate(); err != nil {
+			return fmt.Errorf("node %d: %w", i, err)
+		}
+		if nodes[i].UID.IsZero() {
+			nodes[i].UID = ComputeNodeUID(nodes[i])
+		}
+	}
+
+	numNodes := uint32(len(nodes))
+	outDeg := make([]uint32, len(nodes))
+	inDeg := make([]uint32, len(nodes))
+
+	for i := range edges {
+		e := &edges[i]
+		if e.SourceIdx >= numNodes {
+			return fmt.Errorf("%w: edge %d source index %d >= %d", ErrNodeNotFound, i, e.SourceIdx, numNodes)
+		}
+		if e.TargetIdx >= numNodes {
+			return fmt.Errorf("%w: edge %d target index %d >= %d", ErrNodeNotFound, i, e.TargetIdx, numNodes)
+		}
+		if !e.Kind.IsValid() {
+			return fmt.Errorf("%w: edge %d unknown kind %d", ErrInvalidEdge, i, e.Kind)
+		}
+		if e.SourceIdx == e.TargetIdx && !e.Kind.IsCall() {
+			return fmt.Errorf("%w: self-loop is not allowed for %s edges", ErrInvalidEdge, e.Kind)
+		}
+		if err := validateTierForKind(e.Kind, e.Tier); err != nil {
+			return fmt.Errorf("edge %d: %w", i, err)
+		}
+		if e.HasPrimary {
+			if err := validateDenseSite(i, e.Kind, e.Tier, e.PrimarySite); err != nil {
+				return err
+			}
+		}
+		for _, s := range e.Sites {
+			if err := validateDenseSite(i, e.Kind, e.Tier, s); err != nil {
+				return err
+			}
+		}
+		outDeg[e.SourceIdx]++
+		inDeg[e.TargetIdx]++
+	}
+
+	for i := range sites {
+		if err := sites[i].Validate(); err != nil {
+			return fmt.Errorf("call site %d: %w", i, err)
+		}
+	}
+
+	g.mu.Lock()
+	defer g.mu.Unlock()
+
+	if !g.init || g.nodeCount == 0 {
+		g.initWithCapacityLocked(len(nodes), len(edges))
+		g.nodes = make([]Node, len(nodes))
+		g.outgoing = make([][]uint32, len(nodes))
+		g.incoming = make([][]uint32, len(nodes))
+		g.edges = make([]edgeEntry, 0, len(edges))
+
+		idMap := make([]uint32, len(nodes))
+		for i := range nodes {
+			stored := nodes[i].Clone()
+			g.internNodeStrings(&stored)
+			if existingID, dup := g.uidToID[stored.UID]; dup {
+				// Overwrite existing node slot on duplicate UID
+				idMap[i] = existingID
+				g.updateExistingNodeLocked(existingID, stored)
+				continue
+			}
+			id := uint32(g.nodeCount)
+			idMap[i] = id
+			g.nodes[id] = stored
+			g.uidToID[stored.UID] = id
+			g.nodeCount++
+			g.indexNodeLocked(id, &g.nodes[id])
+			if outDeg[i] > 0 {
+				g.outgoing[id] = make([]uint32, 0, outDeg[i])
+			}
+			if inDeg[i] > 0 {
+				g.incoming[id] = make([]uint32, 0, inDeg[i])
+			}
+		}
+		if g.nodeCount < len(g.nodes) {
+			g.nodes = g.nodes[:g.nodeCount]
+			g.outgoing = g.outgoing[:g.nodeCount]
+			g.incoming = g.incoming[:g.nodeCount]
+		}
+
+		for i := range edges {
+			e := &edges[i]
+			srcID := idMap[e.SourceIdx]
+			tgtID := idMap[e.TargetIdx]
+			key := compactEdgeKey{source: srcID, target: tgtID, kind: e.Kind}
+			if eid, exists := g.edgeToID[key]; exists {
+				entry := &g.edges[eid]
+				if e.Tier < entry.tier {
+					entry.tier = e.Tier
+					if e.Label != "" {
+						entry.labelID = g.labels.intern(e.Label)
+					}
+				}
+				if e.HasPrimary {
+					g.appendUniqueSiteLocked(entry, g.toCompactSite(e.PrimarySite, e.Kind, e.Tier))
+				}
+				for _, s := range e.Sites {
+					g.appendUniqueSiteLocked(entry, g.toCompactSite(s, e.Kind, e.Tier))
+				}
+				continue
+			}
+			g.insertDenseEdgeLocked(srcID, tgtID, e)
+		}
+
+		for i := range sites {
+			g.addCallSiteLocked(sites[i])
+		}
+		return nil
+	}
+
+	// Non-empty graph fallback: map dense nodes/edges cleanly via normal upsert paths.
+	idMap := make([]UID, len(nodes))
+	for i := range nodes {
+		n := nodes[i]
+		idMap[i] = n.UID
+		if existingID, exists := g.uidToID[n.UID]; exists {
+			g.updateExistingNodeLocked(existingID, n)
+		} else {
+			g.insertNewNodeLocked(n)
+		}
+	}
+	for i := range edges {
+		e := &edges[i]
+		var allSites []CallSiteRef
+		if e.HasPrimary {
+			allSites = make([]CallSiteRef, 0, 1+len(e.Sites))
+			allSites = append(allSites, e.PrimarySite)
+			allSites = append(allSites, e.Sites...)
+		} else {
+			allSites = e.Sites
+		}
+		g.upsertEdgeLocked(Edge{
+			Source: idMap[e.SourceIdx],
+			Target: idMap[e.TargetIdx],
+			Kind:   e.Kind,
+			Tier:   e.Tier,
+			Label:  e.Label,
+			Sites:  allSites,
+		})
+	}
+	for i := range sites {
+		g.addCallSiteLocked(sites[i])
+	}
+	return nil
+}
+
+func validateDenseSite(edgeIdx int, kind EdgeKind, edgeTier ResolutionTier, s CallSiteRef) error {
+	if s.Line == 0 {
+		return fmt.Errorf("%w: edge %d call site line must be > 0", ErrInvalidEdge, edgeIdx)
+	}
+	siteTier := s.Tier
+	if siteTier == 0 && kind.IsCall() {
+		siteTier = edgeTier
+	}
+	if err := validateTierForKind(kind, siteTier); err != nil {
+		return fmt.Errorf("edge %d call site at line %d: %w", edgeIdx, s.Line, err)
+	}
+	return nil
+}
+
+func (g *Graph) insertDenseEdgeLocked(srcID, tgtID uint32, e *DenseEdge) {
+	var eid uint32
+	if numFree := len(g.freeEdgeIDs); numFree > 0 {
+		eid = g.freeEdgeIDs[numFree-1]
+		g.freeEdgeIDs = g.freeEdgeIDs[:numFree-1]
+	} else {
+		eid = uint32(len(g.edges))
+		g.edges = append(g.edges, edgeEntry{})
+	}
+	entry := &g.edges[eid]
+	*entry = edgeEntry{
+		source:  srcID,
+		target:  tgtID,
+		kind:    e.Kind,
+		tier:    e.Tier,
+		labelID: g.labels.intern(e.Label),
+	}
+	if e.HasPrimary {
+		g.appendUniqueSiteLocked(entry, g.toCompactSite(e.PrimarySite, e.Kind, e.Tier))
+	}
+	for _, s := range e.Sites {
+		g.appendUniqueSiteLocked(entry, g.toCompactSite(s, e.Kind, e.Tier))
+	}
+	g.edgeToID[compactEdgeKey{source: srcID, target: tgtID, kind: e.Kind}] = eid
+	g.outgoing[srcID] = append(g.outgoing[srcID], eid)
+	g.incoming[tgtID] = append(g.incoming[tgtID], eid)
+	g.edgeCount++
+}
