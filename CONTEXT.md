@@ -1178,12 +1178,14 @@ d:\gographctx\gographctx\
 - `internal/graph/query.go`:
   - `Callers(uid) → []Edge` — direct callers with confidence
   - `Callees(uid) → []Edge` — direct callees with confidence
-  - `CallChain(uid, depth, direction) → [][]Edge` — transitive callers/callees up to depth
+  - `CallChain(uid, depth, direction) → [][]Edge` & `CallChainWithOptions(...)` — bounded, cycle-safe transitive callers/callees
   - `FileNodes(path) → []Node` — all symbols in a file
-  - `Search(query SearchQuery) → []Node` — multi-criteria search (name pattern, kind, file pattern, complexity range)
-  - `ImpactAnalysis(uid, depth) → ImpactResult` — transitive callers + affected files
-  - `Ancestors(uid) → []Node` — inheritance chain
-  - `Descendants(uid) → []Node` — subclasses/implementors
+  - `Search(query SearchQuery) → []Node` & `SearchWithStats(...)` — multi-criteria search (globs, kind, language, file, exported, complexity range, pagination)
+  - `ImpactAnalysis(uid, depth) → ImpactResult` — transitive dependency blast radius with honest tier propagation & affected files
+  - `Ancestors(uid) → []Node` — inheritance & interface implementation chain
+  - `Descendants(uid) → []Node` — subclasses & implementors
+  - `Stats() → RepoStats` — aggregate counts & resolution coverage
+  - Full `ReadView` mirror methods for consistent multi-call queries under one `RLock`
 - Tests: table-driven tests with hand-built graphs covering all query types
 **Exit criteria:** All query operations return correct results on hand-built test graphs
 
