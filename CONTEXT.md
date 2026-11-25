@@ -451,7 +451,7 @@ CGC's biggest performance problem is writing to and querying an external/embedde
 | Neo4j / FalkorDB / KùzuDB | External or slow embedded DB; write amplification caused CGC's 7–61s Flask bottleneck |
 | Monolithic single `.ggctx` rewrite | Rewriting the whole snapshot on every file save violates **P3 (Change-Proportional Work)** |
 | `mmap` directly over Go maps | Go maps/slices require deserialization into managed heap objects; sequential snapshot streaming + WAL replay is honest and fast |
-| SQLite (WAL + startup bulk load) | **Measured in Phase 3 Spike** against custom Snapshot+WAL for 150k/600k startup load time, file write latency, and binary footprint |
+| SQLite (WAL + startup bulk load) | **Rejected after Phase 3 Spike** (150k/600k: 18.87s write, 3.50s load, 10.6ms 1-file tx, 75.84 MB disk vs Snapshot+WAL: 0.70s raw / 1.48s zstd write, 0.93s load, <0.55ms WAL append, 7.85 MB zstd / 19.56 MB raw) |
 | BadgerDB / BoltDB | Key-value stores add B+tree write amplification with no benefit over Memory-First + Snapshot+WAL |
 
 ### Graph Data Structures (In-Memory)
@@ -1192,13 +1192,13 @@ d:\gographctx\gographctx\
 #### Phase 3: Storage Benchmark Spike & Persistence Writer (Snapshot + WAL)
 **Goal:** Benchmark SQLite (WAL + startup bulk load) vs custom Snapshot+WAL at 150k nodes / 600k edges, then implement snapshot serialization and append-only WAL delta writes.
 **Deliverables:**
-- `internal/storage/spike_test.go` — comparative benchmark (startup load latency, incremental file write latency, disk footprint) of SQLite vs custom Snapshot+WAL at 150k/600k scale
-- `internal/storage/format.go` — Magic bytes, version, header structs, Snapshot & WAL record constants
+- `internal/storage/spike_test.go` — comparative benchmark (`Snapshot_Raw`, `Snapshot_Zstd`, `SQLite_WAL`) at 150k nodes / 600k edges confirming Snapshot+WAL (~27x faster write, ~3.75x faster load, ~20x+ faster 1-file write, 7.85 MB zstd vs 75.84 MB SQLite)
+- `internal/storage/format.go` — 80-byte `SnapshotHeader` (SHA-256), 16-byte `WALHeader`, interned string-table & compact binary codecs
 - `internal/storage/writer.go`:
-  - Atomic base snapshot write (`temp → fsync → rename`) with string/label tables, `CallSite` records, optional zstd compression, and SHA-256 verification
-  - `AppendFileDelta(ReplaceResult / FileFragment)` — $O(\text{file})$ CRC-framed WAL append for incremental edits (satisfies P3)
-  - Background WAL compaction into a fresh base snapshot
-- Tests: round-trip snapshot test, WAL append latency test, crash-mid-write recovery test
+  - `WriteSnapshot`: atomic base snapshot (`temp → sync → rename`) with optional zstd compression, dense `uvarint` edge endpoints, `CallSiteRef` sites, and `CallSite` records
+  - `WALWriter` (`OpenWAL`, `AppendReplaceFile`, `AppendRemoveFile`): $O(\text{file})$ CRC-32C-framed incremental delta writes (satisfies P3)
+  - `Store` (`OpenStore`, `Compact`): coordinated Snapshot + WAL management and atomic WAL reset after compaction
+- Tests (`writer_test.go`): determinism, raw/zstd round-trip, SHA-256/magic/version/truncation errors, torn-WAL crash recovery, compaction
 **Exit criteria:** Benchmarked persistence spike confirms choice; atomic snapshots and $O(\text{file})$ WAL appends pass crash-recovery tests
 
 #### Phase 4: Persistence Reader & WAL Replay
