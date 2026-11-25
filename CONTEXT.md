@@ -229,11 +229,20 @@ gographctx/
 │       └── main.go
 ├── internal/                # Private implementation
 │   ├── graph/               # Core graph engine
-│   │   ├── graph.go         # Graph data structure (nodes, edges, indexes)
-│   │   ├── node.go          # Node types and properties
-│   │   ├── edge.go          # Edge types, confidence, resolution metadata
+│   │   ├── graph.go         # Compact Graph data structure, atomic ReplaceFile, View
+│   │   ├── node.go          # Node types and 13 NodeKind definitions
+│   │   ├── edge.go          # ResolutionTier-driven Edge types & CallSiteRef provenance
+│   │   ├── callsite.go      # Unresolved, ambiguous & external CallSite records
+│   │   ├── fragment.go      # Lock-free FileFragment & bulk MergeFragments
+│   │   ├── intern.go        # String & label deduplication pools
+│   │   ├── uid.go           # Stable UID (Kind, QName, Occurrence) & SigHash
 │   │   ├── query.go         # Graph query operations (callers, callees, chains, etc.)
-│   │   └── index.go         # In-memory indexes (name→nodes, file→nodes, reverse deps)
+│   │   └── index.go         # Secondary indexes, adjacency queries & verification
+│   ├── storage/             # Persistence (Snapshot + Append-Only WAL)
+│   │   ├── format.go        # Snapshot & WAL binary format definitions
+│   │   ├── writer.go        # Snapshot serialization & WAL delta append
+│   │   ├── reader.go        # Snapshot + WAL replay into memory
+│   │   └── spike_test.go    # Phase 3 benchmark spike: SQLite vs Snapshot+WAL
 │   ├── parser/              # Parsing layer
 │   │   ├── parser.go        # Common parser interface
 │   │   ├── coordinator.go   # Parallel parse orchestration
@@ -347,18 +356,18 @@ gographctx/
 - Output: `[]ParsedFile` — one per source file
 
 #### Stage 3: Build Graph
-- Create nodes for every extracted symbol
-- **Stable identity**: `uid = hash(qualified_name + signature_hash)` — not line numbers
-  - `qualified_name` = `module_path::ClassName::method_name` (language-appropriate separator)
-  - `signature_hash` = hash of parameter types + return type (or just param count if untyped)
-  - This means renaming stays stable if the signature doesn't change, and moving code within a file doesn't change identity
-- Add CONTAINS edges (File → symbols)
-- Add IMPORTS edges (File → imported symbols/modules)
-- Build in-memory indexes:
-  - `nameIndex`: symbol name → []Node (for resolution)
-  - `fileIndex`: file path → []Node (for file-based queries)
-  - `qualifiedIndex`: fully-qualified name → Node (for precise lookups)
-- Output: populated `Graph` with nodes, structural edges, and indexes
+- Workers construct lock-free `FileFragment` values in parallel and merge in bulk via `MergeFragments`
+- **Stable identity**: `uid = hash(kind, qualified_name, occurrence)` — line numbers and parameter types are excluded so routine edits and adding type annotations preserve symbol identity
+  - `qualified_name` = `module_path::ClassName::method_name` (required for all non-File nodes; no ambiguous `File::Name` fallback)
+  - `occurrence` = 0-based index among same-`(Kind, QName)` siblings (handles multiple Go `init()` functions cleanly)
+  - `signature_hash` (`SigHash`) is stored separately on `Node` to detect API signature changes during incremental updates
+- Add `CONTAINS` edges (`File → symbols`, `TierStructural`) and `IMPORTS` edges (`File → imported modules/symbols`)
+- Build compact in-memory indexes using dense `uint32` internal IDs and string interning:
+  - `byName`: symbol name → `idList`
+  - `byFile`: file path → `idList`
+  - `byQName`: qualified name → `idList` (`GetByQName` returns all matches; `GetUniqueByQName` enforces uniqueness)
+  - `callSitesByLookup`: lookup key → unresolved/ambiguous `CallSite` indices for $O(\text{affected})$ negative-dependency resolution
+- Output: populated `Graph` with nodes, multi-site provenance edges, unresolved call sites, and compact indexes
 
 #### Stage 4: Resolve
 - **Per-language module resolution** (not path-substring matching):
@@ -372,26 +381,26 @@ gographctx/
   - Parameter annotation: `def foo(x: SomeClass)` → type is `SomeClass`
   - Return type: `x = get_client()` where `get_client() -> Client` → type is `Client`
   - Constructor patterns: `x := NewClient()` → type is `Client` (Go convention)
-- **Tiered confidence** (improved from CGC):
+- **Tiered confidence (`ResolutionTier` as single source of truth — numeric confidence and labels derive strictly from it):**
 
-| Tier | Rule | Confidence | Edge Type |
-|---:|------|---:|-----------|
-| 1 | Explicit self/this/super receiver | 1.00 | CALLS |
-| 2 | Local definition in same file | 0.98 | CALLS |
-| 3 | Fully-qualified import, unique match | 0.95 | CALLS |
-| 4 | Receiver-type inferred + method resolved | 0.90 | CALLS |
-| 5 | Module resolution, unique match | 0.88 | CALLS |
-| 6 | Same-package, unique match | 0.85 | CALLS |
-| 7 | Multiple candidates, type-narrowed to ≤2 | 0.60 | LIKELY_CALLS |
-| 8 | Unresolved — candidates recorded but no edge emitted | 0.00 | (none — stored as `UnresolvedCall`) |
+| Tier | Constant | Rule | Confidence | Label | Edge / Record Type |
+|---:|---|---|---:|---|---|
+| 0 | `TierStructural` | Syntactic structural link | 1.00 | certain | `CONTAINS` / `IMPORTS` / `INHERITS` / `IMPLEMENTS` / `DECORATED_BY` |
+| 1 | `TierSelf` | Explicit self/this/super receiver | 1.00 | certain | `CALLS` |
+| 2 | `TierLocal` | Local definition in same file | 0.98 | certain | `CALLS` |
+| 3 | `TierQualifiedImport` | Fully-qualified import, unique match | 0.95 | certain | `CALLS` |
+| 4 | `TierReceiverType` | Receiver-type inferred + method resolved | 0.90 | certain | `CALLS` |
+| 5 | `TierModuleUnique` | Module resolution, unique match | 0.88 | certain | `CALLS` |
+| 6 | `TierSamePackage` | Same-package, unique match | 0.85 | certain | `CALLS` |
+| 7 | `TierTypeNarrowed` | Multiple candidates, type-narrowed | 0.60 | likely | `LIKELY_CALLS` (or ambiguous `CallSite`) |
+| 8 | `TierUnresolved` | Unresolved / external — candidates & lookup key recorded | 0.00 | unresolved | `CallSite` (never emitted as `CALLS`) |
 
-**Key difference from CGC**: Tiers 7+ never produce a `CALLS` edge. They produce `LIKELY_CALLS` (with candidate list) or store candidates without emitting an edge. This is why LLMs will trust us — we never lie.
+**Key difference from CGC**: Tiers 7+ never produce a `CALLS` edge, and `ResolutionTier` is strictly cross-checked against `EdgeKind`. Ambiguous and unresolved calls are stored as `CallSite` records with candidate UIDs and lookup keys — we never emit guesses as facts.
 
-#### Stage 5: Serialize
-- Atomic write: serialize to temp file, fsync, rename
-- Format: custom binary (see Storage Engine section)
-- Checksum: SHA-256 of content, stored in header
-- Compression: optional zstd for large graphs
+#### Stage 5: Persist (Snapshot + Append-Only WAL)
+- Base graph snapshot written atomically (`temp → fsync → rename`) after full repository indexing, with optional zstd compression and SHA-256 verification
+- Incremental edits (`ReplaceFile`) append compact `O(file)` delta records to an append-only WAL instead of rewriting the full snapshot, preserving Principle **P3 (Change-Proportional Work)**
+- Periodic background compaction folds the WAL into a fresh base snapshot once WAL growth crosses a threshold
 
 ### Pipeline Characteristics
 
@@ -409,114 +418,129 @@ gographctx/
 
 ## 7. Storage Engine
 
-### Design: No Database
+### Design: Memory-First Serving + Base Snapshot + Incremental WAL
 
-CGC's biggest performance problem is writing to a graph database. We eliminate it entirely.
+CGC's biggest performance problem is writing to and querying an external/embedded graph database via Cypher. We eliminate that bottleneck completely:
 
-**During indexing:** The graph lives in memory as Go structs with hash-map indexes. This is the fastest possible representation for construction and querying.
+- **During indexing & querying:** The graph lives in compact contiguous Go slices with `uint32` internal IDs (`<150 MB` heap for 150k nodes and 600k edges; parallel `FileFragment` build + bulk merge in `<0.5s`). Reads use `Graph.View(...)` for consistent multi-call snapshots.
+- **At rest:** Persistence combines a **Base Snapshot** (`index.ggctx`) written on full index with an **Append-Only WAL** (`index.wal`) for incremental `ReplaceFile` updates. On startup, the reader streams the snapshot and replays WAL frames to reconstruct the in-memory graph rather than trying to `mmap` Go pointer/map structures directly.
+- **Phase 3 Spike Rule:** Before locking in the custom Snapshot+WAL binary layout in Phase 3, benchmark **SQLite (WAL mode + startup bulk load)** vs **custom Snapshot+WAL** at the 150k-node / 600k-edge target scale so storage decisions rest on measured numbers.
 
-**At rest:** The graph serializes to a `.ggctx` file — a compact binary format read with `mmap` for instant load.
-
-### .ggctx File Format
+### Snapshot & WAL Persistence Architecture
 
 ```
 ┌──────────────────────────────────────┐
-│ Header (64 bytes)                    │
-│   Magic: "GGCTX\x00\x00\x01"        │
-│   Version: uint32                    │
-│   Flags: uint32 (compression, etc.)  │
-│   NodeCount: uint64                  │
-│   EdgeCount: uint64                  │
-│   IndexOffset: uint64                │
-│   Checksum: [32]byte (SHA-256)       │
+│ Base Snapshot (index.ggctx)          │
+│   Header (Magic, Version, SHA-256)   │
+│   Interned String & Label Tables     │
+│   Node Records (UID, Kind, Occ, Sig) │
+│   Edge Records (Tier + Sites[])      │
+│   CallSite Records (LookupKey, Cands)│
 ├──────────────────────────────────────┤
-│ Node Table                           │
-│   For each node:                     │
-│     UID: [16]byte                    │
-│     Kind: uint8                      │
-│     NameOffset: uint32 (into strings)│
-│     FileOffset: uint32               │
-│     StartLine: uint32                │
-│     EndLine: uint32                  │
-│     Properties: varint-length prefixed│
-├──────────────────────────────────────┤
-│ Edge Table                           │
-│   For each edge:                     │
-│     SourceUID: [16]byte              │
-│     TargetUID: [16]byte              │
-│     Kind: uint8                      │
-│     Confidence: float32              │
-│     Tier: uint8                      │
-│     Metadata: varint-length prefixed │
-├──────────────────────────────────────┤
-│ String Table (deduplicated)          │
-├──────────────────────────────────────┤
-│ Index Section                        │
-│   Name → NodeOffsets                 │
-│   File → NodeOffsets                 │
-│   QualifiedName → NodeOffset         │
+│ Append-Only WAL (index.wal)          │
+│   CRC-framed ReplaceFile(file) ops   │
+│   O(changed file) append per save    │
+│   Compacted into base snapshot async │
 └──────────────────────────────────────┘
 ```
 
-### Why Not SQLite / BadgerDB / etc.?
+### Why Not External Graph DBs or Monolithic File Rewrites?
 
-| Option | Rejected Because |
-|--------|-----------------|
-| SQLite | Good for relational data, but graph traversals (callers-of-callers) need recursive CTEs — slow for deep chains |
-| BadgerDB/BoltDB | Key-value stores; graph queries require manual edge-list management, no better than our format |
-| Neo4j/FalkorDB | External dependency, write overhead (CGC's core problem), operational complexity |
-| In-memory only | Need persistence for instant startup on subsequent runs |
-| JSON/MessagePack | Too large, too slow to parse for big graphs |
-
-**Our format** gives: O(1) node/edge lookup by UID, mmap-friendly layout, instant load, atomic writes, and zero external dependencies.
+| Option | Trade-off / Decision |
+|--------|----------------------|
+| Neo4j / FalkorDB / KùzuDB | External or slow embedded DB; write amplification caused CGC's 7–61s Flask bottleneck |
+| Monolithic single `.ggctx` rewrite | Rewriting the whole snapshot on every file save violates **P3 (Change-Proportional Work)** |
+| `mmap` directly over Go maps | Go maps/slices require deserialization into managed heap objects; sequential snapshot streaming + WAL replay is honest and fast |
+| SQLite (WAL + startup bulk load) | **Measured in Phase 3 Spike** against custom Snapshot+WAL for 150k/600k startup load time, file write latency, and binary footprint |
+| BadgerDB / BoltDB | Key-value stores add B+tree write amplification with no benefit over Memory-First + Snapshot+WAL |
 
 ### Graph Data Structures (In-Memory)
 
+Exported getters return safe value copies (`Node`, `Edge`, `CallSite`) so callers cannot corrupt indexes; multi-call queries use `Graph.View(func(v *ReadView))` under a single read lock.
+
 ```go
 type Graph struct {
-    Nodes      map[UID]*Node           // All nodes by stable UID
-    Edges      []*Edge                 // All edges
-    
-    // Indexes (built on load or during construction)
-    ByName     map[string][]*Node      // "funcName" → nodes
-    ByFile     map[string][]*Node      // "/path/to/file.go" → nodes
-    ByQName    map[string]*Node        // "pkg::Class::method" → node
-    Callers    map[UID][]*Edge         // target UID → incoming CALLS edges
-    Callees    map[UID][]*Edge         // source UID → outgoing CALLS edges
-    Contains   map[UID][]*Node         // parent UID → child nodes
-    RevDeps    map[UID][]UID           // symbol → files that depend on it
+    mu   sync.RWMutex
+    init bool
+
+    // Dense contiguous storage keyed by uint32 internal IDs (with free-list reuse)
+    nodes       []Node
+    uidToID     map[UID]uint32
+    edges       []edgeEntry          // stores PrimarySite inline + optional ExtraSites
+    edgeToID    map[compactEdgeKey]uint32
+
+    // O(1)/O(d) adjacency slices indexed by nodeID (callers/callees/contains/revDeps derived directly)
+    outgoing    [][]uint32
+    incoming    [][]uint32
+
+    // Secondary node indexes (singleton-optimized idList values)
+    byName      map[string]idList
+    byFile      map[string]idList
+    byQName     map[string]idList    // GetByQName returns []Node; GetUniqueByQName checks ambiguity
+
+    // Unresolved, ambiguous & external calls + negative-dependency invalidation index
+    callSites         []CallSite
+    callSitesByCaller map[UID][]int
+    callSitesByFile   map[string][]int
+    callSitesByLookup map[string][]int
+
+    strings *stringPool
+    labels  *labelPool
 }
 
 type Node struct {
-    UID        UID
-    Kind       NodeKind   // Function, Class, Interface, Struct, Variable, File, Module, etc.
-    Name       string
-    QName      string     // Fully qualified name
-    File       string
-    StartLine  uint32
-    EndLine    uint32
-    // Properties vary by kind:
-    Params     []Param    // Functions
-    ReturnType string     // Functions
-    Decorators []string   // Functions/Classes
-    Docstring  string     // Functions/Classes
-    Complexity uint16     // Cyclomatic complexity
-    Bases      []string   // Classes (inheritance)
+    UID           UID      // hash(Kind, QName, Occurrence) — stable across line & annotation edits
+    Kind          NodeKind // 13 kinds: File..Decorator + External
+    Name          string
+    QName         string   // Required for all non-File nodes
+    Occurrence    uint16   // Disambiguates same-(Kind, QName) siblings (e.g. Go init())
+    SignatureHash SigHash  // Digest of param types & return type for API diffing
+    File          string
+    StartLine     uint32
+    EndLine       uint32
+    Language      string
+    Type          string
+    Receiver      string
+    Exported      bool
+    Params        []Param
+    ReturnType    string
+    Decorators    []string
+    Docstring     string
+    Complexity    uint16
+    Bases         []string
+}
+
+type CallSiteRef struct {
+    Line   uint32
+    Column uint16
+    Tier   ResolutionTier
+    Label  string
 }
 
 type Edge struct {
-    Source     UID
-    Target     UID
-    Kind       EdgeKind   // CALLS, LIKELY_CALLS, CONTAINS, IMPORTS, INHERITS, IMPLEMENTS, DECORATED_BY
-    Confidence float32
-    Tier       uint8
-    Label      string     // Resolution label for debugging
+    Source UID
+    Target UID
+    Kind   EdgeKind       // CALLS, LIKELY_CALLS, CONTAINS, IMPORTS, INHERITS, IMPLEMENTS, DECORATED_BY
+    Tier   ResolutionTier // Single source of truth for Confidence() and ConfidenceLabel()
+    Label  string
+    Sites  []CallSiteRef  // Retains all call-site lines between (Source, Target, Kind)
+}
+
+type CallSite struct {
+    Caller     UID
+    File       string
+    Line       uint32
+    Column     uint16
+    CalleeExpr string
+    LookupKey  string         // Enables O(affected) negative-dependency resolution
+    Candidates []UID
+    Status     CallStatus     // unresolved | ambiguous | external
+    Tier       ResolutionTier
+    Reason     string
 }
 ```
 
-### Node Kinds (Reduced from CGC's 29)
-
-We start with 12 essential node kinds:
+### Node Kinds (13 Core Kinds, Down from CGC's 29)
 
 | Kind | Description |
 |------|------------|
@@ -532,8 +556,9 @@ We start with 12 essential node kinds:
 | `Property` | A class/struct field or property |
 | `TypeAlias` | A type alias or typedef |
 | `Decorator` | A decorator or annotation |
+| `External` | External/stdlib target symbol not defined inside the indexed repository |
 
-Additional kinds can be added as languages require, but we don't start with 29.
+Sentinel constants (`numNodeKinds`, `numEdgeKinds`, `numResolutionTiers`, `numCallStatuses`) and table-completeness unit tests enforce that enum tables stay synchronized as kinds are extended.
 
 ---
 
@@ -882,7 +907,7 @@ Based on observed behavior, LLMs hedge on CGC output because:
 |-------------|-------------|
 | **No phantom edges** | Real module resolution, not substring matching. If we can't resolve it, we say so. |
 | **Explicit confidence** | Every edge and every response carries confidence: certain, likely, or unresolved. |
-| **Stable identity** | UIDs based on qualified name + signature hash. Same symbol = same ID across runs. |
+| **Stable identity** | UIDs based on `(Kind, QName, Occurrence)` (`SigHash` stored separately). Same symbol = same ID across routine edits. |
 | **Compact responses** | 7 tools, structured output, token-budgeted, no source code by default. |
 | **Reproducibility** | Deterministic: same input = same output. Agents can verify by re-running. |
 | **Provenance** | Every fact includes: file, line, resolution method. The LLM can check our work. |
@@ -1029,14 +1054,20 @@ d:\gographctx\gographctx\
 │
 ├── internal/
 │   ├── graph/                  # Core graph engine
-│   │   ├── graph.go            # Graph struct, construction, modification
+│   │   ├── graph.go            # Compact Graph struct, O(d) removal, ReplaceFile, View
 │   │   ├── graph_test.go
-│   │   ├── node.go             # Node types, kinds, properties
-│   │   ├── edge.go             # Edge types, confidence, metadata
+│   │   ├── node.go             # Node types, 13 kinds (incl. External), validation
+│   │   ├── node_edge_test.go
+│   │   ├── edge.go             # Edge types, ResolutionTier confidence, CallSiteRef
+│   │   ├── callsite.go         # Unresolved/ambiguous/external CallSite records
+│   │   ├── fragment.go         # Parallel FileFragment & bulk MergeFragments
+│   │   ├── intern.go           # StringPool & LabelPool deduplication
 │   │   ├── query.go            # Graph query operations
 │   │   ├── query_test.go
-│   │   ├── index.go            # In-memory indexes
-│   │   └── uid.go              # Stable UID generation
+│   │   ├── index.go            # In-memory indexes, consistency checks
+│   │   ├── bench_test.go       # 150k-node/600k-edge heap & O(d) hub removal benchmarks
+│   │   ├── uid.go              # Stable UID (Kind, QName, Occurrence) & SigHash
+│   │   └── uid_test.go
 │   │
 │   ├── parser/
 │   │   ├── parser.go           # LanguageParser interface
@@ -1129,16 +1160,17 @@ d:\gographctx\gographctx\
 ### Foundation (Phases 1–5)
 
 #### Phase 1: Project Bootstrap & Graph Core
-**Goal:** Initialize Go module, define core graph data structures, and implement in-memory graph operations.
+**Goal:** Initialize Go module, define core graph data structures, and implement compact, thread-safe in-memory graph operations.
 **Deliverables:**
-- `go.mod` with module path
-- `internal/graph/node.go` — Node struct with all 12 kinds, properties
-- `internal/graph/edge.go` — Edge struct with kinds (CALLS, CONTAINS, IMPORTS, INHERITS, IMPLEMENTS, DECORATED_BY, LIKELY_CALLS), confidence, tier
-- `internal/graph/uid.go` — Stable UID generation (hash of qualified name + signature)
-- `internal/graph/graph.go` — Graph struct with Add/Remove/Get operations
-- `internal/graph/index.go` — ByName, ByFile, ByQName indexes with auto-update on add/remove
-- Tests: 100% coverage of graph CRUD and index consistency
-**Exit criteria:** `go test ./internal/graph/...` passes with all graph operations working correctly
+- `go.mod` (`go 1.21+`), `Makefile`, and `.github/workflows/ci.yml` (`gofmt`, `go vet`, `staticcheck`, `-race`, scale benchmarks)
+- `internal/graph/node.go` — `Node` value type, 13 `NodeKind`s (including `KindExternal`), strict `QName` validation, `numNodeKinds` sentinel
+- `internal/graph/edge.go` — `Edge` with `ResolutionTier`-derived confidence/labels, multi-site `CallSiteRef` provenance, non-call self-loop rejection, `(Kind, Tier)` validation
+- `internal/graph/callsite.go` — `CallSite` (`Status`, `Candidates`, `LookupKey`) for unresolved/ambiguous calls and negative dependencies
+- `internal/graph/uid.go` — Stable UID from `(Kind, QName, Occurrence)` plus separate `SigHash` for API change detection
+- `internal/graph/intern.go`, `fragment.go` — String/label interning and lock-free `FileFragment` + bulk `MergeFragments`
+- `internal/graph/graph.go`, `index.go` — Compact `uint32`-indexed storage (`<150 MB` for 150k/600k), $O(d)$ node removal, value-copy getters, atomic `ReplaceFile`, `View(*ReadView)`, `GetByQName` / `GetUniqueByQName`
+- Tests & benchmarks: unit, race/concurrency, scale memory (`144 MB` @ 150k/600k) and $O(d)$ hub-removal benchmarks
+**Exit criteria:** `go test ./internal/graph/...` and benchmarks pass with all invariants verified
 
 #### Phase 2: Graph Query Engine
 **Goal:** Implement all graph traversal operations needed by MCP tools.
@@ -1155,30 +1187,27 @@ d:\gographctx\gographctx\
 - Tests: table-driven tests with hand-built graphs covering all query types
 **Exit criteria:** All query operations return correct results on hand-built test graphs
 
-#### Phase 3: Storage Format — Writer
-**Goal:** Serialize in-memory graph to the `.ggctx` binary format.
+#### Phase 3: Storage Benchmark Spike & Persistence Writer (Snapshot + WAL)
+**Goal:** Benchmark SQLite (WAL + startup bulk load) vs custom Snapshot+WAL at 150k nodes / 600k edges, then implement snapshot serialization and append-only WAL delta writes.
 **Deliverables:**
-- `internal/storage/format.go` — Magic bytes, version, header struct, format constants
+- `internal/storage/spike_test.go` — comparative benchmark (startup load latency, incremental file write latency, disk footprint) of SQLite vs custom Snapshot+WAL at 150k/600k scale
+- `internal/storage/format.go` — Magic bytes, version, header structs, Snapshot & WAL record constants
 - `internal/storage/writer.go`:
-  - Serialize nodes with string deduplication (string table)
-  - Serialize edges with UID references
-  - Build and serialize index section
-  - Compute SHA-256 checksum
-  - Atomic write (temp file → fsync → rename)
-  - Optional zstd compression
-- Tests: round-trip test (write then verify binary structure), atomic write test (kill mid-write → old file intact)
-**Exit criteria:** Can serialize a 1000-node graph and verify binary structure
+  - Atomic base snapshot write (`temp → fsync → rename`) with string/label tables, `CallSite` records, optional zstd compression, and SHA-256 verification
+  - `AppendFileDelta(ReplaceResult / FileFragment)` — $O(\text{file})$ CRC-framed WAL append for incremental edits (satisfies P3)
+  - Background WAL compaction into a fresh base snapshot
+- Tests: round-trip snapshot test, WAL append latency test, crash-mid-write recovery test
+**Exit criteria:** Benchmarked persistence spike confirms choice; atomic snapshots and $O(\text{file})$ WAL appends pass crash-recovery tests
 
-#### Phase 4: Storage Format — Reader
-**Goal:** Deserialize `.ggctx` file back to in-memory graph.
+#### Phase 4: Persistence Reader & WAL Replay
+**Goal:** Fast startup reconstruction of the compact in-memory graph from Base Snapshot + Append-Only WAL replay.
 **Deliverables:**
 - `internal/storage/reader.go`:
-  - Parse header, validate magic/version/checksum
-  - Deserialize nodes and edges
-  - Rebuild in-memory indexes
-  - mmap support for large files (optional, benchmark first)
-- Tests: round-trip fuzz test (random graphs → write → read → compare), corrupt file handling, version mismatch handling
-**Exit criteria:** `write(graph) → read() → graph'` where `graph == graph'` for all test cases. Corrupt files return clear errors.
+  - Validate snapshot header, magic, version, and SHA-256 checksum
+  - Stream nodes, edges (`CallSiteRef` sites), and `CallSite` records directly into pre-sized `Graph` storage
+  - Replay CRC-verified WAL frames sequentially (discarding torn trailing incomplete frames safely)
+- Tests: round-trip fuzz test (snapshot + N WAL updates → load → compare), corrupt snapshot/torn-WAL handling, version mismatch handling
+**Exit criteria:** `load(snapshot, wal) == inMemoryGraph` across fuzz and crash-simulation tests with `<500ms` startup target at 150k/600k scale
 
 #### Phase 5: Configuration & Ignore Patterns
 **Goal:** Configuration loading and `.ggctxignore` file support.
@@ -1547,8 +1576,8 @@ d:\gographctx\gographctx\
 |-------|------|-----------|------------|
 | 1 | Graph Core | — | In-memory graph data structure |
 | 2 | Graph Queries | 1 | Callers, callees, impact, search |
-| 3 | Storage Writer | 1 | .ggctx file serialization |
-| 4 | Storage Reader | 3 | .ggctx file deserialization |
+| 3 | Persistence Spike & Writer | 1 | SQLite vs Snapshot+WAL benchmark; atomic snapshot + WAL writer |
+| 4 | Persistence Reader & WAL | 3 | Snapshot stream + WAL replay into memory |
 | 5 | Config & Ignore | — | Configuration, .ggctxignore |
 | 6 | tree-sitter Setup | — | Grammar management, parser init |
 | 7 | Go Parser | 6 | Go language extraction |
@@ -1581,8 +1610,8 @@ d:\gographctx\gographctx\
 ```mermaid
 flowchart TD
     P1["P1: Graph Core"] --> P2["P2: Graph Queries"]
-    P1 --> P3["P3: Storage Writer"]
-    P3 --> P4["P4: Storage Reader"]
+    P1 --> P3["P3: Persistence Spike & Writer"]
+    P3 --> P4["P4: Persistence Reader & WAL"]
     P5["P5: Config & Ignore"] --> P20["P20: File Discovery"]
     P6["P6: tree-sitter Setup"] --> P7["P7: Go Parser"]
     P6 --> P8["P8: Python Parser"]
@@ -1665,7 +1694,7 @@ flowchart TD
 | **MCP** | Model Context Protocol — the standard for LLM tool integration (stdio JSON-RPC) |
 | **tree-sitter** | An incremental parsing library that generates syntax trees for source code |
 | **SCIP** | Source Code Intelligence Protocol — compiler-accurate indexing (Sourcegraph) |
-| **UID** | Unique Identifier for a node — based on qualified name + signature hash |
+| **UID** | Unique Identifier for a node — based on `(Kind, QName, Occurrence)` (`SignatureHash` stored separately for API diffing) |
 | **Tier** | Resolution confidence level (1 = most confident, 8 = unresolved) |
 | **Blast radius** | The set of files affected by a change to a symbol |
 | **Golden test** | A test that compares output against a known-correct snapshot |
