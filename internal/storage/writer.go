@@ -701,6 +701,9 @@ func ReplayWALDecode(path string, g *graph.Graph, allowTrailingPartial bool) (in
 		}
 		frameLen := binary.LittleEndian.Uint32(raw[pos : pos+4])
 		if frameLen == 0 {
+			if allowTrailingPartial {
+				break
+			}
 			return applied, fmt.Errorf("%w: zero-length WAL frame at offset %d", ErrCorruptWAL, pos)
 		}
 		rem := uint64(len(raw) - (pos + 4))

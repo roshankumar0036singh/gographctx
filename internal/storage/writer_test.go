@@ -124,6 +124,22 @@ func buildSampleGraph(t *testing.T, reverseInsert bool) (*graph.Graph, map[strin
 	}
 }
 
+func mustReadFile(t *testing.T, path string) []byte {
+	t.Helper()
+	b, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("os.ReadFile(%q) failed: %v", path, err)
+	}
+	return b
+}
+
+func mustWriteFile(t *testing.T, path string, data []byte) {
+	t.Helper()
+	if err := os.WriteFile(path, data, 0o644); err != nil {
+		t.Fatalf("os.WriteFile(%q) failed: %v", path, err)
+	}
+}
+
 func TestSnapshotDeterminismAndRoundTrip(t *testing.T) {
 	dir := t.TempDir()
 	g1, uids := buildSampleGraph(t, false)
@@ -149,8 +165,8 @@ func TestSnapshotDeterminismAndRoundTrip(t *testing.T) {
 		if st1.Checksum != st2.Checksum {
 			t.Fatalf("%s snapshots not deterministic: checksums differ", suffix)
 		}
-		b1, _ := os.ReadFile(p1)
-		b2, _ := os.ReadFile(p2)
+		b1 := mustReadFile(t, p1)
+		b2 := mustReadFile(t, p2)
 		if !bytes.Equal(b1, b2) {
 			t.Fatalf("%s snapshots not byte-for-byte deterministic", suffix)
 		}
@@ -206,7 +222,7 @@ func TestSnapshotCorruptionAndAtomicWrite(t *testing.T) {
 	corruptPath := filepath.Join(dir, "corrupt_payload.ggctx")
 	corrupt := bytes.Clone(origBytes)
 	corrupt[len(corrupt)-1] ^= 0xFF
-	_ = os.WriteFile(corruptPath, corrupt, 0o644)
+	mustWriteFile(t, corruptPath, corrupt)
 	if _, _, err := ReadSnapshotDecode(corruptPath); !errors.Is(err, ErrChecksumMismatch) {
 		t.Fatalf("expected ErrChecksumMismatch, got %v", err)
 	}
@@ -215,7 +231,7 @@ func TestSnapshotCorruptionAndAtomicWrite(t *testing.T) {
 	badMagic := bytes.Clone(origBytes)
 	badMagic[0] = 'X'
 	badMagicPath := filepath.Join(dir, "bad_magic.ggctx")
-	_ = os.WriteFile(badMagicPath, badMagic, 0o644)
+	mustWriteFile(t, badMagicPath, badMagic)
 	if _, _, err := ReadSnapshotDecode(badMagicPath); !errors.Is(err, ErrInvalidFormat) {
 		t.Fatalf("expected ErrInvalidFormat for bad magic, got %v", err)
 	}
@@ -224,20 +240,23 @@ func TestSnapshotCorruptionAndAtomicWrite(t *testing.T) {
 	badVer := bytes.Clone(origBytes)
 	binary.LittleEndian.PutUint32(badVer[8:12], 99)
 	badVerPath := filepath.Join(dir, "bad_ver.ggctx")
-	_ = os.WriteFile(badVerPath, badVer, 0o644)
+	mustWriteFile(t, badVerPath, badVer)
 	if _, _, err := ReadSnapshotDecode(badVerPath); !errors.Is(err, ErrVersionMismatch) {
 		t.Fatalf("expected ErrVersionMismatch, got %v", err)
 	}
 
 	// Truncated header -> ErrInvalidFormat
 	truncPath := filepath.Join(dir, "trunc.ggctx")
-	_ = os.WriteFile(truncPath, origBytes[:20], 0o644)
+	mustWriteFile(t, truncPath, origBytes[:20])
 	if _, _, err := ReadSnapshotDecode(truncPath); !errors.Is(err, ErrInvalidFormat) {
 		t.Fatalf("expected ErrInvalidFormat for truncated header, got %v", err)
 	}
 
 	// Verify no leftover temp files after WriteSnapshot
-	entries, _ := os.ReadDir(dir)
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatalf("os.ReadDir(%q) failed: %v", dir, err)
+	}
 	for _, e := range entries {
 		if len(e.Name()) > 10 && e.Name()[:10] == ".ggctx-tmp" {
 			t.Fatalf("leftover temp file found: %s", e.Name())
@@ -288,15 +307,21 @@ func TestWALAppendReplayCrashRecoveryAndCompaction(t *testing.T) {
 	}
 	torn := append(bytes.Clone(walBytes), 50, 0, 0, 0, 1, 2, 3) // declares len=50, ends after 3 bytes
 	tornPath := filepath.Join(dir, "torn.wal")
-	_ = os.WriteFile(tornPath, torn, 0o644)
+	mustWriteFile(t, tornPath, torn)
 
 	// Strict replay fails with ErrCorruptWAL; crash-safe replay recovers valid frame
-	gStrict, _, _ := ReadSnapshotDecode(store.SnapshotPath())
+	gStrict, _, err := ReadSnapshotDecode(store.SnapshotPath())
+	if err != nil {
+		t.Fatalf("ReadSnapshotDecode failed: %v", err)
+	}
 	if _, err := ReplayWALDecode(tornPath, gStrict, false); !errors.Is(err, ErrCorruptWAL) {
 		t.Fatalf("expected ErrCorruptWAL on strict replay of torn WAL, got %v", err)
 	}
 
-	gRecovered, _, _ := ReadSnapshotDecode(store.SnapshotPath())
+	gRecovered, _, err := ReadSnapshotDecode(store.SnapshotPath())
+	if err != nil {
+		t.Fatalf("ReadSnapshotDecode failed: %v", err)
+	}
 	applied, err := ReplayWALDecode(tornPath, gRecovered, true)
 	if err != nil || applied != 1 {
 		t.Fatalf("crash-safe WAL replay = (%d, %v), want (1, nil)", applied, err)
@@ -347,7 +372,7 @@ func TestCorruptCountsAndWALOverflowGuards(t *testing.T) {
 	// 1. Huge frameLen (0xffffffff) must not overflow 32-bit math
 	hugeLenPath := filepath.Join(dir, "huge_len.wal")
 	hugeData := append(bytes.Clone(hdr[:]), 0xff, 0xff, 0xff, 0xff, 1, 2, 3, 4)
-	_ = os.WriteFile(hugeLenPath, hugeData, 0o644)
+	mustWriteFile(t, hugeLenPath, hugeData)
 	if _, err := ReplayWALDecode(hugeLenPath, graph.New(), false); !errors.Is(err, ErrCorruptWAL) {
 		t.Fatalf("expected ErrCorruptWAL on huge frameLen, got %v", err)
 	}
@@ -355,12 +380,15 @@ func TestCorruptCountsAndWALOverflowGuards(t *testing.T) {
 		t.Fatalf("expected clean partial stop on huge frameLen, got (%d, %v)", n, err)
 	}
 
-	// 2. Zero-length WAL frame rejected as ErrCorruptWAL
+	// 2. Zero-length WAL frame: strict returns ErrCorruptWAL; crash-safe stops cleanly
 	zeroLenPath := filepath.Join(dir, "zero_len.wal")
 	zeroData := append(bytes.Clone(hdr[:]), 0, 0, 0, 0)
-	_ = os.WriteFile(zeroLenPath, zeroData, 0o644)
-	if _, err := ReplayWALDecode(zeroLenPath, graph.New(), true); !errors.Is(err, ErrCorruptWAL) {
-		t.Fatalf("expected ErrCorruptWAL on zero-length frame, got %v", err)
+	mustWriteFile(t, zeroLenPath, zeroData)
+	if _, err := ReplayWALDecode(zeroLenPath, graph.New(), false); !errors.Is(err, ErrCorruptWAL) {
+		t.Fatalf("expected ErrCorruptWAL on strict zero-length frame, got %v", err)
+	}
+	if n, err := ReplayWALDecode(zeroLenPath, graph.New(), true); err != nil || n != 0 {
+		t.Fatalf("expected clean crash-safe stop on trailing zero-length frame, got (%d, %v)", n, err)
 	}
 
 	// 3. Adversarial huge nodeCount in CRC-valid WAL frame must fail via checkCount before allocating
@@ -382,7 +410,7 @@ func TestCorruptCountsAndWALOverflowGuards(t *testing.T) {
 	_, _ = frame.Write(u32[:])
 
 	evilWAL := filepath.Join(dir, "evil_count.wal")
-	_ = os.WriteFile(evilWAL, frame.Bytes(), 0o644)
+	mustWriteFile(t, evilWAL, frame.Bytes())
 	if _, err := ReplayWALDecode(evilWAL, graph.New(), false); !errors.Is(err, ErrCorruptWAL) || !errors.Is(err, ErrInvalidFormat) {
 		t.Fatalf("expected ErrCorruptWAL/ErrInvalidFormat on bogus huge node count, got %v", err)
 	}
