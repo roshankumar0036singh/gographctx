@@ -596,8 +596,11 @@ func decodeSnapshotPayload(payload []byte, nodeCount, edgeCount, siteCount uint6
 	if err != nil {
 		return nil, err
 	}
-	if strCount == 0 || strCount > uint64(len(payload))+1 {
-		return nil, fmt.Errorf("%w: invalid string table count %d", ErrInvalidFormat, strCount)
+	if strCount == 0 {
+		return nil, fmt.Errorf("%w: empty string table", ErrInvalidFormat)
+	}
+	if err := r.checkCount(strCount, 1, "string table"); err != nil {
+		return nil, err
 	}
 	tbl := make([]string, strCount)
 	for i := uint64(0); i < strCount; i++ {
@@ -606,6 +609,9 @@ func decodeSnapshotPayload(payload []byte, nodeCount, edgeCount, siteCount uint6
 		}
 	}
 
+	if err := r.checkCount(nodeCount, 48, "snapshot node"); err != nil {
+		return nil, err
+	}
 	nodes := make([]graph.Node, nodeCount)
 	for i := uint64(0); i < nodeCount; i++ {
 		if nodes[i], err = readNodeRecord(r, tbl); err != nil {
@@ -613,6 +619,9 @@ func decodeSnapshotPayload(payload []byte, nodeCount, edgeCount, siteCount uint6
 		}
 	}
 
+	if err := r.checkCount(edgeCount, 6, "snapshot edge"); err != nil {
+		return nil, err
+	}
 	edges := make([]graph.Edge, edgeCount)
 	for i := uint64(0); i < edgeCount; i++ {
 		srcIdx, err := r.readUvarint()
@@ -652,6 +661,9 @@ func decodeSnapshotPayload(payload []byte, nodeCount, edgeCount, siteCount uint6
 		}
 	}
 
+	if err := r.checkCount(siteCount, 26, "snapshot call site"); err != nil {
+		return nil, err
+	}
 	sites := make([]graph.CallSite, siteCount)
 	for i := uint64(0); i < siteCount; i++ {
 		if sites[i], err = readCallSiteRecord(r, tbl); err != nil {
@@ -688,15 +700,20 @@ func ReplayWALDecode(path string, g *graph.Graph, allowTrailingPartial bool) (in
 			return applied, fmt.Errorf("%w: truncated frame length at offset %d", ErrCorruptWAL, pos)
 		}
 		frameLen := binary.LittleEndian.Uint32(raw[pos : pos+4])
-		frameStart := pos + 4
-		crcStart := frameStart + int(frameLen)
-		frameEnd := crcStart + 4
-		if frameLen == 0 || frameEnd > len(raw) {
+		if frameLen == 0 {
+			return applied, fmt.Errorf("%w: zero-length WAL frame at offset %d", ErrCorruptWAL, pos)
+		}
+		rem := uint64(len(raw) - (pos + 4))
+		if uint64(frameLen)+4 > rem {
 			if allowTrailingPartial {
 				break
 			}
 			return applied, fmt.Errorf("%w: truncated frame body at offset %d", ErrCorruptWAL, pos)
 		}
+
+		frameStart := pos + 4
+		crcStart := frameStart + int(frameLen)
+		frameEnd := crcStart + 4
 
 		body := raw[frameStart:crcStart]
 		gotCRC := binary.LittleEndian.Uint32(raw[crcStart:frameEnd])
@@ -735,6 +752,12 @@ func applyWALFrame(body []byte, g *graph.Graph) error {
 		if err != nil {
 			return fmt.Errorf("%w: %w", ErrCorruptWAL, err)
 		}
+		if strCount == 0 {
+			return fmt.Errorf("%w: empty WAL string table", ErrCorruptWAL)
+		}
+		if err := r.checkCount(strCount, 1, "WAL string table"); err != nil {
+			return fmt.Errorf("%w: %w", ErrCorruptWAL, err)
+		}
 		tbl := make([]string, strCount)
 		for i := uint64(0); i < strCount; i++ {
 			if tbl[i], err = r.readString(); err != nil {
@@ -749,6 +772,9 @@ func applyWALFrame(body []byte, g *graph.Graph) error {
 		if err != nil {
 			return fmt.Errorf("%w: %w", ErrCorruptWAL, err)
 		}
+		if err := r.checkCount(nc, 48, "WAL node"); err != nil {
+			return fmt.Errorf("%w: %w", ErrCorruptWAL, err)
+		}
 		nodes := make([]graph.Node, nc)
 		for i := uint64(0); i < nc; i++ {
 			if nodes[i], err = readNodeRecord(r, tbl); err != nil {
@@ -757,6 +783,9 @@ func applyWALFrame(body []byte, g *graph.Graph) error {
 		}
 		ec, err := r.readUvarint()
 		if err != nil {
+			return fmt.Errorf("%w: %w", ErrCorruptWAL, err)
+		}
+		if err := r.checkCount(ec, 36, "WAL edge"); err != nil {
 			return fmt.Errorf("%w: %w", ErrCorruptWAL, err)
 		}
 		edges := make([]graph.Edge, ec)
@@ -787,6 +816,9 @@ func applyWALFrame(body []byte, g *graph.Graph) error {
 		}
 		sc, err := r.readUvarint()
 		if err != nil {
+			return fmt.Errorf("%w: %w", ErrCorruptWAL, err)
+		}
+		if err := r.checkCount(sc, 26, "WAL call site"); err != nil {
 			return fmt.Errorf("%w: %w", ErrCorruptWAL, err)
 		}
 		sites := make([]graph.CallSite, sc)

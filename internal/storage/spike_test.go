@@ -325,20 +325,30 @@ func BenchmarkPersistenceSpike150kNodes600kEdges(b *testing.B) {
 			if _, err := itx.Exec(`DELETE FROM nodes WHERE file = ?`, targetFile); err != nil {
 				b.Fatal(err)
 			}
-			inStmt, _ := itx.Prepare(`INSERT INTO nodes(uid, kind, name, qname, file, start_line, end_line, language) VALUES(?, ?, ?, ?, ?, ?, ?, ?)`)
+			inStmt, err := itx.Prepare(`INSERT INTO nodes(uid, kind, name, qname, file, start_line, end_line, language) VALUES(?, ?, ?, ?, ?, ?, ?, ?)`)
+			if err != nil {
+				b.Fatal(err)
+			}
 			for j := range sampleNodes {
 				n := &sampleNodes[j]
-				_, _ = inStmt.Exec(n.UID[:], int(n.Kind), n.Name, n.QName, n.File, n.StartLine, n.EndLine, n.Language)
+				if _, err := inStmt.Exec(n.UID[:], int(n.Kind), n.Name, n.QName, n.File, n.StartLine, n.EndLine, n.Language); err != nil {
+					b.Fatal(err)
+				}
 			}
 			_ = inStmt.Close()
-			ieStmt, _ := itx.Prepare(`INSERT OR REPLACE INTO edges(source, target, kind, tier, line) VALUES(?, ?, ?, ?, ?)`)
+			ieStmt, err := itx.Prepare(`INSERT OR REPLACE INTO edges(source, target, kind, tier, line) VALUES(?, ?, ?, ?, ?)`)
+			if err != nil {
+				b.Fatal(err)
+			}
 			for j := range sampleEdges {
 				e := &sampleEdges[j]
 				var line uint32
 				if len(e.Sites) > 0 {
 					line = e.Sites[0].Line
 				}
-				_, _ = ieStmt.Exec(e.Source[:], e.Target[:], int(e.Kind), int(e.Tier), line)
+				if _, err := ieStmt.Exec(e.Source[:], e.Target[:], int(e.Kind), int(e.Tier), line); err != nil {
+					b.Fatal(err)
+				}
 			}
 			_ = ieStmt.Close()
 			if err := itx.Commit(); err != nil {

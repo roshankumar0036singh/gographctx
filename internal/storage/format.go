@@ -263,6 +263,20 @@ func (r *binReader) readString() (string, error) {
 	return s, nil
 }
 
+func (r *binReader) checkCount(count, minBytes uint64, what string) error {
+	if count == 0 {
+		return nil
+	}
+	rem := uint64(r.remaining())
+	if minBytes == 0 {
+		minBytes = 1
+	}
+	if count > rem/minBytes {
+		return fmt.Errorf("%w: %s count %d exceeds remaining %d bytes", ErrInvalidFormat, what, count, rem)
+	}
+	return nil
+}
+
 func (r *binReader) lookupTableString(tbl []string) (string, error) {
 	idx, err := r.readUvarint()
 	if err != nil {
@@ -375,8 +389,8 @@ func readNodeRecord(r *binReader, tbl []string) (graph.Node, error) {
 		return n, err
 	}
 	if paramCount > 0 {
-		if paramCount > uint64(r.remaining()) {
-			return n, io.ErrUnexpectedEOF
+		if err := r.checkCount(paramCount, 2, "param"); err != nil {
+			return n, err
 		}
 		n.Params = make([]graph.Param, paramCount)
 		for i := uint64(0); i < paramCount; i++ {
@@ -394,8 +408,8 @@ func readNodeRecord(r *binReader, tbl []string) (graph.Node, error) {
 		return n, err
 	}
 	if decCount > 0 {
-		if decCount > uint64(r.remaining()) {
-			return n, io.ErrUnexpectedEOF
+		if err := r.checkCount(decCount, 1, "decorator"); err != nil {
+			return n, err
 		}
 		n.Decorators = make([]string, decCount)
 		for i := uint64(0); i < decCount; i++ {
@@ -410,8 +424,8 @@ func readNodeRecord(r *binReader, tbl []string) (graph.Node, error) {
 		return n, err
 	}
 	if baseCount > 0 {
-		if baseCount > uint64(r.remaining()) {
-			return n, io.ErrUnexpectedEOF
+		if err := r.checkCount(baseCount, 1, "base"); err != nil {
+			return n, err
 		}
 		n.Bases = make([]string, baseCount)
 		for i := uint64(0); i < baseCount; i++ {
@@ -445,8 +459,8 @@ func readEdgeSites(r *binReader, tbl []string) ([]graph.CallSiteRef, error) {
 	if cnt == 0 {
 		return nil, nil
 	}
-	if cnt > uint64(r.remaining()) {
-		return nil, io.ErrUnexpectedEOF
+	if err := r.checkCount(cnt, 5, "edge site"); err != nil {
+		return nil, err
 	}
 	sites := make([]graph.CallSiteRef, cnt)
 	for i := uint64(0); i < cnt; i++ {
@@ -534,8 +548,8 @@ func readCallSiteRecord(r *binReader, tbl []string) (graph.CallSite, error) {
 		return cs, err
 	}
 	if candCount > 0 {
-		if candCount*16 > uint64(r.remaining()) {
-			return cs, io.ErrUnexpectedEOF
+		if err := r.checkCount(candCount, 16, "candidate"); err != nil {
+			return cs, err
 		}
 		cs.Candidates = make([]graph.UID, candCount)
 		for i := uint64(0); i < candCount; i++ {

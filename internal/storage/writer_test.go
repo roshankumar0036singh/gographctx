@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/binary"
 	"errors"
+	"hash/crc32"
 	"os"
 	"path/filepath"
 	"testing"
@@ -336,5 +337,61 @@ func TestWALAppendReplayCrashRecoveryAndCompaction(t *testing.T) {
 	_ = store2.Close()
 	if _, err := store2.AppendRemoveFile("x.go"); !errors.Is(err, ErrClosed) {
 		t.Fatalf("expected ErrClosed on closed Store, got %v", err)
+	}
+}
+
+func TestCorruptCountsAndWALOverflowGuards(t *testing.T) {
+	dir := t.TempDir()
+	hdr := (WALHeader{Magic: WALMagic, Version: FormatVersion}).MarshalBinary()
+
+	// 1. Huge frameLen (0xffffffff) must not overflow 32-bit math
+	hugeLenPath := filepath.Join(dir, "huge_len.wal")
+	hugeData := append(bytes.Clone(hdr[:]), 0xff, 0xff, 0xff, 0xff, 1, 2, 3, 4)
+	_ = os.WriteFile(hugeLenPath, hugeData, 0o644)
+	if _, err := ReplayWALDecode(hugeLenPath, graph.New(), false); !errors.Is(err, ErrCorruptWAL) {
+		t.Fatalf("expected ErrCorruptWAL on huge frameLen, got %v", err)
+	}
+	if n, err := ReplayWALDecode(hugeLenPath, graph.New(), true); err != nil || n != 0 {
+		t.Fatalf("expected clean partial stop on huge frameLen, got (%d, %v)", n, err)
+	}
+
+	// 2. Zero-length WAL frame rejected as ErrCorruptWAL
+	zeroLenPath := filepath.Join(dir, "zero_len.wal")
+	zeroData := append(bytes.Clone(hdr[:]), 0, 0, 0, 0)
+	_ = os.WriteFile(zeroLenPath, zeroData, 0o644)
+	if _, err := ReplayWALDecode(zeroLenPath, graph.New(), true); !errors.Is(err, ErrCorruptWAL) {
+		t.Fatalf("expected ErrCorruptWAL on zero-length frame, got %v", err)
+	}
+
+	// 3. Adversarial huge nodeCount in CRC-valid WAL frame must fail via checkCount before allocating
+	var body binWriter
+	body.writeU8(WALOpReplaceFile)
+	body.writeUvarint(1) // strCount = 1
+	body.writeString("")
+	body.writeString("evil.go")
+	body.writeUvarint(1 << 40) // nc = 1 trillion nodes inside tiny body!
+	rawBody := body.buf.Bytes()
+
+	var frame bytes.Buffer
+	_, _ = frame.Write(hdr[:])
+	var u32 [4]byte
+	binary.LittleEndian.PutUint32(u32[:], uint32(len(rawBody)))
+	_, _ = frame.Write(u32[:])
+	_, _ = frame.Write(rawBody)
+	binary.LittleEndian.PutUint32(u32[:], crc32.Checksum(rawBody, crc32cTable))
+	_, _ = frame.Write(u32[:])
+
+	evilWAL := filepath.Join(dir, "evil_count.wal")
+	_ = os.WriteFile(evilWAL, frame.Bytes(), 0o644)
+	if _, err := ReplayWALDecode(evilWAL, graph.New(), false); !errors.Is(err, ErrCorruptWAL) || !errors.Is(err, ErrInvalidFormat) {
+		t.Fatalf("expected ErrCorruptWAL/ErrInvalidFormat on bogus huge node count, got %v", err)
+	}
+
+	// 4. Adversarial huge snapshot nodeCount must fail before allocating
+	var tinyPayload binWriter
+	tinyPayload.writeUvarint(1)
+	tinyPayload.writeString("")
+	if _, err := decodeSnapshotPayload(tinyPayload.buf.Bytes(), 1<<40, 0, 0); !errors.Is(err, ErrInvalidFormat) {
+		t.Fatalf("expected ErrInvalidFormat on bogus huge snapshot nodeCount, got %v", err)
 	}
 }
