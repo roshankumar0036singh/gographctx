@@ -451,7 +451,7 @@ CGC's biggest performance problem is writing to and querying an external/embedde
 | Neo4j / FalkorDB / KùzuDB | External or slow embedded DB; write amplification caused CGC's 7–61s Flask bottleneck |
 | Monolithic single `.ggctx` rewrite | Rewriting the whole snapshot on every file save violates **P3 (Change-Proportional Work)** |
 | `mmap` directly over Go maps | Go maps/slices require deserialization into managed heap objects; sequential snapshot streaming + WAL replay is honest and fast |
-| SQLite (WAL + startup bulk load) | **Rejected after Phase 3 Spike** (150k/600k: 18.87s write, 3.50s load, 10.6ms 1-file tx, 75.84 MB disk vs Snapshot+WAL: 0.70s raw / 1.48s zstd write, 0.93s load, <0.55ms WAL append, 7.85 MB zstd / 19.56 MB raw) |
+| SQLite (WAL + startup bulk load) | **Rejected after Phase 3 Spike** (150k/600k: 18.87s write, 3.50s load, 10.6ms 1-file tx, 75.84 MB disk vs Snapshot+WAL: 0.61s raw / 0.89s zstd write, 0.44s raw / 0.50s zstd load, <0.55ms WAL append, 7.85 MB zstd / 19.56 MB raw) |
 | BadgerDB / BoltDB | Key-value stores add B+tree write amplification with no benefit over Memory-First + Snapshot+WAL |
 
 ### Graph Data Structures (In-Memory)
@@ -1204,11 +1204,13 @@ d:\gographctx\gographctx\
 #### Phase 4: Persistence Reader & WAL Replay
 **Goal:** Fast startup reconstruction of the compact in-memory graph from Base Snapshot + Append-Only WAL replay.
 **Deliverables:**
+- `internal/graph/fragment.go`: `DenseEdge` and `(*Graph).LoadDense` pre-sizing out/in adjacency slices and eliminating per-edge UID lookups on startup load
+- `internal/storage/format.go`: `recordReader` interface and bounded `streamReader` (shared across streaming snapshots and slice WAL frames)
 - `internal/storage/reader.go`:
-  - Validate snapshot header, magic, version, and SHA-256 checksum
-  - Stream nodes, edges (`CallSiteRef` sites), and `CallSite` records directly into pre-sized `Graph` storage
-  - Replay CRC-verified WAL frames sequentially (discarding torn trailing incomplete frames safely)
-- Tests: round-trip fuzz test (snapshot + N WAL updates → load → compare), corrupt snapshot/torn-WAL handling, version mismatch handling
+  - `ReadSnapshot`: validates magic/version/flags, streams bounded SHA-256 + optional zstd decompression directly into `LoadDense` (`436.8 ms` raw / `500.7 ms` zstd at 150k/600k)
+  - `ReplayWAL`: streams CRC-32C-verified WAL frames sequentially (`allowTrailingPartial` recovery)
+  - `LoadStore`: coordinates snapshot + WAL replay, truncating torn trailing WAL crash bytes back to `LastValidOffset` before reopening `OpenWAL`
+- Tests (`reader_test.go`): randomized 40-update snapshot+WAL round-trip (`raw` & `zstd`), torn-tail truncation recovery before subsequent appends, corruption/flag/EOF checks, and `FuzzSnapshotAndWALDecode`
 **Exit criteria:** `load(snapshot, wal) == inMemoryGraph` across fuzz and crash-simulation tests with `<500ms` startup target at 150k/600k scale
 
 #### Phase 5: Configuration & Ignore Patterns
