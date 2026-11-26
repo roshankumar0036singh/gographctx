@@ -210,7 +210,6 @@ func parseIgnoreLine(baseDir, raw string) (ignoreRule, bool, error) {
 		return ignoreRule{}, false, nil
 	}
 
-	line = filepath.ToSlash(line)
 	if strings.HasSuffix(line, "/") {
 		rule.dirOnly = true
 		line = strings.TrimRight(line, "/")
@@ -272,7 +271,7 @@ func (m *IgnoreMatcher) ShouldIgnore(relPath string) bool {
 	if m == nil {
 		return false
 	}
-	slash := filepath.ToSlash(relPath)
+	slash := strings.ReplaceAll(relPath, "\\", "/")
 	isDir := strings.HasSuffix(slash, "/")
 	return m.ShouldIgnorePath(slash, isDir)
 }
@@ -385,7 +384,7 @@ func normalizeRelDir(dir string) string {
 }
 
 func normalizeRelPath(p string) string {
-	s := filepath.ToSlash(p)
+	s := strings.ReplaceAll(p, "\\", "/")
 	for strings.HasPrefix(s, "./") {
 		s = s[2:]
 	}
