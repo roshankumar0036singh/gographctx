@@ -1217,14 +1217,12 @@ d:\gographctx\gographctx\
 **Goal:** Configuration loading and `.ggctxignore` file support.
 **Deliverables:**
 - `internal/config/config.go`:
-  - Config struct with defaults (parallel workers, token budget, debounce interval, etc.)
-  - Load from `.ggctxrc` or environment variables
-  - Sensible defaults that work without any config
+  - `Config` & `DefaultConfig()` (workers, token budget, watcher debounce, snapshot compression/sync, WAL compaction threshold, data/ignore paths, language list, depth/result limits)
+  - Layered `Load(repoRoot)` & `LoadFromFile(path)`: defaults → `.ggctxrc` (JSON with `DisallowUnknownFields` or `key = value` + comments) → `GGCTX_*` env overrides → `Validate()`
 - `internal/config/ignore.go`:
-  - Parse `.ggctxignore` (gitignore-compatible syntax)
-  - Default ignore patterns (`.git`, `node_modules`, `vendor`, `__pycache__`, etc.)
-  - `ShouldIgnore(path) bool` function
-- Tests: ignore pattern matching edge cases, config loading with defaults
+  - `IgnoreMatcher`, `LoadRepoIgnoreMatcher`, `Child`/`ChildFromFile`, `ShouldIgnore(path)`, `ShouldIgnorePath(path, isDir)`
+  - Gitignore-compatible matching: `DefaultIgnorePatterns`, `.gitignore` + `.ggctxignore` layering, negation (`!`), directory-only (`/`), ancestor pruning, anchored vs basename, `**` globs, `[!...]` classes, and Windows backslash normalization
+- Tests (`config_test.go`, `ignore_test.go`): JSON/kv/env precedence, validation errors, and comprehensive gitignore edge cases
 **Exit criteria:** Config loads correctly, ignore patterns match correctly with gitignore semantics
 
 ### Parsing Layer (Phases 6–12)
