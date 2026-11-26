@@ -2,12 +2,14 @@ package storage
 
 import (
 	"bufio"
+	"bytes"
 	"crypto/sha256"
 	"encoding/binary"
 	"errors"
 	"fmt"
 	"hash/crc32"
 	"io"
+	"math"
 	"os"
 	"path/filepath"
 	"strings"
@@ -73,6 +75,9 @@ func ReadSnapshot(path string) (*graph.Graph, SnapshotHeader, error) {
 	}
 	if hdr.Flags&^FlagZstd != 0 {
 		return nil, SnapshotHeader{}, fmt.Errorf("%w: unsupported snapshot flags %#x", ErrInvalidFormat, hdr.Flags)
+	}
+	if hdr.PayloadSize > math.MaxInt64 {
+		return nil, SnapshotHeader{}, fmt.Errorf("%w: payload size %d exceeds max int64", ErrInvalidFormat, hdr.PayloadSize)
 	}
 
 	expectedEnd := uint64(SnapshotHeaderSize) + hdr.PayloadSize
@@ -259,7 +264,14 @@ func ReplayWAL(path string, g *graph.Graph, allowTrailingPartial bool) (WALRepla
 
 	br := bufio.NewReaderSize(f, 64*1024)
 	var hdrBuf [WALHeaderSize]byte
-	if _, err := io.ReadFull(br, hdrBuf[:]); err != nil {
+	hdrN, err := io.ReadFull(br, hdrBuf[:])
+	if err != nil {
+		if allowTrailingPartial && (errors.Is(err, io.ErrUnexpectedEOF) || errors.Is(err, io.EOF)) && isPartialWALMagic(hdrBuf[:hdrN]) {
+			return WALReplayResult{
+				LastValidOffset: 0,
+				TruncatedTail:   true,
+			}, nil
+		}
 		return WALReplayResult{}, fmt.Errorf("%w: WAL header truncated: %w", ErrInvalidFormat, err)
 	}
 	if _, err := UnmarshalWALHeader(hdrBuf[:]); err != nil {
@@ -404,6 +416,13 @@ func LoadStore(dir string, snapOpts WriteOptions, walOpts WALOptions, loadOpts L
 
 	stats.DurationMs = float64(time.Since(start).Microseconds()) / 1000.0
 	return store, g, stats, nil
+}
+
+func isPartialWALMagic(partial []byte) bool {
+	if len(partial) <= len(WALMagic) {
+		return bytes.Equal(partial, WALMagic[:len(partial)])
+	}
+	return bytes.Equal(partial[:len(WALMagic)], WALMagic[:])
 }
 
 func applyWALFrame(body []byte, g *graph.Graph) error {

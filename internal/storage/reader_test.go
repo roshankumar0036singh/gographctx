@@ -308,7 +308,7 @@ func TestReaderCorruptionAndEdgeErrors(t *testing.T) {
 		t.Fatalf("expected ErrInvalidFormat on empty dir, got %v", err)
 	}
 
-	// Zstd snapshot bit-flip returns ErrChecksumMismatch even if zstd decode errors
+	// Zstd snapshot bit-flip returns ErrChecksumMismatch even if zstd decode errors (both header and epilogue/trailer)
 	zstdPath := filepath.Join(dir, "sample_zstd.ggctx")
 	if _, err := WriteSnapshot(zstdPath, g, WriteOptions{Compress: true}); err != nil {
 		t.Fatal(err)
@@ -319,7 +319,34 @@ func TestReaderCorruptionAndEdgeErrors(t *testing.T) {
 	zCorruptPath := filepath.Join(dir, "corrupt_zstd.ggctx")
 	mustWriteFile(t, zCorruptPath, zCorrupt)
 	if _, _, err := ReadSnapshot(zCorruptPath); !errors.Is(err, ErrChecksumMismatch) {
-		t.Fatalf("expected ErrChecksumMismatch on corrupted zstd payload, got %v", err)
+		t.Fatalf("expected ErrChecksumMismatch on corrupted zstd header/payload, got %v", err)
+	}
+
+	zEpilogue := bytes.Clone(zBytes)
+	zEpilogue[len(zEpilogue)-1] ^= 0xFF
+	zEpiloguePath := filepath.Join(dir, "corrupt_zstd_epilogue.ggctx")
+	mustWriteFile(t, zEpiloguePath, zEpilogue)
+	if _, _, err := ReadSnapshot(zEpiloguePath); !errors.Is(err, ErrChecksumMismatch) {
+		t.Fatalf("expected ErrChecksumMismatch on corrupted zstd epilogue/trailer, got %v", err)
+	}
+
+	// Sub-header torn WAL (0 < size < WALHeaderSize) matching WALMagic prefix:
+	// strict LoadStore returns ErrInvalidFormat, crash-safe LoadStore truncates to 0 and reinitializes header.
+	tornHdrDir := t.TempDir()
+	mustWriteFile(t, filepath.Join(tornHdrDir, WALFileName), WALMagic[:6])
+	if _, _, _, err := LoadStore(tornHdrDir, WriteOptions{}, WALOptions{}, LoadOptions{AllowTrailingPartialWAL: false}); !errors.Is(err, ErrInvalidFormat) {
+		t.Fatalf("expected ErrInvalidFormat on strict sub-header WAL, got %v", err)
+	}
+	stRec, gRec, stStats, err := LoadStore(tornHdrDir, WriteOptions{}, WALOptions{}, LoadOptions{AllowTrailingPartialWAL: true})
+	if err != nil {
+		t.Fatalf("crash-safe LoadStore on sub-header WAL failed: %v", err)
+	}
+	_ = stRec.Close()
+	if !stStats.WALTruncatedTail || stStats.WALFramesApplied != 0 || gRec.NodeCount() != 0 {
+		t.Fatalf("unexpected stats recovering sub-header WAL: %+v", stStats)
+	}
+	if fi, err := os.Stat(filepath.Join(tornHdrDir, WALFileName)); err != nil || fi.Size() != WALHeaderSize {
+		t.Fatalf("expected reinitialized %d-byte WAL header after recovery, got size=%d err=%v", WALHeaderSize, fi.Size(), err)
 	}
 
 	// Corrupted WAL CRC in middle vs allowTrailingPartial

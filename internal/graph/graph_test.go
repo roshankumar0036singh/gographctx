@@ -751,3 +751,102 @@ func TestQueriesReadViewRemoveFileAndErrorPaths(t *testing.T) {
 	}
 	mustAssertConsistent(t, g)
 }
+
+func TestLoadDenseDuplicateUIDsFallbackAndValidation(t *testing.T) {
+	// 1. Empty graph LoadDense with duplicate node UID + duplicate edge merging sites & tier
+	g := New()
+	nFile := Node{Kind: KindFile, Name: "d.go", File: "d.go", StartLine: 1}
+	nFnV1 := Node{Kind: KindFunction, Name: "Do", QName: "pkg::Do", File: "d.go", StartLine: 5}
+	nFnV2 := Node{Kind: KindFunction, Name: "Do", QName: "pkg::Do", File: "d.go", StartLine: 10, Exported: true}
+	nTarget := Node{Kind: KindFunction, Name: "Helper", QName: "pkg::Helper", File: "d.go", StartLine: 20}
+
+	err := g.LoadDense(
+		[]Node{nFile, nFnV1, nFnV2, nTarget}, // index 1 and 2 share UID
+		[]DenseEdge{
+			{SourceIdx: 0, TargetIdx: 1, Kind: EdgeContains, Tier: TierStructural},
+			{SourceIdx: 2, TargetIdx: 3, Kind: EdgeCalls, Tier: TierSamePackage, HasPrimary: true, PrimarySite: CallSiteRef{Line: 12}},
+			{SourceIdx: 1, TargetIdx: 3, Kind: EdgeCalls, Tier: TierLocal, Label: "local", HasPrimary: true, PrimarySite: CallSiteRef{Line: 14}},
+		},
+		[]CallSite{{Caller: ComputeNodeUID(nFnV2), File: "d.go", Line: 16, LookupKey: "ExtFn", Status: CallStatusExternal, Tier: TierUnresolved}},
+	)
+	if err != nil {
+		t.Fatalf("LoadDense with duplicate node UID failed: %v", err)
+	}
+	mustAssertConsistent(t, g)
+
+	if g.NodeCount() != 3 || g.EdgeCount() != 2 || g.CallSiteCount() != 1 {
+		t.Fatalf("unexpected counts after LoadDense dedup: nodes=%d edges=%d sites=%d", g.NodeCount(), g.EdgeCount(), g.CallSiteCount())
+	}
+	uDo := ComputeNodeUID(nFnV2)
+	uHelper := ComputeNodeUID(nTarget)
+	if gotDo, ok := g.GetNode(uDo); !ok || gotDo.StartLine != 10 || !gotDo.Exported {
+		t.Fatalf("duplicate node UID did not keep updated metadata: %+v", gotDo)
+	}
+	if edge, ok := g.GetEdge(uDo, uHelper, EdgeCalls); !ok || edge.Tier != TierLocal || len(edge.Sites) != 2 {
+		t.Fatalf("duplicate dense edge did not merge sites & upgrade tier: %+v", edge)
+	}
+
+	// 2. Non-empty graph fallback branch of LoadDense preserves existing data and merges new/updated nodes
+	nExistingExtra := Node{Kind: KindFunction, Name: "PreExisting", QName: "pkg::PreExisting", File: "other.go", StartLine: 1}
+	uPre, err := g.AddNode(nExistingExtra)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	nFnV3 := Node{Kind: KindFunction, Name: "Do", QName: "pkg::Do", File: "d.go", StartLine: 15, Complexity: 9}
+	nNew := Node{Kind: KindFunction, Name: "AddedLater", QName: "pkg::AddedLater", File: "d.go", StartLine: 30}
+	err = g.LoadDense(
+		[]Node{nFnV3, nNew},
+		[]DenseEdge{
+			{
+				SourceIdx:   0,
+				TargetIdx:   1,
+				Kind:        EdgeCalls,
+				Tier:        TierQualifiedImport,
+				HasPrimary:  true,
+				PrimarySite: CallSiteRef{Line: 18},
+				Sites:       []CallSiteRef{{Line: 19}},
+			},
+		},
+		nil,
+	)
+	if err != nil {
+		t.Fatalf("non-empty LoadDense fallback failed: %v", err)
+	}
+	mustAssertConsistent(t, g)
+
+	if !g.HasNode(uPre) || g.NodeCount() != 5 {
+		t.Fatalf("non-empty LoadDense lost pre-existing node or miscounted: count=%d", g.NodeCount())
+	}
+	if gotV3, _ := g.GetNode(uDo); gotV3.StartLine != 15 || gotV3.Complexity != 9 {
+		t.Fatalf("non-empty LoadDense did not update survivor: %+v", gotV3)
+	}
+	if eNew, ok := g.GetEdge(uDo, ComputeNodeUID(nNew), EdgeCalls); !ok || len(eNew.Sites) != 2 {
+		t.Fatalf("non-empty LoadDense edge sites mismatch: %+v", eNew)
+	}
+
+	// 3. Validation error branches leave graph untouched
+	beforeNodes := g.NodeCount()
+	invalidCases := []struct {
+		name  string
+		nodes []Node
+		edges []DenseEdge
+		sites []CallSite
+		want  error
+	}{
+		{"invalid node", []Node{{Kind: KindUnknown}}, nil, nil, ErrInvalidNode},
+		{"out of range source", []Node{nNew}, []DenseEdge{{SourceIdx: 5, TargetIdx: 0, Kind: EdgeCalls, Tier: TierLocal}}, nil, ErrNodeNotFound},
+		{"out of range target", []Node{nNew}, []DenseEdge{{SourceIdx: 0, TargetIdx: 5, Kind: EdgeCalls, Tier: TierLocal}}, nil, ErrNodeNotFound},
+		{"non-call self loop", []Node{nNew}, []DenseEdge{{SourceIdx: 0, TargetIdx: 0, Kind: EdgeContains, Tier: TierStructural}}, nil, ErrInvalidEdge},
+		{"bad site line", []Node{nNew}, []DenseEdge{{SourceIdx: 0, TargetIdx: 0, Kind: EdgeCalls, Tier: TierLocal, HasPrimary: true, PrimarySite: CallSiteRef{Line: 0}}}, nil, ErrInvalidEdge},
+		{"invalid callsite", []Node{nNew}, nil, []CallSite{{}}, ErrInvalidCallSite},
+	}
+	for _, tc := range invalidCases {
+		if err := g.LoadDense(tc.nodes, tc.edges, tc.sites); !errors.Is(err, tc.want) {
+			t.Errorf("%s: got %v, want %v", tc.name, err, tc.want)
+		}
+	}
+	if g.NodeCount() != beforeNodes {
+		t.Fatalf("invalid LoadDense mutated graph count from %d to %d", beforeNodes, g.NodeCount())
+	}
+}
