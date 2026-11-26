@@ -566,8 +566,8 @@ Sentinel constants (`numNodeKinds`, `numEdgeKinds`, `numResolutionTiers`, `numCa
 
 ### Design: tree-sitter + Go Walkers
 
-Like CGC, we use tree-sitter for parsing. Unlike CGC:
-- We call tree-sitter's C library via cgo directly — no Python overhead
+Like CGC, we use tree-sitter grammars for parsing. Unlike CGC:
+- We run pure-Go tree-sitter (`gotreesitter`) with compiled-in grammars — no Python overhead and no CGo toolchain required (`CGO_ENABLED=0` compatible)
 - We write Go tree-walkers instead of Python tree-walkers — true parallelism
 - **We parse each file exactly once** — name collection and full extraction in a single pass
 - We use tree-sitter queries (`.scm` files) where practical for declarative extraction, falling back to programmatic walking for complex patterns
@@ -1015,7 +1015,7 @@ CGC got several things right. We adopt these ideas (clean-room implementation, n
 | Choice | Technology | Why |
 |--------|-----------|-----|
 | Language | **Go** | True parallelism (goroutines), single static binary, fast compilation, excellent concurrency primitives, no runtime dependencies |
-| Parser | **tree-sitter** (via cgo) | Battle-tested, supports all target languages, incremental parsing, C-speed with Go orchestration |
+| Parser | **gotreesitter** (pure-Go tree-sitter) | Battle-tested tree-sitter grammars & `.scm` queries in pure Go (`CGO_ENABLED=0`), compiled-in grammars, pooled parsers for parallel Go orchestration |
 | File watching | **fsnotify** | Cross-platform, well-maintained, Go-native |
 | MCP protocol | **Custom Go implementation** | stdio JSON-RPC is simple; no need for a framework. ~300 lines. |
 | Serialization | **Custom binary format** | Purpose-built for our graph shape; no general-purpose DB overhead |
@@ -1027,7 +1027,7 @@ CGC got several things right. We adopt these ideas (clean-room implementation, n
 
 ```
 go.mod:
-  github.com/smacker/go-tree-sitter    # tree-sitter Go bindings
+  github.com/odvcencio/gotreesitter    # Pure-Go tree-sitter runtime + compiled-in grammars
   github.com/fsnotify/fsnotify          # File watching
   github.com/klauspost/compress/zstd    # Optional compression
   # That's it. Maybe 5-6 total with transitive deps.
@@ -1162,7 +1162,7 @@ d:\gographctx\gographctx\
 #### Phase 1: Project Bootstrap & Graph Core
 **Goal:** Initialize Go module, define core graph data structures, and implement compact, thread-safe in-memory graph operations.
 **Deliverables:**
-- `go.mod` (`go 1.21+`), `Makefile`, and `.github/workflows/ci.yml` (`gofmt`, `go vet`, `staticcheck`, `-race`, scale benchmarks)
+- `go.mod` (`go 1.22+` after `gotreesitter` integration; initially `1.21+`), `Makefile`, and `.github/workflows/ci.yml` (`gofmt`, `go vet`, `staticcheck`, `-race`, scale benchmarks)
 - `internal/graph/node.go` — `Node` value type, 13 `NodeKind`s (including `KindExternal`), strict `QName` validation, `numNodeKinds` sentinel
 - `internal/graph/edge.go` — `Edge` with `ResolutionTier`-derived confidence/labels, multi-site `CallSiteRef` provenance, non-call self-loop rejection, `(Kind, Tier)` validation
 - `internal/graph/callsite.go` — `CallSite` (`Status`, `Candidates`, `LookupKey`) for unresolved/ambiguous calls and negative dependencies
@@ -1228,17 +1228,17 @@ d:\gographctx\gographctx\
 ### Parsing Layer (Phases 6–12)
 
 #### Phase 6: tree-sitter Integration & Grammar Management
-**Goal:** Set up tree-sitter Go bindings and grammar loading.
+**Goal:** Set up pure-Go tree-sitter runtime and compiled-in grammar loading.
 **Deliverables:**
 - `internal/parser/treesitter/manager.go`:
-  - Initialize tree-sitter parsers for each supported language
-  - Parse file content → syntax tree
-  - Manage parser lifecycle (create, reuse, destroy)
-  - Grammar compiled into binary (no runtime downloads)
-- `internal/parser/parser.go` — `LanguageParser` interface definition
-- `internal/parser/result.go` — `ParsedFile`, `ParsedFunction`, `ParsedClass`, `ParsedImport`, `ParsedCall`, `ParsedVariable` structs
-- Tests: parse a simple file in each language, verify tree is non-nil and has expected root node
-**Exit criteria:** Can parse files in all 6 languages and get valid syntax trees
+  - Initialize compiled-in grammars (`go`, `python`, `typescript`, `tsx`, `javascript`, `rust`, `java`)
+  - Parse file content → syntax tree (`Parse`, `ParseContext`, `ParseStrict`, `ParseFile`) and `.scm` query compilation (`CompileQuery`)
+  - Manage parser lifecycle via per-language `gotreesitter.ParserPool` (`sync.Pool`), `ParsedTree.Release()`, and `Manager.Close()`
+  - Grammar tables and scanners compiled into binary (no runtime downloads, `CGO_ENABLED=0` compatible)
+- `internal/parser/parser.go` — `LanguageParser` interface definition + thread-safe `Registry`
+- `internal/parser/result.go` — `ParsedFile`, `ParsedFunction`, `ParsedClass`, `ParsedField`, `ParsedImport`, `ParsedCall`, `ParsedVariable`, `ParsedTypeAlias` structs
+- Tests: parse sample files in all 7 grammars (`go`, `python`, `typescript`, `tsx`, `javascript`, `rust`, `java`), concurrency safety, error recovery, and query compilation
+**Exit criteria:** Can parse files in all 6 languages (+ TSX) and get valid syntax trees
 
 #### Phase 7: Go Parser
 **Goal:** Implement full Go language parser.
