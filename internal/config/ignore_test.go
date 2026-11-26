@@ -69,12 +69,13 @@ func TestGitignoreSemanticsGlobsNegationAndChildScoping(t *testing.T) {
 /root_only.txt
 docs/generated/
 **/temp/*.go
-a/**/z.py
+a/**/**/z.py
 [0-9]?.tmp
 [!a-z]_file.txt
 \#literal_hash.txt
 \!literal_bang.txt
-trailing\ 
+trailing\   
+lead_space  \ 
 `
 	m, err := ParseIgnoreRules("", rules)
 	if err != nil {
@@ -116,16 +117,25 @@ trailing\
 		{"9_file.txt", false, true},
 		{"a_file.txt", false, false},
 
-		// Escaped # and ! and trailing space
+		// Escaped # and ! and trailing space edge cases
 		{"#literal_hash.txt", false, true},
 		{"!literal_bang.txt", false, true},
 		{"trailing ", false, true},
 		{"trailing", false, false},
+		{"lead_space   ", false, true},
+		{"lead_space  ", false, false},
 	}
 	for _, tc := range cases {
 		if got := m.ShouldIgnorePath(tc.path, tc.isDir); got != tc.want {
 			t.Errorf("ShouldIgnorePath(%q, isDir=%v) = %v, want %v", tc.path, tc.isDir, got, tc.want)
 		}
+	}
+
+	if got := stripTrailingUnescapedSpaces(`two_bs\\ `); got != `two_bs\\` {
+		t.Fatalf("stripTrailingUnescapedSpaces(even backslashes) = %q, want %q", got, `two_bs\\`)
+	}
+	if got := stripTrailingUnescapedSpaces(`one_bs\   `); got != `one_bs ` {
+		t.Fatalf("stripTrailingUnescapedSpaces(escaped + trailing spaces) = %q, want %q", got, `one_bs `)
 	}
 
 	// Excluded ancestor directory blocks re-inclusion of nested files

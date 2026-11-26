@@ -88,14 +88,14 @@ func TestLoadJSONAndKeyValueRCWithEnvPrecedence(t *testing.T) {
 		t.Fatalf("env GGCTX_LANGUAGES mismatch: %v", cfg.Languages)
 	}
 
-	// 2. Key = value .ggctxrc with comments and quotes
+	// 2. Key = value .ggctxrc with inline comments and quotes
 	kvDir := t.TempDir()
 	kvRC := `
 # GoGraphCtx settings
-workers = 4
-token_budget = 6000
+workers = 4 # worker threads
+token_budget = 6000 // MCP token limit
 debounce_ms = 0
-data_dir = ".kv_data"
+data_dir = ".kv#data" # keeps '#' inside quotes
 languages = "go, typescript"
 `
 	kvPath := filepath.Join(kvDir, DefaultRCFileName)
@@ -108,7 +108,7 @@ languages = "go, typescript"
 	if err != nil {
 		t.Fatalf("LoadFromFile key=value failed: %v", err)
 	}
-	if cfgKV.Workers != 9 || cfgKV.TokenBudget != 6000 || cfgKV.DebounceDuration() != 0 || cfgKV.DataDir != ".kv_data" {
+	if cfgKV.Workers != 9 || cfgKV.TokenBudget != 6000 || cfgKV.DebounceDuration() != 0 || cfgKV.DataDir != ".kv#data" {
 		t.Fatalf("key=value rc mismatch: %+v", cfgKV)
 	}
 }
@@ -125,13 +125,27 @@ func TestConfigValidationAndMalformedErrors(t *testing.T) {
 		t.Fatalf("empty .ggctxrc should succeed: %v", err)
 	}
 
-	// Unknown JSON field rejected cleanly
+	// Unknown JSON field & trailing JSON content rejected cleanly
 	badJSON := filepath.Join(dir, "bad.json.rc")
 	if err := os.WriteFile(badJSON, []byte(`{"unknown_field": 1}`), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := LoadFromFile(badJSON); !errors.Is(err, ErrInvalidConfig) {
 		t.Fatalf("expected ErrInvalidConfig for unknown JSON field, got %v", err)
+	}
+	trailingJSON := filepath.Join(dir, "trailing.json.rc")
+	if err := os.WriteFile(trailingJSON, []byte(`{"workers": 2}{"workers": 4}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := LoadFromFile(trailingJSON); !errors.Is(err, ErrInvalidConfig) {
+		t.Fatalf("expected ErrInvalidConfig for trailing JSON object, got %v", err)
+	}
+	garbageJSON := filepath.Join(dir, "garbage.json.rc")
+	if err := os.WriteFile(garbageJSON, []byte(`{"workers": 2} trailing`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := LoadFromFile(garbageJSON); !errors.Is(err, ErrInvalidConfig) {
+		t.Fatalf("expected ErrInvalidConfig for trailing JSON garbage, got %v", err)
 	}
 
 	// Unknown key=value key or syntax error rejected

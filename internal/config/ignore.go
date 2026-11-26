@@ -87,6 +87,7 @@ func LoadIgnoreFile(path string) (*IgnoreMatcher, error) {
 
 // LoadRepoIgnoreMatcher builds the effective repository IgnoreMatcher from:
 // DefaultIgnorePatterns -> cfg.DataDir -> <repoRoot>/.gitignore (if cfg.UseGitignore) -> <repoRoot>/<cfg.IgnoreFile>.
+// Directory walkers descending into subdirectories should layer nested ignore files via ChildFromFile.
 func LoadRepoIgnoreMatcher(repoRoot string, cfg Config) (*IgnoreMatcher, error) {
 	m := &IgnoreMatcher{}
 	defaults := append([]string{}, DefaultIgnorePatterns...)
@@ -226,12 +227,18 @@ func parseIgnoreLine(baseDir, raw string) (ignoreRule, bool, error) {
 		return ignoreRule{}, false, nil
 	}
 
-	segs := strings.Split(line, "/")
-	for i := range segs {
-		segs[i] = normalizeSegmentPattern(segs[i])
-		if _, err := path.Match(segs[i], "probe"); err != nil {
+	rawSegs := strings.Split(line, "/")
+	segs := make([]string, 0, len(rawSegs))
+	for _, s := range rawSegs {
+		// Collapse consecutive "**" segments directly (e.g. a/**/**/b -> a/**/b).
+		if s == "**" && len(segs) > 0 && segs[len(segs)-1] == "**" {
+			continue
+		}
+		norm := normalizeSegmentPattern(s)
+		if _, err := path.Match(norm, "probe"); err != nil {
 			return ignoreRule{}, false, fmt.Errorf("%w: invalid ignore pattern %q: %w", ErrInvalidConfig, raw, err)
 		}
+		segs = append(segs, norm)
 	}
 	rule.patSegs = segs
 	return rule, true, nil
@@ -240,8 +247,12 @@ func parseIgnoreLine(baseDir, raw string) (ignoreRule, bool, error) {
 func stripTrailingUnescapedSpaces(s string) string {
 	end := len(s)
 	for end > 0 && (s[end-1] == ' ' || s[end-1] == '\t') {
-		if end >= 2 && s[end-2] == '\\' {
-			// Replace escaped space "\ " with literal " " and stop stripping.
+		bs := 0
+		for j := end - 2; j >= 0 && s[j] == '\\'; j-- {
+			bs++
+		}
+		// Odd backslash count means this trailing whitespace character is escaped.
+		if bs%2 == 1 {
 			return s[:end-2] + s[end-1:end]
 		}
 		end--

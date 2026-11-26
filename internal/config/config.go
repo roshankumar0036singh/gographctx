@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -185,6 +186,13 @@ func mergeFileInto(cfg *Config, path string) error {
 		if err := dec.Decode(cfg); err != nil {
 			return fmt.Errorf("%w: parse JSON config %q: %w", ErrInvalidConfig, path, err)
 		}
+		var trailing any
+		if err := dec.Decode(&trailing); err != io.EOF {
+			if err == nil {
+				return fmt.Errorf("%w: unexpected trailing JSON value in %q", ErrInvalidConfig, path)
+			}
+			return fmt.Errorf("%w: trailing content in %q: %w", ErrInvalidConfig, path, err)
+		}
 		return nil
 	}
 	return parseKeyValueConfig(cfg, path, trimmed)
@@ -204,7 +212,7 @@ func parseKeyValueConfig(cfg *Config, path string, data []byte) error {
 			return fmt.Errorf("%w: %s:%d expected key = value, got %q", ErrInvalidConfig, path, lineNum, line)
 		}
 		key := strings.ToLower(strings.TrimSpace(line[:eq]))
-		val := strings.TrimSpace(line[eq+1:])
+		val := stripInlineComment(strings.TrimSpace(line[eq+1:]))
 		val = trimMatchingQuotes(val)
 
 		if err := setConfigKey(cfg, key, val); err != nil {
@@ -215,6 +223,31 @@ func parseKeyValueConfig(cfg *Config, path string, data []byte) error {
 		return fmt.Errorf("scan config %q: %w", path, err)
 	}
 	return nil
+}
+
+func stripInlineComment(s string) string {
+	var quote byte
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if quote != 0 {
+			if c == '\\' && quote == '"' && i+1 < len(s) {
+				i++
+				continue
+			}
+			if c == quote {
+				quote = 0
+			}
+			continue
+		}
+		if c == '"' || c == '\'' {
+			quote = c
+			continue
+		}
+		if c == '#' || (c == '/' && i+1 < len(s) && s[i+1] == '/') {
+			return strings.TrimSpace(s[:i])
+		}
+	}
+	return s
 }
 
 func trimMatchingQuotes(s string) string {
