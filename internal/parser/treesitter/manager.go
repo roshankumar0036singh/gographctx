@@ -156,6 +156,8 @@ type langEntry struct {
 
 // ParsedTree owns a parsed tree-sitter syntax tree along with the language grammar
 // needed to inspect node types and text slices. Call Release when finished.
+// Source aliases the byte slice passed to Parse so callers must not mutate it
+// while inspecting NodeText before Release.
 type ParsedTree struct {
 	Language string
 	Tree     *gotreesitter.Tree
@@ -356,8 +358,25 @@ func (m *Manager) Parse(lang string, source []byte) (*ParsedTree, error) {
 	return m.ParseContext(context.Background(), lang, source)
 }
 
-// ParseContext parses source if ctx has not already been canceled or expired.
+// ParseContext parses source if ctx has not already been canceled or expired,
+// releasing any produced tree and returning ctx.Err() if ctx expires mid-parse.
 func (m *Manager) ParseContext(ctx context.Context, lang string, source []byte) (*ParsedTree, error) {
+	return m.parseContext(ctx, lang, source, false)
+}
+
+// ParseStrict parses source and propagates strict parse errors and early stops.
+// Callers must call Release on the returned *ParsedTree when done.
+func (m *Manager) ParseStrict(lang string, source []byte) (*ParsedTree, error) {
+	return m.ParseStrictContext(context.Background(), lang, source)
+}
+
+// ParseStrictContext parses source with strict error reporting, honoring ctx
+// cancellation/deadline before and immediately after parsing.
+func (m *Manager) ParseStrictContext(ctx context.Context, lang string, source []byte) (*ParsedTree, error) {
+	return m.parseContext(ctx, lang, source, true)
+}
+
+func (m *Manager) parseContext(ctx context.Context, lang string, source []byte, strict bool) (*ParsedTree, error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -368,28 +387,23 @@ func (m *Manager) ParseContext(ctx context.Context, lang string, source []byte) 
 	if err != nil {
 		return nil, err
 	}
-	tree, err := entry.pool.Parse(source)
+	var tree *gotreesitter.Tree
+	if strict {
+		tree, err = entry.pool.ParseStrict(source)
+	} else {
+		tree, err = entry.pool.Parse(source)
+	}
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		if tree != nil {
+			tree.Release()
+		}
+		return nil, ctxErr
+	}
 	if err != nil {
+		if strict {
+			return nil, fmt.Errorf("treesitter: strict parse %s: %w", canonical, err)
+		}
 		return nil, fmt.Errorf("treesitter: parse %s: %w", canonical, err)
-	}
-	return &ParsedTree{
-		Language: canonical,
-		Tree:     tree,
-		Grammar:  entry.grammar,
-		Source:   source,
-	}, nil
-}
-
-// ParseStrict parses source and propagates strict parse errors and early stops.
-// Callers must call Release on the returned *ParsedTree when done.
-func (m *Manager) ParseStrict(lang string, source []byte) (*ParsedTree, error) {
-	entry, canonical, err := m.lookupEntry(lang)
-	if err != nil {
-		return nil, err
-	}
-	tree, err := entry.pool.ParseStrict(source)
-	if err != nil {
-		return nil, fmt.Errorf("treesitter: strict parse %s: %w", canonical, err)
 	}
 	return &ParsedTree{
 		Language: canonical,
@@ -401,14 +415,27 @@ func (m *Manager) ParseStrict(lang string, source []byte) (*ParsedTree, error) {
 
 // ParseFile detects the language from path and parses source.
 func (m *Manager) ParseFile(path string, source []byte) (*ParsedTree, error) {
+	return m.ParseFileContext(context.Background(), path, source)
+}
+
+// ParseFileContext detects the language from path and parses source under ctx.
+func (m *Manager) ParseFileContext(ctx context.Context, path string, source []byte) (*ParsedTree, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	lang, ok := DetectLanguage(path)
 	if !ok {
 		return nil, fmt.Errorf("%w: no grammar for %q", ErrUnsupportedLanguage, path)
 	}
-	return m.Parse(lang, source)
+	return m.ParseContext(ctx, lang, source)
 }
 
 // CompileQuery compiles a tree-sitter S-expression query for lang.
+// Returned *gotreesitter.Query instances are pure-Go GC-managed and do not
+// require explicit Close or Release calls.
 func (m *Manager) CompileQuery(lang string, pattern string) (*gotreesitter.Query, error) {
 	if strings.TrimSpace(pattern) == "" {
 		return nil, ErrEmptyQueryPattern

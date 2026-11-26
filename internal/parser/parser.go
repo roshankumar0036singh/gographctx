@@ -27,6 +27,9 @@ type LanguageParser interface {
 	Parse(ctx context.Context, path string, source []byte) (*ParsedFile, error)
 }
 
+// NOTE: "jsx" intentionally normalizes to "javascript" because the JavaScript
+// tree-sitter grammar parses both JS and JSX; downstream parsers must not
+// register a separate "jsx" parser claiming ".jsx". ".tsx" remains distinct.
 var languageAliases = map[string]string{
 	"golang":     "go",
 	"py":         "python",

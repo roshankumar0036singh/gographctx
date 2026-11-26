@@ -313,6 +313,23 @@ func TestManagerOptionsErrorsAndClosedLifecycle(t *testing.T) {
 	if _, err := mgr.ParseContext(canceled, LangGo, []byte("package p")); !errors.Is(err, context.Canceled) {
 		t.Fatalf("ParseContext canceled err = %v, want context.Canceled", err)
 	}
+	if _, err := mgr.ParseStrictContext(canceled, LangGo, []byte("package p")); !errors.Is(err, context.Canceled) {
+		t.Fatalf("ParseStrictContext canceled err = %v, want context.Canceled", err)
+	}
+	if _, err := mgr.ParseFileContext(canceled, "main.go", []byte("package p")); !errors.Is(err, context.Canceled) {
+		t.Fatalf("ParseFileContext canceled err = %v, want context.Canceled", err)
+	}
+	var nilCtx context.Context
+	ptNilCtx, err := mgr.ParseStrictContext(nilCtx, LangGo, []byte("package p\n"))
+	if err != nil {
+		t.Fatalf("ParseStrictContext(nil) failed: %v", err)
+	}
+	ptNilCtx.Release()
+	ptFileCtx, err := mgr.ParseFileContext(nilCtx, "main.go", []byte("package p\n"))
+	if err != nil {
+		t.Fatalf("ParseFileContext(nil) failed: %v", err)
+	}
+	ptFileCtx.Release()
 
 	if err := mgr.Close(); err != nil {
 		t.Fatalf("Close failed: %v", err)
