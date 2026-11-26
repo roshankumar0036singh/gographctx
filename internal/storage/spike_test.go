@@ -127,7 +127,7 @@ func BenchmarkPersistenceSpike150kNodes600kEdges(b *testing.B) {
 			writeMs := float64(time.Since(t0).Microseconds()) / 1000.0
 
 			t1 := time.Now()
-			loaded, _, err := ReadSnapshotDecode(snapPath)
+			loaded, _, err := ReadSnapshot(snapPath)
 			if err != nil {
 				b.Fatal(err)
 			}
@@ -166,7 +166,7 @@ func BenchmarkPersistenceSpike150kNodes600kEdges(b *testing.B) {
 			writeMs := float64(time.Since(t0).Microseconds()) / 1000.0
 
 			t1 := time.Now()
-			loaded, _, err := ReadSnapshotDecode(snapPath)
+			loaded, _, err := ReadSnapshot(snapPath)
 			if err != nil {
 				b.Fatal(err)
 			}

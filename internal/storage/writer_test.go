@@ -419,7 +419,7 @@ func TestCorruptCountsAndWALOverflowGuards(t *testing.T) {
 	var tinyPayload binWriter
 	tinyPayload.writeUvarint(1)
 	tinyPayload.writeString("")
-	if _, err := decodeSnapshotPayload(tinyPayload.buf.Bytes(), 1<<40, 0, 0); !errors.Is(err, ErrInvalidFormat) {
+	if _, err := decodeSnapshotFromReader(newBinReader(tinyPayload.buf.Bytes()), 1<<40, 0, 0); !errors.Is(err, ErrInvalidFormat) {
 		t.Fatalf("expected ErrInvalidFormat on bogus huge snapshot nodeCount, got %v", err)
 	}
 }
