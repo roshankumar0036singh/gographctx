@@ -1,9 +1,10 @@
 module github.com/roshankumar0036singh/gographctx
 
-go 1.21
+go 1.22.0
 
 require (
 	github.com/klauspost/compress v1.17.11
+	github.com/odvcencio/gotreesitter v0.58.0
 	modernc.org/sqlite v1.34.5
 )
 
