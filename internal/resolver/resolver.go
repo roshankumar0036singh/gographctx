@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"sort"
+	"strings"
 	"sync"
 
 	"github.com/roshankumar0036singh/gographctx/internal/graph"
@@ -84,8 +85,40 @@ type FileResolution struct {
 type ResolutionContext struct {
 	View      *graph.ReadView
 	NameIndex *parser.NameIndex
+	Files     map[string]*parser.ParsedFile `json:"-"`
 	RepoRoot  string
 	Module    string
+}
+
+// IndexFiles populates Files keyed by cleaned slash path so resolvers can inspect
+// transitive re-exports and barrel imports without re-reading disk.
+func (rc *ResolutionContext) IndexFiles(files []*parser.ParsedFile) {
+	if rc == nil {
+		return
+	}
+	if rc.Files == nil {
+		rc.Files = make(map[string]*parser.ParsedFile, len(files))
+	}
+	for _, f := range files {
+		if f == nil || f.Path == "" {
+			continue
+		}
+		rc.Files[normalizeContextPath(f.Path)] = f
+	}
+}
+
+// LookupFile returns the indexed ParsedFile for filePath, if registered on rc.
+func (rc *ResolutionContext) LookupFile(filePath string) *parser.ParsedFile {
+	if rc == nil || len(rc.Files) == 0 || filePath == "" {
+		return nil
+	}
+	return rc.Files[normalizeContextPath(filePath)]
+}
+
+func normalizeContextPath(p string) string {
+	cleaned := strings.ReplaceAll(strings.TrimSpace(p), "\\", "/")
+	cleaned = strings.TrimPrefix(cleaned, "./")
+	return cleaned
 }
 
 // LookupByQName returns matching graph nodes for qname from View, if present.
