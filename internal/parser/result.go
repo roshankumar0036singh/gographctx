@@ -111,6 +111,7 @@ type ParsedImport struct {
 	IsWildcard bool     `json:"is_wildcard,omitempty"`
 	IsTypeOnly bool     `json:"is_type_only,omitempty"`
 	IsRelative bool     `json:"is_relative,omitempty"`
+	Exported   bool     `json:"exported,omitempty"`
 }
 
 // ParsedCall represents a syntactic function, method, or constructor call site.
