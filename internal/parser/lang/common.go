@@ -184,7 +184,8 @@ func LeadingDocComment(targetNode *gotreesitter.Node, source []byte, lang *gotre
 	var lines []string
 	nextStartRow := targetNode.StartPoint().Row
 	for prev := targetNode.PrevSibling(); prev != nil; prev = prev.PrevSibling() {
-		if prev.Type(lang) != "comment" {
+		typ := prev.Type(lang)
+		if typ != "comment" && typ != "line_comment" && typ != "block_comment" {
 			break
 		}
 		endRow := prev.EndPoint().Row
