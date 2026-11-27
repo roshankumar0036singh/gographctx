@@ -308,18 +308,22 @@ func BuildResolvedFragment(pf *parser.ParsedFile, fr *resolver.FileResolution, v
 
 	fileUID := frag.Nodes[0].UID
 	extByKey := make(map[string]graph.UID)
+	seenImports := make(map[graph.UID]struct{})
 
 	// 1. Materialize IMPORTS edges (internal TargetFile or per-file external node).
 	for _, imp := range fr.Imports {
 		if !imp.IsExternal && imp.TargetFile != "" {
 			if targetFileUID, ok := lookupFileNodeUID(imp.TargetFile, pf.Path, fileUID, view); ok && targetFileUID != fileUID {
-				frag.Edges = append(frag.Edges, graph.Edge{
-					Source: fileUID,
-					Target: targetFileUID,
-					Kind:   graph.EdgeImports,
-					Tier:   resolver.TierQualifiedImport,
-					Label:  imp.ImportPath,
-				})
+				if _, dup := seenImports[targetFileUID]; !dup {
+					seenImports[targetFileUID] = struct{}{}
+					frag.Edges = append(frag.Edges, graph.Edge{
+						Source: fileUID,
+						Target: targetFileUID,
+						Kind:   graph.EdgeImports,
+						Tier:   resolver.TierQualifiedImport,
+						Label:  imp.ImportPath,
+					})
+				}
 			}
 			continue
 		}
@@ -347,13 +351,16 @@ func BuildResolvedFragment(pf *parser.ParsedFile, fr *resolver.FileResolution, v
 				})
 			}
 			if extUID != fileUID {
-				frag.Edges = append(frag.Edges, graph.Edge{
-					Source: fileUID,
-					Target: extUID,
-					Kind:   graph.EdgeImports,
-					Tier:   resolver.TierQualifiedImport,
-					Label:  imp.ImportPath,
-				})
+				if _, dup := seenImports[extUID]; !dup {
+					seenImports[extUID] = struct{}{}
+					frag.Edges = append(frag.Edges, graph.Edge{
+						Source: fileUID,
+						Target: extUID,
+						Kind:   graph.EdgeImports,
+						Tier:   resolver.TierQualifiedImport,
+						Label:  imp.ImportPath,
+					})
+				}
 			}
 		}
 	}

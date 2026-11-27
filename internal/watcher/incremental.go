@@ -383,6 +383,32 @@ func (e *IncrementalEngine) reResolveAndPersistLocked(ctx context.Context, files
 		return nil
 	}
 
+	// Lazily hydrate parsedCache for direct import targets of files being re-resolved
+	// so transitive re-export chasing (__init__.py / barrel index.ts / pub use) remains
+	// accurate even after loading a cold snapshot on restart.
+	var importTargets []string
+	e.g.View(func(v *graph.ReadView) {
+		seen := make(map[string]struct{})
+		for _, pf := range files {
+			for _, fnNode := range v.GetByQName(pf.Path) {
+				if fnNode.Kind != graph.KindFile {
+					continue
+				}
+				for _, edge := range v.GetOutgoingEdges(fnNode.UID, graph.EdgeImports) {
+					if tgt, ok := v.GetNode(edge.Target); ok && tgt.Kind == graph.KindFile && tgt.File != "" {
+						if _, dup := seen[tgt.File]; !dup {
+							seen[tgt.File] = struct{}{}
+							importTargets = append(importTargets, tgt.File)
+						}
+					}
+				}
+			}
+		}
+	})
+	for _, impFile := range importTargets {
+		_, _ = e.ensureParsedLocked(ctx, impFile)
+	}
+
 	var nameIdx *parser.NameIndex
 	allOverlay := make([]*parser.ParsedFile, 0, len(e.parsedCache))
 	for _, pf := range e.parsedCache {

@@ -1457,13 +1457,11 @@ d:\gographctx\gographctx\
 **Goal:** Wire fsnotify to the incremental indexing engine.
 **Deliverables:**
 - `internal/watcher/watcher.go`:
-  - fsnotify-based recursive directory watching
-  - Debounce: coalesce rapid changes (configurable, default 100ms)
-  - Filter: ignore changes to non-source files and ignored paths
-  - Trigger incremental update on debounce timeout
-  - Report: "Updated X in 45ms (re-resolved 3 dependents)"
-  - Graceful shutdown
-- Tests: mock filesystem events, verify correct debouncing, verify incremental update triggered
+  - `FileWatcher` (`fsnotify.Watcher`) with recursive directory registration, dynamic new-directory watching, and deleted-directory graph cleanup
+  - Configurable debounce coalescing rapid write/create bursts (default 100ms)
+  - Nested `.gitignore` / `.ggctxignore` directory matcher layering and language/extension source filtering
+  - `UpdateReport` (`"Updated X in 45ms (re-resolved 3 dependents)"`), non-blocking `EnqueueEvent`, and graceful context/close shutdown
+- Tests: `internal/watcher/watcher_test.go` (`TestFileWatcherDebouncingFilteringAndGracefulShutdown` verifying burst coalescing, ignore filtering, new subdirectory watching, and graceful shutdown)
 **Exit criteria:** File changes trigger correct incremental updates within 100ms target
 
 ### MCP Server (Phases 25–28)
@@ -1558,6 +1556,55 @@ d:\gographctx\gographctx\
 - Comparison report: GoGraphCtx vs CGC on same repos
 **Exit criteria:** All performance targets met. Accuracy targets met. Comparison report generated.
 
+### CI/CD, Testing & Release Benchmarking Workflows (Phases 31–34)
+
+#### Phase 31: Unit Test, Lint & Security CI Workflows
+**Goal:** Enforce fast unit test verification, formatting, static analysis, and vulnerability scanning on every Pull Request and push.
+**Deliverables:**
+- `.github/workflows/unit-tests.yml`:
+  - Trigger: `pull_request` (all opened/synchronized PRs) and `push` to `main` / `phase-*` branches
+  - Fast unit-test matrix (`go test -short -race -cover ./...`) across Ubuntu Linux, macOS, and Windows on supported Go versions (`1.22`, `1.25`)
+  - Enforce per-package coverage reporting (`go tool cover`) and artifact upload
+- `.github/workflows/lint-security.yml`:
+  - Trigger: `pull_request` and `push`
+  - Enforce `gofmt -l .` zero-diff check, `go vet ./...`, `staticcheck ./...`, `govulncheck ./...`, and `go mod verify`
+**Exit criteria:** Every PR runs unit tests, lint, and security checks automatically in <3 minutes with zero manual triggers
+
+#### Phase 32: Approved-PR Integration & Cross-Platform E2E Workflows
+**Goal:** Gate heavyweight integration, watcher, recovery, and cross-platform end-to-end workflows so they execute only after PR approval (plus manual dispatch for maintainers).
+**Deliverables:**
+- `.github/workflows/integration-tests.yml`:
+  - Trigger: `pull_request_review` (`types: [submitted]`, conditional on `github.event.review.state == 'approved'`) and `workflow_dispatch` (skipping unapproved/draft PRs)
+  - Concurrency cancellation per PR ref; checks out PR head commit cleanly after verifying approval state via GitHub context
+  - Runs full multi-package/multi-language indexing tests (`internal/pipeline`), crash-recovery & WAL compaction tests (`internal/storage`), real `fsnotify` watcher tests (`internal/watcher`), and full MCP stdio integration harness (`internal/mcp`)
+- `.github/workflows/cross-platform-smoke.yml`:
+  - Trigger: approved PR merge queue / `push` to `main` / `workflow_dispatch`
+  - Builds release-grade binaries (`CGO_ENABLED=0` or target toolchains) and executes CLI smoke tests (`index`, `query`, `stats`, `serve`) across Linux, macOS, and Windows
+**Exit criteria:** Unapproved PRs skip heavy integration suites, while every approved PR passes full end-to-end integration tests across platforms before merge
+
+#### Phase 33: Fuzz, Race Stress & Accuracy Evaluation Workflows
+**Goal:** Continuously guard against persistence corruption, data races, watcher deadlocks, and resolver accuracy drift via dedicated specialized testing workflows.
+**Deliverables:**
+- `.github/workflows/fuzz-soak.yml`:
+  - Trigger: `schedule` (nightly cron), `pull_request` with `run-fuzz` label, and `workflow_dispatch`
+  - Runs binary snapshot/WAL fuzzing (`go test -fuzz=FuzzSnapshotAndWALDecode -fuzztime=60s ./internal/storage`) and `-race` stress tests on `internal/graph` and `internal/watcher`
+- `.github/workflows/accuracy-eval.yml`:
+  - Trigger: `pull_request_review` (approved PRs touching `internal/parser/` or `internal/resolver/`), nightly `schedule`, and `workflow_dispatch`
+  - Indexes reference open-source fixtures (including Flask 83 Python files and multi-package Go/TS/Rust/Java fixtures), compares resolved edges against SCIP ground truth, asserts precision ≥90% and strong-tier coverage ≥85%, and uploads JSON diff reports
+**Exit criteria:** Fuzzing, race stress, and resolver accuracy gates catch regressions automatically without slowing routine unit PRs
+
+#### Phase 34: Post-Release Comprehensive Benchmarking Workflow
+**Goal:** Run a full end-to-end performance, memory, latency, and binary-size benchmark suite automatically after every published release to track trends and detect regressions across versions.
+**Deliverables:**
+- `.github/workflows/release-benchmarks.yml`:
+  - Trigger: `release` (`types: [published]`), tag push `v*`, and `workflow_dispatch`
+  - Runs comprehensive release benchmarks on dedicated consistent runners:
+    - Micro-benchmarks (`go test -bench=. -benchmem -count=5 ./...`) across graph queries, binary snapshot/WAL codec, parser coordinator, and pipeline
+    - Full repository benchmarks: Flask (target <1s, RSS <80MB) and 1000-file Go monorepo (target <3s, RSS <150MB)
+    - Incremental body-edit (<50ms) and export-change (<100ms) latency benchmarks, MCP tool query p50/p95/p99 latency (<10ms), CLI cold-startup time (<50ms), and binary size measurement
+  - Compares results against the previous release tag baseline and CGC reference metrics, generates Markdown + JSON benchmark reports attached to the GitHub Release assets / Actions summary, and fails or alerts on regression beyond configured tolerance thresholds
+**Exit criteria:** Every published release produces an audited, archived benchmark report comparing throughput, RSS memory, latency, and accuracy against prior releases
+
 ### Phase Summary Table
 
 | Phase | Name | Depends On | Key Output |
@@ -1592,6 +1639,10 @@ d:\gographctx\gographctx\
 | 28 | MCP Integration Tests | 22, 26, 27 | End-to-end MCP tests |
 | 29 | CLI | 22, 24, 25 | Binary entry point |
 | 30 | Benchmarks & Validation | 22, 28 | Performance + accuracy proof |
+| 31 | Unit, Lint & Security CI | 1–30 | PR unit tests (`-short -race`), `gofmt`, `staticcheck`, `govulncheck` |
+| 32 | Approved-PR Integration CI | 28, 29, 31 | Approval-gated E2E integration & cross-platform smoke workflows |
+| 33 | Fuzz, Race & Accuracy CI | 4, 24, 30 | Nightly/labeled fuzzing, `-race` soak, SCIP accuracy evaluation |
+| 34 | Post-Release Benchmarks | 30, 32, 33 | Automated post-release perf/RSS/latency/CGC comparison & report |
 
 ### Dependency Graph
 
@@ -1655,6 +1706,15 @@ flowchart TD
     P25 --> P29
     P22 --> P30["P30: Benchmarks & Validation"]
     P28 --> P30
+    P30 --> P31["P31: Unit, Lint & Security CI"]
+    P28 --> P32["P32: Approved-PR Integration CI"]
+    P29 --> P32
+    P31 --> P32
+    P30 --> P33["P33: Fuzz, Race & Accuracy CI"]
+    P24 --> P33
+    P30 --> P34["P34: Post-Release Benchmarks"]
+    P32 --> P34
+    P33 --> P34
 ```
 
 ---
