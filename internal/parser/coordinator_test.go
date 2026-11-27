@@ -164,19 +164,44 @@ func TestCoordinatorErrorsFailFastAndCancel(t *testing.T) {
 	if !res.HasErrors() || len(res.Errors) != 2 || res.Err() == nil {
 		t.Fatalf("expected 2 FileErrors collected, got %+v", res.Errors)
 	}
+	var fe parser.FileError
+	if !errors.As(res.Err(), &fe) || fe.Path != "unknown.xyz" {
+		t.Fatalf("errors.As(res.Err(), &fe) mismatch: fe=%+v err=%v", fe, res.Err())
+	}
 	if len(res.Files) != 1 || res.Files[0].Path != "good.go" {
 		t.Fatalf("expected healthy good.go parsed, got %+v", res.Files)
 	}
 
-	// FailFast=true aborts and returns error.
+	// FailFast=true aborts and returns error matching FileError.
 	fastCoord, err := parser.NewCoordinator(reg, parser.CoordinatorConfig{Workers: 2, FailFast: true})
 	if err != nil {
 		t.Fatalf("NewCoordinator FailFast failed: %v", err)
 	}
-	if _, err := fastCoord.ParseFiles(context.Background(), []parser.FileInput{
+	_, ffErr := fastCoord.ParseFiles(context.Background(), []parser.FileInput{
 		{Path: "bad.unknown", Source: []byte("x")},
-	}); err == nil {
-		t.Fatal("expected error in FailFast mode")
+	})
+	var ffFileErr parser.FileError
+	if ffErr == nil || !errors.As(ffErr, &ffFileErr) || ffFileErr.Path != "bad.unknown" {
+		t.Fatalf("FailFast errors.As mismatch: err=%v fe=%+v", ffErr, ffFileErr)
+	}
+
+	// Mixed ./ and backslash paths sort consistently across Files and NameIndex.
+	mixedCoord, err := parser.NewCoordinator(reg, parser.CoordinatorConfig{Workers: 2, DeterministicSort: true})
+	if err != nil {
+		t.Fatalf("NewCoordinator mixed failed: %v", err)
+	}
+	mixedRes, err := mixedCoord.ParseFiles(context.Background(), []parser.FileInput{
+		{Path: `pkg\zeta.go`, Source: []byte("package pkg\nfunc Shared() {}\n")},
+		{Path: "./pkg/alpha.go", Source: []byte("package pkg\nfunc Shared() {}\n")},
+	})
+	if err != nil || mixedRes.HasErrors() || len(mixedRes.Files) != 2 {
+		t.Fatalf("mixed paths parse failed: err=%v errs=%v", err, mixedRes.Errors)
+	}
+	if mixedRes.Files[0].Path != "./pkg/alpha.go" || mixedRes.Files[1].Path != `pkg\zeta.go` {
+		t.Fatalf("mixed path Files order = [%q, %q]", mixedRes.Files[0].Path, mixedRes.Files[1].Path)
+	}
+	if got := mixedRes.NameIndex.FilesForSymbol("Shared"); !slices.Equal(got, []string{"./pkg/alpha.go", `pkg\zeta.go`}) {
+		t.Fatalf("mixed path NameIndex.FilesForSymbol order = %v", got)
 	}
 
 	// Canceled context fails promptly.

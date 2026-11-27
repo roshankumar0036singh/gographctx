@@ -6,9 +6,10 @@ import (
 	"errors"
 	"fmt"
 	"os"
-	"path/filepath"
+	"path"
 	"runtime"
 	"slices"
+	"strings"
 	"time"
 
 	"github.com/roshankumar0036singh/gographctx/internal/graph"
@@ -41,6 +42,8 @@ type CoordinatorConfig struct {
 }
 
 // FileError captures a per-file failure observed during batch parsing.
+// Both BatchResult.Err() and FailFast error returns wrap FileError values so
+// callers can consistently inspect failures via errors.As(err, &fileErr).
 type FileError struct {
 	Path     string
 	Language string
@@ -74,6 +77,9 @@ type SymbolEntry struct {
 
 // NameIndex maps symbol names, qualified names, and packages to defining files
 // and symbol metadata from a single parse pass (eliminating two-pass pre-scans).
+// Both exported and unexported fields/symbols are indexed with Exported preserved
+// so intra-package receiver resolution can match private members while
+// cross-package resolvers filter on Exported.
 type NameIndex struct {
 	ByName    map[string][]SymbolEntry
 	ByQName   map[string][]SymbolEntry
@@ -114,7 +120,9 @@ func (idx *NameIndex) FilesForSymbol(name string) []string {
 			files = append(files, entry.File)
 		}
 	}
-	slices.Sort(files)
+	slices.SortFunc(files, func(a, b string) int {
+		return cmp.Compare(canonicalPathKey(a), canonicalPathKey(b))
+	})
 	return files
 }
 
@@ -227,7 +235,7 @@ func BuildNameIndex(files []*ParsedFile) *NameIndex {
 
 	sortEntries := func(entries []SymbolEntry) {
 		slices.SortFunc(entries, func(a, b SymbolEntry) int {
-			if c := cmp.Compare(a.File, b.File); c != 0 {
+			if c := cmp.Compare(canonicalPathKey(a.File), canonicalPathKey(b.File)); c != 0 {
 				return c
 			}
 			if c := cmp.Compare(a.StartLine, b.StartLine); c != 0 {
@@ -257,11 +265,21 @@ func BuildNameIndex(files []*ParsedFile) *NameIndex {
 		for p := range set {
 			paths = append(paths, p)
 		}
-		slices.Sort(paths)
+		slices.SortFunc(paths, func(a, b string) int {
+			return cmp.Compare(canonicalPathKey(a), canonicalPathKey(b))
+		})
 		idx.ByPackage[pkg] = paths
 	}
 
 	return idx
+}
+
+func canonicalPathKey(p string) string {
+	trimmed := strings.TrimSpace(p)
+	if trimmed == "" {
+		return ""
+	}
+	return path.Clean(strings.ReplaceAll(trimmed, "\\", "/"))
 }
 
 // BatchResult aggregates deterministic parse outputs, per-file errors, language
@@ -372,7 +390,7 @@ func (c *Coordinator) ParseFiles(ctx context.Context, inputs []FileInput) (*Batc
 	ordered := slices.Clone(inputs)
 	if c.cfg.DeterministicSort {
 		slices.SortStableFunc(ordered, func(a, b FileInput) int {
-			return cmp.Compare(filepath.ToSlash(a.Path), filepath.ToSlash(b.Path))
+			return cmp.Compare(canonicalPathKey(a.Path), canonicalPathKey(b.Path))
 		})
 	}
 
