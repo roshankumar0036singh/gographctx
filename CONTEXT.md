@@ -1399,13 +1399,13 @@ d:\gographctx\gographctx\
 #### Phase 19: Inheritance & Link Resolution
 **Goal:** Resolve inheritance chains, interface implementations, and decorator links.
 **Deliverables:**
-- Extend each language resolver to handle:
-  - `INHERITS` edges (class extends, struct embeds)
-  - `IMPLEMENTS` edges (class implements interface, struct satisfies trait)
-  - `DECORATED_BY` edges (decorators/annotations → target)
-- Transitive inheritance resolution (walk the chain)
-- Cross-file inheritance (class A in file X extends class B in file Y)
-- Tests: deep inheritance chains, diamond inheritance, cross-file hierarchies
+- `internal/resolver/resolver.go`: `ResolvedLink` (`Validate()`), `LinkResolver` optional extension interface, `FileResolution.Links` populated in `Registry.ResolveFile`
+- `internal/resolver/lang/common.go`: `ResolveClassOrSymbolUID`, `MakeResolvedLink`, `NormalizeDecoratorTarget`, `ResolveTransitiveChain` (cycle-guarded BFS), and `DedupeResolvedLinks`
+- Extended all 6 language resolvers (`golang.go`, `python.go`, `typescript.go`, `rust.go`, `java.go`) with `ResolveLinks`:
+  - `INHERITS` edges (Go struct embeds, Python/TS/Java `extends`, Rust trait super-bounds)
+  - `IMPLEMENTS` edges (Go interface satisfaction, Python `Protocol`/`ABC`, TS/Java `implements`, Rust `impl Trait for Struct` including cross-file `impl` blocks)
+  - `DECORATED_BY` edges (Python/TS decorators, Java annotations, Rust attributes referencing indexed targets)
+- Tests: `internal/resolver/lang/links_test.go` covering cross-file 3+ level chains, Python diamond inheritance, transitive traversal, interface/trait `IMPLEMENTS`, and `DECORATED_BY`
 **Exit criteria:** Correctly resolve 3+ level inheritance chains across files
 
 ### Pipeline & Integration (Phases 20–24)
