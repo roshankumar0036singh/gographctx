@@ -1387,15 +1387,13 @@ d:\gographctx\gographctx\
 **Goal:** Implement Rust and Java resolution.
 **Deliverables:**
 - `internal/resolver/lang/rust.go`:
-  - Parse `Cargo.toml` for crate name
-  - Resolve `use` paths following Rust module system (crate root, `mod.rs`, inline `mod`)
-  - Trait method resolution via impl blocks
-  - Handle: `pub use` re-exports, associated functions
+  - `ParseCargoTOML` extracting crate name and normalized crate identifier from `Cargo.toml`
+  - `RustResolver` resolving `crate::`, `self::`, `super::`, `mod.rs`, `mod foo;` submodules, and cycle-guarded `pub use` re-exports
+  - Trait method resolution via `impl Trait for Struct` (`rust:impl_trait:`) and default trait methods, inherent `impl` methods, associated functions (`::new`), macro/std external classification, and lifetime/reference wrapper normalization
 - `internal/resolver/lang/java.go`:
-  - Resolve imports to classes via package → directory mapping
-  - Method resolution via class hierarchy
-  - Handle: static imports, inner classes, overloaded methods (match by name)
-- Tests: multi-crate Rust project, multi-package Java project
+  - `JavaResolver` resolving package -> directory imports, static imports (`import static ...`), wildcard `.*` imports, and same-package sibling classes
+  - Class hierarchy traversal (`Bases` & `Implements`), inner class lookup (`Outer.Inner`), constructors (`new` / `::new`), and overloaded method arity matching (emitting `TierTypeNarrowed` `CallStatusAmbiguous` when multiple overloads share arity)
+- Tests: `internal/resolver/lang/rust_test.go` (`TestParseCargoTOML`, `TestRustResolverCrateModulesAndTraits`) & `internal/resolver/lang/java_test.go` (`TestJavaResolverPackagesHierarchyAndOverloads`)
 **Exit criteria:** Correct resolution for standard module patterns in both languages
 
 #### Phase 19: Inheritance & Link Resolution
