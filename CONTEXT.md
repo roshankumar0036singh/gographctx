@@ -1309,14 +1309,14 @@ d:\gographctx\gographctx\
 **Goal:** Orchestrate parallel parsing across all languages with single-pass design.
 **Deliverables:**
 - `internal/parser/coordinator.go`:
-  - Accept file list grouped by language
-  - Parse files in parallel using `errgroup` with configurable concurrency
-  - Single pass: extract both names (for resolution) and full facts
-  - Collect results into `[]ParsedFile` ordered deterministically
-  - Error handling: continue on parse failure, collect errors, report at end
-  - Build `NameIndex` (symbol name → defining files) from parse results — replaces CGC's pre-scan
-- Performance: benchmark parallel vs sequential on test fixtures
-- Tests: concurrent parse of mixed-language project, error handling, deterministic ordering
+  - `Coordinator` (`NewCoordinator`, `ParseFiles`, `ParseGrouped`) accepting grouped or flat `[]FileInput` across all compiled languages
+  - Parse files in parallel using `golang.org/x/sync/errgroup` with configurable `Workers` concurrency (`SetLimit`)
+  - Single pass: extract both names (for resolution) and full structural facts in one AST traversal
+  - Collect results into deterministically ordered `[]*ParsedFile` (`DeterministicSort` or stable input index slots)
+  - Error handling: continue on per-file failure by default (`FailFast: false`), collect `[]FileError`, or abort early when `FailFast: true`
+  - Build single-pass `NameIndex` (`ByName`, `ByQName`, `ByPackage`, `ByFile`, `FilesForSymbol`, `FilesForPackage`) replacing CGC's two-pass pre-scan
+- Performance: `BenchmarkCoordinatorParallelVsSequential` on 100 mixed-language files (`~545 ms` sequential vs `~105 ms` parallel)
+- Tests: `coordinator_test.go` covering 100-file mixed-language deterministic parallel parsing, `NameIndex`, error collection, `FailFast`, and cancellation
 **Exit criteria:** Parse 100 files across 3+ languages in parallel, correctly and deterministically
 
 ### Resolution Engine (Phases 13–19)
