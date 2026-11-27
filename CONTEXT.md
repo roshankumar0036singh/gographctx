@@ -1445,18 +1445,12 @@ d:\gographctx\gographctx\
 #### Phase 23: Incremental Indexing Engine
 **Goal:** Implement change-proportional re-indexing without file watching (the logic, not the trigger).
 **Deliverables:**
-- `internal/watcher/deptracker.go`:
-  - Build reverse dependency index from graph
-  - `Dependents(file) → []string` — files that reference symbols in the given file
-  - Update dep index incrementally as graph changes
+- `internal/pipeline/pipeline.go`: `BuildViewNameIndex` helper exposing graph-plus-overlay `NameIndex` construction
+- `internal/watcher/deptracker.go`: `DepTracker` maintaining reverse file dependency maps (`RefreshFromView`, `UpdateFileOutgoing`, `RemoveFile`, `Dependents`, `CallSiteDependents`)
 - `internal/watcher/incremental.go`:
-  - `UpdateFile(path string, graph *Graph) → (changes ChangeSet, err error)`
-  - Re-parse single file
-  - Diff old vs new: identify added/removed/changed symbols
-  - Determine blast radius using dep tracker
-  - Re-resolve affected edges only
-  - Update graph in-place
-- Tests: change a function body → only local re-resolution; add an export → dependent files re-resolved; delete a function → callers updated
+  - `IncrementalEngine`: `NewIncrementalEngine`, `UpdateFile`, `RemoveFile`, `Close`
+  - Single-file re-parsing, `diffFileSymbols` signature/export/bases diffing (`ChangeSet`), body-only short-circuit (`DependentsUpdated == 0`), blast-radius + negative `CallSite` resolution, atomic `g.ReplaceFile`/`g.RemoveFile`, and WAL append/compaction
+- Tests: `internal/watcher/incremental_test.go` (`TestIncrementalEngineBodyExportAndDeleteUpdates`) covering body edits, new exports resolving unresolved call sites, deleted functions/files, and WAL replay
 **Exit criteria:** Incremental update correctly handles body changes, export changes, and deletions
 
 #### Phase 24: File Watcher
