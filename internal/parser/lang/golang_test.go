@@ -139,7 +139,7 @@ func TestGoParserGoldenFixture(t *testing.T) {
 		t.Fatalf("Repository interface mismatch: %+v", repoIface)
 	}
 	idIface := classByName["Identifier"]
-	if idIface.Kind != graph.KindInterface || len(idIface.Bases) == 0 {
+	if idIface.Kind != graph.KindInterface || len(idIface.Bases) != 0 || !slices.Contains(idIface.Decorators, "go:constraint:~string | ~int64") {
 		t.Fatalf("Identifier constraint interface mismatch: %+v", idIface)
 	}
 
@@ -387,5 +387,59 @@ func ValidAfter() {
 	close(errCh)
 	for err := range errCh {
 		t.Fatal(err)
+	}
+}
+
+func TestGoParserCRLFBlockDocstringsGenericsAndRangeComplexity(t *testing.T) {
+	mgr, err := treesitter.NewManager()
+	if err != nil {
+		t.Fatalf("NewManager failed: %v", err)
+	}
+	defer mgr.Close()
+
+	gp, err := NewGoParser(mgr)
+	if err != nil {
+		t.Fatalf("NewGoParser failed: %v", err)
+	}
+
+	src := "package edge\r\n\r\n" +
+		"/*\r\n * Process handles generic calls.\r\n * Second line.\r\n */\r\n" +
+		"func Process(xs []int) {\r\n" +
+		"\tfor _, x := range xs {\r\n" +
+		"\t\t_ = Decode[int](x)\r\n" +
+		"\t\t_ = pkg.Decode[int](x)\r\n" +
+		"\t\t_ = a.b.Decode[int](x)\r\n" +
+		"\t}\r\n" +
+		"}\r\n"
+
+	pf, err := gp.Parse(context.Background(), "edge/process.go", []byte(src))
+	if err != nil {
+		t.Fatalf("Parse failed: %v", err)
+	}
+	if pf.HasErrors() || len(pf.Functions) != 1 {
+		t.Fatalf("unexpected parse result: errs=%v funcs=%d", pf.ParseErrors, len(pf.Functions))
+	}
+
+	fn := pf.Functions[0]
+	if strings.Contains(fn.Docstring, "\r") {
+		t.Fatalf("Docstring retained carriage return: %q", fn.Docstring)
+	}
+	if fn.Docstring != "Process handles generic calls.\nSecond line." {
+		t.Fatalf("Docstring = %q, want %q", fn.Docstring, "Process handles generic calls.\nSecond line.")
+	}
+	if fn.Complexity != 2 {
+		t.Fatalf("Complexity with single for..range = %d, want 2", fn.Complexity)
+	}
+
+	hasCall := func(receiver, callee string) bool {
+		for _, c := range pf.Calls {
+			if c.ReceiverName == receiver && c.CalleeName == callee {
+				return true
+			}
+		}
+		return false
+	}
+	if !hasCall("", "Decode") || !hasCall("pkg", "Decode") || !hasCall("a.b", "Decode") {
+		t.Fatalf("generic selector calls mismatch: %+v", pf.Calls)
 	}
 }

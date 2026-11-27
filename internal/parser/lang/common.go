@@ -211,6 +211,7 @@ func LeadingDocComment(targetNode *gotreesitter.Node, source []byte, lang *gotre
 }
 
 func cleanCommentText(raw string) string {
+	raw = strings.ReplaceAll(strings.ReplaceAll(raw, "\r\n", "\n"), "\r", "\n")
 	if strings.HasPrefix(raw, "//") {
 		txt := strings.TrimPrefix(raw, "//")
 		return strings.TrimPrefix(txt, " ")

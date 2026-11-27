@@ -467,20 +467,23 @@ func (e *goExtractor) populateInterfaceMembers(cls *parser.ParsedClass, ifaceNod
 		}
 		switch elem.Type(e.lang) {
 		case "type_elem", "constraint_elem":
-			// Interface embeddings and union constraints.
-			for j := 0; j < elem.NamedChildCount(); j++ {
-				child := elem.NamedChild(j)
-				if child == nil {
-					continue
-				}
-				if base := normalizeGoEmbeddedType(child.Text(e.src)); base != "" {
-					cls.Bases = append(cls.Bases, base)
+			// Single non-negated type references represent embedded interfaces;
+			// multi-term unions and approximation constraints (~T) are preserved as
+			// constraints so Bases stays limited to embedded interface types.
+			if elem.NamedChildCount() == 1 {
+				child := elem.NamedChild(0)
+				if child != nil {
+					switch child.Type(e.lang) {
+					case "type_identifier", "qualified_type", "generic_type":
+						if base := normalizeGoEmbeddedType(child.Text(e.src)); base != "" {
+							cls.Bases = append(cls.Bases, base)
+						}
+						continue
+					}
 				}
 			}
-			if elem.NamedChildCount() == 0 {
-				if base := normalizeGoEmbeddedType(elem.Text(e.src)); base != "" {
-					cls.Bases = append(cls.Bases, base)
-				}
+			if constraint := CollapseWhitespace(elem.Text(e.src)); constraint != "" {
+				cls.Decorators = append(cls.Decorators, "go:constraint:"+constraint)
 			}
 
 		case "method_elem":
@@ -825,6 +828,11 @@ func countGoArguments(argsNode *gotreesitter.Node) uint16 {
 	return uint16(n)
 }
 
+// computeGoComplexity computes cyclomatic complexity starting at 1.
+// In gotreesitter's Go grammar, "for ... range" parses as a for_statement
+// wrapping a range_clause, so counting for_statement counts both classic and
+// range loops once. Branches inside nested func_literal closures roll into the
+// enclosing function because Go closures do not emit standalone function nodes.
 func computeGoComplexity(body *gotreesitter.Node, lang *gotreesitter.Language, src []byte) uint16 {
 	if body == nil {
 		return 1
