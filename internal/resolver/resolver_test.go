@@ -131,6 +131,20 @@ func TestResolvedAndUnresolvedCallValidation(t *testing.T) {
 		t.Fatalf("ToCallSite mismatch: cs=%+v err=%v", cs, err)
 	}
 
+	ucUnresolved := UnresolvedCall{
+		CallerUID:  caller,
+		File:       "pkg/caller.go",
+		Line:       51,
+		CalleeExpr: "ext.Ping()",
+		LookupKey:  "ext::Ping",
+		Status:     graph.CallStatusUnresolved,
+		Tier:       TierUnresolved,
+		Reason:     "external symbol not indexed",
+	}
+	if err := ucUnresolved.Validate(); err != nil {
+		t.Fatalf("UnresolvedCall(TierUnresolved).Validate failed: %v", err)
+	}
+
 	ucBad := uc
 	ucBad.Tier = TierLocal
 	if err := ucBad.Validate(); !errors.Is(err, ErrInvalidResolution) {
@@ -174,9 +188,9 @@ func TestRegistryCommonHelpersAndResolutionContext(t *testing.T) {
 	}
 
 	pf := &parser.ParsedFile{Path: "main.go", Language: "go"}
-	res, err := reg.ResolveFile(context.Background(), pf, &ResolutionContext{})
+	res, err := reg.ResolveFile(context.Background(), pf, nil)
 	if err != nil {
-		t.Fatalf("ResolveFile failed: %v", err)
+		t.Fatalf("ResolveFile(nil rc) failed: %v", err)
 	}
 	if len(res.Imports) != 1 || res.Types["c"].Name != "Client" {
 		t.Fatalf("ResolveFile output mismatch: %+v", res)
@@ -199,8 +213,11 @@ func TestRegistryCommonHelpersAndResolutionContext(t *testing.T) {
 	if got := StripTypeDecorations("*pkg.Service[T]"); got != "pkg.Service" {
 		t.Fatalf("StripTypeDecorations(*pkg.Service[T]) = %q", got)
 	}
-	if got := StripTypeDecorations("Order | null"); got != "Order" {
-		t.Fatalf("StripTypeDecorations(Order | null) = %q", got)
+	if got := StripTypeDecorations("(Order | null)"); got != "Order" {
+		t.Fatalf("StripTypeDecorations((Order | null)) = %q", got)
+	}
+	if got := StripTypeDecorations("(*pkg.Service[T])"); got != "pkg.Service" {
+		t.Fatalf("StripTypeDecorations((*pkg.Service[T])) = %q", got)
 	}
 	if got := StripTypeDecorations("&mut Client<'a, T>"); got != "Client" {
 		t.Fatalf("StripTypeDecorations(&mut Client<'a, T>) = %q", got)
@@ -208,8 +225,10 @@ func TestRegistryCommonHelpersAndResolutionContext(t *testing.T) {
 
 	n1 := graph.Node{UID: graph.GenerateNodeUID(graph.KindFunction, "a::F", 0), Kind: graph.KindFunction, Name: "F"}
 	n2 := graph.Node{UID: graph.GenerateNodeUID(graph.KindFunction, "b::F", 0), Kind: graph.KindFunction, Name: "F"}
-	if u, ok, cands := MatchUniqueNode([]graph.Node{n1, n2}, nil); ok || len(cands) != 2 || !u.UID.IsZero() {
-		t.Fatalf("MatchUniqueNode ambiguous mismatch: u=%+v ok=%v cands=%v", u, ok, cands)
+	_, okA, candsA := MatchUniqueNode([]graph.Node{n1, n2}, nil)
+	_, okB, candsB := MatchUniqueNode([]graph.Node{n2, n1, n1}, nil)
+	if okA || okB || len(candsA) != 2 || !slices.Equal(candsA, candsB) {
+		t.Fatalf("MatchUniqueNode deterministic ordering/dedup mismatch: A=%v B=%v", candsA, candsB)
 	}
 	if u, ok, _ := MatchUniqueNode([]graph.Node{n1, n2}, func(n graph.Node) bool { return n.UID == n1.UID }); !ok || u.UID != n1.UID {
 		t.Fatalf("MatchUniqueNode filtered mismatch: u=%+v ok=%v", u, ok)

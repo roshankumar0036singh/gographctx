@@ -1,6 +1,7 @@
 package resolver
 
 import (
+	"slices"
 	"strings"
 
 	"github.com/roshankumar0036singh/gographctx/internal/graph"
@@ -43,6 +44,9 @@ func StripTypeDecorations(typeExpr string) string {
 	if s == "" {
 		return ""
 	}
+	for hasOuterParens(s) {
+		s = strings.TrimSpace(s[1 : len(s)-1])
+	}
 	// Handle nullable TS unions like "Client | null" or "Client | undefined".
 	if idx := strings.IndexByte(s, '|'); idx >= 0 {
 		s = strings.TrimSpace(s[:idx])
@@ -66,8 +70,6 @@ func StripTypeDecorations(typeExpr string) string {
 	}
 
 stripGenerics:
-	// Unwrap Optional[T] / Promise<T> / Arc<T> if needed when caller resolves inner type?
-	// Preserve outer name unless caller inspects generics directly; strip angle/square args.
 	if idx := strings.IndexByte(s, '['); idx >= 0 {
 		s = s[:idx]
 	}
@@ -77,9 +79,28 @@ stripGenerics:
 	return strings.TrimSpace(s)
 }
 
+func hasOuterParens(s string) bool {
+	if len(s) < 2 || s[0] != '(' || s[len(s)-1] != ')' {
+		return false
+	}
+	depth := 0
+	for i := 0; i < len(s); i++ {
+		switch s[i] {
+		case '(':
+			depth++
+		case ')':
+			depth--
+			if depth == 0 && i < len(s)-1 {
+				return false
+			}
+		}
+	}
+	return depth == 0
+}
+
 // MatchUniqueNode filters nodes with filter (if non-nil) and reports whether
 // exactly one candidate remains. If zero or multiple match, it returns the
-// collected candidate UIDs (sorted deterministically? preserves input order, deduped).
+// collected candidate UIDs sorted deterministically and deduplicated.
 func MatchUniqueNode(nodes []graph.Node, filter func(graph.Node) bool) (unique graph.Node, ok bool, candidateUIDs []graph.UID) {
 	var matched []graph.Node
 	for _, n := range nodes {
@@ -105,5 +126,8 @@ func MatchUniqueNode(nodes []graph.Node, filter func(graph.Node) bool) (unique g
 			candidateUIDs = append(candidateUIDs, m.UID)
 		}
 	}
+	slices.SortFunc(candidateUIDs, func(a, b graph.UID) int {
+		return a.Compare(b)
+	})
 	return graph.Node{}, false, candidateUIDs
 }

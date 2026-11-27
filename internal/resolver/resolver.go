@@ -206,6 +206,9 @@ func (r *Registry) ResolveFile(ctx context.Context, file *parser.ParsedFile, rc 
 	if ctx == nil {
 		ctx = context.Background()
 	}
+	if rc == nil {
+		rc = &ResolutionContext{}
+	}
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
