@@ -199,3 +199,60 @@ func TestJavaParserErrorsGuardsAndConcurrency(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+func TestJavaParserMethodRefsStaticWildcardAndCommaGenerics(t *testing.T) {
+	mgr, err := treesitter.NewManager()
+	if err != nil {
+		t.Fatalf("NewManager failed: %v", err)
+	}
+	defer mgr.Close()
+
+	jp, err := NewJavaParser(mgr)
+	if err != nil {
+		t.Fatalf("NewJavaParser failed: %v", err)
+	}
+
+	src := []byte(`package demo;
+
+import static java.lang.Math.*;
+
+public class Handler implements Map<String, Integer>, Serializable {
+    void process(java.util.List<String> xs) {
+        var r1 = System.out::println;
+        var r2 = String::valueOf;
+        var r3 = String::new;
+        xs.forEach(System.out::println);
+    }
+}
+`)
+
+	pf, err := jp.Parse(context.Background(), "demo/Handler.java", src)
+	if err != nil || pf.HasErrors() {
+		t.Fatalf("Parse failed: err=%v errs=%v", err, pf.ParseErrors)
+	}
+
+	if len(pf.Imports) != 1 || pf.Imports[0].Path != "java.lang.Math" || !pf.Imports[0].IsWildcard {
+		t.Fatalf("static wildcard import mismatch: %+v", pf.Imports)
+	}
+	if len(pf.Classes) != 1 || !slices.Equal(pf.Classes[0].Implements, []string{"Map", "Serializable"}) {
+		t.Fatalf("comma-separated generic implements mismatch: %+v", pf.Classes)
+	}
+
+	hasRef := func(receiver, callee string, isCtor, isMethod bool) bool {
+		for _, c := range pf.Calls {
+			if c.CallerQName == "demo::Handler::process" &&
+				c.ReceiverName == receiver &&
+				c.CalleeName == callee &&
+				c.IsConstructor == isCtor &&
+				c.IsMethodCall == isMethod {
+				return true
+			}
+		}
+		return false
+	}
+	if !hasRef("System.out", "println", false, true) ||
+		!hasRef("String", "valueOf", false, true) ||
+		!hasRef("String", "new", true, true) {
+		t.Fatalf("method reference calls mismatch: %+v", pf.Calls)
+	}
+}
