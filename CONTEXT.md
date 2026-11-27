@@ -1376,12 +1376,11 @@ d:\gographctx\gographctx\
 **Goal:** Implement TS/JS module resolution.
 **Deliverables:**
 - `internal/resolver/lang/typescript.go`:
-  - Parse `tsconfig.json` for `paths` and `baseUrl`
-  - Node.js module resolution algorithm (`node_modules`, `package.json` main/exports)
-  - ES module resolution (relative paths, index files)
-  - Method resolution on class instances
-  - Handle: re-exports, barrel files, default exports, namespace imports
-- Tests: TS project with path aliases, barrel files, node_modules references
+  - `ParseTSConfig` parsing JSONC `tsconfig.json` (`baseUrl`, `paths`, relative `extends`) and `ParsePackageJSON` (`main`, `module`, `types`, `exports` conditions)
+  - `TypeScriptResolver` supporting `typescript`, `tsx`, and `javascript` (`NewTypeScriptResolver`, `NewTSXResolver`, `NewJavaScriptResolver`)
+  - ESM/CommonJS resolution: relative paths, `.js` -> `.ts`/`.tsx` extension probing, `node_modules` ancestor walk, barrel `index.*` files, cycle-guarded `export { ... } from` / `export * from` re-exports
+  - Class instance method resolution (`this`, `super`, class `Bases`, field promotion), default/namespace/`require` imports, and JSX component resolution
+- Tests: `internal/resolver/lang/typescript_test.go` (`TestParseTSConfigAndPackageJSON`, `TestTypeScriptAndJSXResolverEndToEnd` covering `@` path aliases, barrels, `node_modules`, CommonJS, inheritance, and JSX)
 **Exit criteria:** Correctly resolve cross-module calls in a TypeScript project
 
 #### Phase 18: Rust & Java Resolvers
