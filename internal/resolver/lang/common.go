@@ -1,6 +1,7 @@
 package lang
 
 import (
+	"cmp"
 	"slices"
 	"strings"
 
@@ -364,4 +365,137 @@ func AddParsedFileToGraph(g *graph.Graph, pf *parser.ParsedFile) error {
 	}
 
 	return g.MergeFragments([]graph.FileFragment{frag})
+}
+
+// ResolveClassOrSymbolUID looks up the UID for qname in rc.View matching allowed kinds,
+// falling back deterministically to GenerateNodeUID when View is unavailable or unindexed.
+func ResolveClassOrSymbolUID(rc *resolver.ResolutionContext, fallbackKind graph.NodeKind, qname string) graph.UID {
+	if rc != nil && rc.View != nil && qname != "" {
+		for _, n := range rc.View.GetByQName(qname) {
+			if n.Kind == fallbackKind || n.Kind == graph.KindClass || n.Kind == graph.KindStruct || n.Kind == graph.KindInterface {
+				return n.UID
+			}
+		}
+		if nodes := rc.View.GetByQName(qname); len(nodes) > 0 {
+			return nodes[0].UID
+		}
+	}
+	return graph.GenerateNodeUID(fallbackKind, qname, 0)
+}
+
+// MakeResolvedLink constructs a ResolvedLink targeting target with kind and tier metadata.
+func MakeResolvedLink(
+	srcUID graph.UID,
+	srcQName string,
+	target graph.Node,
+	kind graph.EdgeKind,
+	tier graph.ResolutionTier,
+	line uint32,
+	method string,
+) resolver.ResolvedLink {
+	return resolver.ResolvedLink{
+		SourceUID:   srcUID,
+		SourceQName: srcQName,
+		TargetUID:   target.UID,
+		TargetQName: target.QName,
+		Kind:        kind,
+		Tier:        tier,
+		Line:        line,
+		Method:      method,
+	}
+}
+
+// NormalizeDecoratorTarget strips leading '@', trailing call argument lists '(...)',
+// and generic parameters '<...>' from decorator/annotation text, returning "" for
+// internal parser tag markers (such as "ts:", "js:", "rust:", "java:", "go:", "metaclass:").
+func NormalizeDecoratorTarget(raw string) string {
+	s := strings.TrimSpace(raw)
+	if s == "" {
+		return ""
+	}
+	for _, prefix := range []string{"ts:", "js:", "rust:", "java:", "go:", "metaclass:"} {
+		if strings.HasPrefix(s, prefix) {
+			return ""
+		}
+	}
+	s = strings.TrimSpace(strings.TrimPrefix(s, "@"))
+	if idx := strings.IndexByte(s, '('); idx > 0 {
+		s = strings.TrimSpace(s[:idx])
+	}
+	if idx := strings.IndexByte(s, '<'); idx > 0 {
+		s = strings.TrimSpace(s[:idx])
+	}
+	return s
+}
+
+// ResolveTransitiveChain walks multi-level inheritance or implementation chains
+// from startQName using nextTargets (with cycle prevention) and returns all
+// reachable ancestor nodes in breadth-first discovery order.
+func ResolveTransitiveChain(rc *resolver.ResolutionContext, startQName string) []graph.Node {
+	if rc == nil || rc.View == nil || startQName == "" {
+		return nil
+	}
+	visited := map[string]struct{}{startQName: {}}
+	queue := []string{startQName}
+	var chain []graph.Node
+
+	for len(queue) > 0 {
+		curQName := queue[0]
+		queue = queue[1:]
+
+		for _, srcNode := range rc.View.GetByQName(curQName) {
+			for _, edge := range rc.View.GetOutgoingEdges(srcNode.UID, graph.EdgeInherits, graph.EdgeImplements) {
+				target, ok := rc.View.GetNode(edge.Target)
+				if !ok || target.QName == "" {
+					continue
+				}
+				if _, seen := visited[target.QName]; seen {
+					continue
+				}
+				visited[target.QName] = struct{}{}
+				chain = append(chain, target)
+				queue = append(queue, target.QName)
+			}
+		}
+	}
+	return chain
+}
+
+// DedupeResolvedLinks deduplicates links by (SourceUID, TargetUID, Kind) and sorts
+// them deterministically by (Line, Kind, SourceQName, TargetQName).
+func DedupeResolvedLinks(links []resolver.ResolvedLink) []resolver.ResolvedLink {
+	if len(links) == 0 {
+		return nil
+	}
+	type key struct {
+		src  graph.UID
+		tgt  graph.UID
+		kind graph.EdgeKind
+	}
+	seen := make(map[key]struct{}, len(links))
+	out := make([]resolver.ResolvedLink, 0, len(links))
+	for _, l := range links {
+		if err := l.Validate(); err != nil {
+			continue
+		}
+		k := key{src: l.SourceUID, tgt: l.TargetUID, kind: l.Kind}
+		if _, dup := seen[k]; dup {
+			continue
+		}
+		seen[k] = struct{}{}
+		out = append(out, l)
+	}
+	slices.SortFunc(out, func(a, b resolver.ResolvedLink) int {
+		if c := cmp.Compare(a.Line, b.Line); c != 0 {
+			return c
+		}
+		if c := cmp.Compare(a.Kind, b.Kind); c != 0 {
+			return c
+		}
+		if c := cmp.Compare(a.SourceQName, b.SourceQName); c != 0 {
+			return c
+		}
+		return cmp.Compare(a.TargetQName, b.TargetQName)
+	})
+	return out
 }

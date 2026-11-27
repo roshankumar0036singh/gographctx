@@ -1244,3 +1244,119 @@ func isUpperStart(s string) bool {
 }
 
 var _ = isUpperStart
+
+// ResolveLinks resolves Python class inheritance (INHERITS), Protocol/ABC
+// interface implementation (IMPLEMENTS), and decorator (DECORATED_BY) edges.
+func (r *PythonResolver) ResolveLinks(ctx context.Context, file *parser.ParsedFile, rc *resolver.ResolutionContext, imports []resolver.ResolvedImport) ([]resolver.ResolvedLink, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if file == nil {
+		return nil, nil
+	}
+	if rc == nil {
+		rc = &resolver.ResolutionContext{}
+	}
+
+	modScope, _, _ := pythonModuleContext(file)
+	bindings := buildPythonBindings(file, imports, rc)
+	localClassesByName := make(map[string]parser.ParsedClass, len(file.Classes))
+	for _, cls := range file.Classes {
+		localClassesByName[cls.Name] = cls
+	}
+
+	var links []resolver.ResolvedLink
+	for _, cls := range file.Classes {
+		srcUID := ResolveClassOrSymbolUID(rc, cls.EffectiveKind(), cls.QName)
+		for _, base := range cls.Bases {
+			basePkg, baseName := resolvePythonBaseRef(rc, modScope, base, localClassesByName, bindings, modScope)
+			if baseName == "" || basePkg == "" {
+				continue
+			}
+			if targetNode, ok := lookupPythonClassNode(rc, basePkg+"::"+baseName); ok {
+				kind := graph.EdgeInherits
+				method := "inherits: " + baseName
+				if isPythonProtocolOrABCClass(rc, targetNode) {
+					kind = graph.EdgeImplements
+					method = "implements: " + baseName
+				}
+				tier := resolver.TierQualifiedImport
+				if basePkg == modScope {
+					tier = resolver.TierLocal
+				}
+				links = append(links, MakeResolvedLink(srcUID, cls.QName, targetNode, kind, tier, cls.StartLine, method))
+			}
+		}
+
+		for _, dec := range cls.Decorators {
+			if targetNode, tier, ok := resolvePythonDecoratorTarget(rc, modScope, bindings, dec); ok {
+				links = append(links, MakeResolvedLink(srcUID, cls.QName, targetNode, graph.EdgeDecoratedBy, tier, cls.StartLine, "decorator: "+dec))
+			}
+		}
+	}
+
+	for _, fn := range file.Functions {
+		if len(fn.Decorators) == 0 {
+			continue
+		}
+		srcUID := ResolveCallerUID(rc, fn.QName, fn.StartLine)
+		for _, dec := range fn.Decorators {
+			if targetNode, tier, ok := resolvePythonDecoratorTarget(rc, modScope, bindings, dec); ok {
+				links = append(links, MakeResolvedLink(srcUID, fn.QName, targetNode, graph.EdgeDecoratedBy, tier, fn.StartLine, "decorator: "+dec))
+			}
+		}
+	}
+
+	return DedupeResolvedLinks(links), nil
+}
+
+func lookupPythonClassNode(rc *resolver.ResolutionContext, qname string) (graph.Node, bool) {
+	if rc == nil || rc.View == nil || qname == "" {
+		return graph.Node{}, false
+	}
+	for _, n := range rc.View.GetByQName(qname) {
+		if n.Kind == graph.KindClass || n.Kind == graph.KindInterface {
+			return n, true
+		}
+	}
+	return graph.Node{}, false
+}
+
+func isPythonProtocolOrABCClass(rc *resolver.ResolutionContext, clsNode graph.Node) bool {
+	if clsNode.Kind == graph.KindInterface {
+		return true
+	}
+	for _, b := range clsNode.Bases {
+		if b == "Protocol" || strings.HasSuffix(b, ".Protocol") || b == "ABC" || strings.HasSuffix(b, ".ABC") {
+			return true
+		}
+	}
+	_ = rc
+	return false
+}
+
+func resolvePythonDecoratorTarget(rc *resolver.ResolutionContext, modScope string, bindings *pyBindings, rawDec string) (graph.Node, graph.ResolutionTier, bool) {
+	targetExpr := NormalizeDecoratorTarget(rawDec)
+	if targetExpr == "" || rc == nil || rc.View == nil {
+		return graph.Node{}, 0, false
+	}
+	if !strings.Contains(targetExpr, ".") {
+		if n, ok := findPythonClassOrCallable(rc, modScope, targetExpr); ok {
+			return n, resolver.TierLocal, true
+		}
+		if targets, _, _ := resolvePythonSymbolCallTargets(rc, bindings, targetExpr); len(targets) == 1 {
+			return targets[0], resolver.TierQualifiedImport, true
+		}
+		return graph.Node{}, 0, false
+	}
+	idx := strings.LastIndexByte(targetExpr, '.')
+	recv := targetExpr[:idx]
+	member := targetExpr[idx+1:]
+	if n, _, isMod, ext := resolvePythonModuleCall(rc, bindings, recv, member); isMod && !ext && !n.UID.IsZero() {
+		return n, resolver.TierQualifiedImport, true
+	}
+	return graph.Node{}, 0, false
+}

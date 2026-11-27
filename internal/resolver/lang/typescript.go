@@ -1563,3 +1563,111 @@ func isJSBuiltinReceiver(recv string) bool {
 		return false
 	}
 }
+
+// ResolveLinks resolves TypeScript/JavaScript inheritance (extends -> INHERITS),
+// interface implementation (implements -> IMPLEMENTS), and decorator (DECORATED_BY) edges.
+func (r *TypeScriptResolver) ResolveLinks(ctx context.Context, file *parser.ParsedFile, rc *resolver.ResolutionContext, imports []resolver.ResolvedImport) ([]resolver.ResolvedLink, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if file == nil {
+		return nil, nil
+	}
+	if rc == nil {
+		rc = &resolver.ResolutionContext{}
+	}
+
+	modScope := tsModuleScope(file)
+	bindings := buildTSBindings(file, imports, rc)
+	localClassesByName := make(map[string]parser.ParsedClass, len(file.Classes))
+	for _, cls := range file.Classes {
+		localClassesByName[cls.Name] = cls
+	}
+
+	var links []resolver.ResolvedLink
+	for _, cls := range file.Classes {
+		srcUID := ResolveClassOrSymbolUID(rc, cls.EffectiveKind(), cls.QName)
+		for _, base := range cls.Bases {
+			basePkg, baseName := resolveTSBaseRef(rc, modScope, base, localClassesByName, bindings, modScope)
+			if basePkg == "" || baseName == "" {
+				continue
+			}
+			if targetNode, ok := lookupTSClassOrInterfaceNode(rc, basePkg+"::"+baseName); ok {
+				tier := resolver.TierQualifiedImport
+				if basePkg == modScope {
+					tier = resolver.TierLocal
+				}
+				links = append(links, MakeResolvedLink(srcUID, cls.QName, targetNode, graph.EdgeInherits, tier, cls.StartLine, "extends: "+base))
+			}
+		}
+		for _, iface := range cls.Implements {
+			if targetNode, hitPkg, ok := resolveTSSymbolType(rc, bindings, modScope, resolver.StripTypeDecorations(iface)); ok {
+				tier := resolver.TierQualifiedImport
+				if hitPkg == modScope {
+					tier = resolver.TierLocal
+				}
+				links = append(links, MakeResolvedLink(srcUID, cls.QName, targetNode, graph.EdgeImplements, tier, cls.StartLine, "implements: "+iface))
+			}
+		}
+		for _, dec := range cls.Decorators {
+			if targetNode, tier, ok := resolveTSDecoratorTarget(rc, modScope, bindings, dec); ok {
+				links = append(links, MakeResolvedLink(srcUID, cls.QName, targetNode, graph.EdgeDecoratedBy, tier, cls.StartLine, "decorator: "+dec))
+			}
+		}
+	}
+
+	for _, fn := range file.Functions {
+		if len(fn.Decorators) == 0 {
+			continue
+		}
+		srcUID := ResolveCallerUID(rc, fn.QName, fn.StartLine)
+		for _, dec := range fn.Decorators {
+			if targetNode, tier, ok := resolveTSDecoratorTarget(rc, modScope, bindings, dec); ok {
+				links = append(links, MakeResolvedLink(srcUID, fn.QName, targetNode, graph.EdgeDecoratedBy, tier, fn.StartLine, "decorator: "+dec))
+			}
+		}
+	}
+
+	return DedupeResolvedLinks(links), nil
+}
+
+func lookupTSClassOrInterfaceNode(rc *resolver.ResolutionContext, qname string) (graph.Node, bool) {
+	if rc == nil || rc.View == nil || qname == "" {
+		return graph.Node{}, false
+	}
+	for _, n := range rc.View.GetByQName(qname) {
+		if n.Kind == graph.KindClass || n.Kind == graph.KindInterface {
+			return n, true
+		}
+	}
+	return graph.Node{}, false
+}
+
+func resolveTSDecoratorTarget(rc *resolver.ResolutionContext, modScope string, bindings *tsBindings, rawDec string) (graph.Node, graph.ResolutionTier, bool) {
+	expr := NormalizeDecoratorTarget(rawDec)
+	if expr == "" || rc == nil || rc.View == nil {
+		return graph.Node{}, 0, false
+	}
+	if !strings.Contains(expr, ".") {
+		if n, _, ok := resolveTSDirectBindingTarget(rc, bindings, modScope, expr); ok {
+			tier := resolver.TierQualifiedImport
+			if PackageScopePrefix(n.QName) == modScope {
+				tier = resolver.TierLocal
+			}
+			return n, tier, true
+		}
+		return graph.Node{}, 0, false
+	}
+	idx := strings.LastIndexByte(expr, '.')
+	ns := expr[:idx]
+	sym := expr[idx+1:]
+	if nb, ok := bindings.Namespaces[ns]; ok && !nb.IsExternal {
+		if n, _, found := resolveTSSymbolOrReexport(rc, nb.TargetPackage, nb.TargetFile, sym, make(map[string]struct{}), 0); found {
+			return n, resolver.TierQualifiedImport, true
+		}
+	}
+	return graph.Node{}, 0, false
+}

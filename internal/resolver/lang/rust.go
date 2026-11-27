@@ -1146,3 +1146,82 @@ func makeRustResolvedCall(callerUID graph.UID, call parser.ParsedCall, target gr
 		LookupKey:   resolver.BuildLookupKey(call.ReceiverName, pkgScope, call.CalleeName),
 	}
 }
+
+// ResolveLinks resolves Rust trait super-bounds (INHERITS), `impl Trait for Struct`
+// relationships (IMPLEMENTS), and attribute/decorator references (DECORATED_BY).
+func (r *RustResolver) ResolveLinks(ctx context.Context, file *parser.ParsedFile, rc *resolver.ResolutionContext, imports []resolver.ResolvedImport) ([]resolver.ResolvedLink, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if file == nil {
+		return nil, nil
+	}
+	if rc == nil {
+		rc = &resolver.ResolutionContext{}
+	}
+
+	modScope := rustModuleScope(file)
+	cargoInfo, _ := ParseCargoTOML(rc.RepoRoot)
+	bindings := buildRustBindings(file, imports, rc, cargoInfo)
+
+	var links []resolver.ResolvedLink
+	for _, cls := range file.Classes {
+		srcUID := ResolveClassOrSymbolUID(rc, cls.EffectiveKind(), cls.QName)
+		for _, base := range cls.Bases {
+			if targetNode, hitPkg, ok := resolveRustSymbolType(rc, bindings, modScope, base, cargoInfo); ok {
+				tier := resolver.TierQualifiedImport
+				if hitPkg == modScope {
+					tier = resolver.TierLocal
+				}
+				links = append(links, MakeResolvedLink(srcUID, cls.QName, targetNode, graph.EdgeInherits, tier, cls.StartLine, "trait bound: "+base))
+			}
+		}
+		for _, trait := range cls.Implements {
+			if targetNode, hitPkg, ok := resolveRustSymbolType(rc, bindings, modScope, trait, cargoInfo); ok {
+				tier := resolver.TierQualifiedImport
+				if hitPkg == modScope {
+					tier = resolver.TierLocal
+				}
+				links = append(links, MakeResolvedLink(srcUID, cls.QName, targetNode, graph.EdgeImplements, tier, cls.StartLine, "impl trait: "+trait))
+			}
+		}
+		for _, dec := range cls.Decorators {
+			if sym := NormalizeDecoratorTarget(dec); sym != "" {
+				if targetNode, hitPkg, ok := resolveRustUnqualifiedSymbol(rc, file, bindings, modScope, sym); ok {
+					tier := resolver.TierQualifiedImport
+					if hitPkg == modScope {
+						tier = resolver.TierLocal
+					}
+					links = append(links, MakeResolvedLink(srcUID, cls.QName, targetNode, graph.EdgeDecoratedBy, tier, cls.StartLine, "attribute: "+dec))
+				}
+			}
+		}
+	}
+
+	// Capture `impl Trait for RemoteStruct` defined in a file separate from RemoteStruct's definition.
+	for _, fn := range file.Functions {
+		if fn.ReceiverType == "" {
+			continue
+		}
+		for _, dec := range fn.Decorators {
+			if !strings.HasPrefix(dec, "rust:impl_trait:") {
+				continue
+			}
+			traitName := strings.TrimPrefix(dec, "rust:impl_trait:")
+			if structNode, _, okStruct := resolveRustSymbolType(rc, bindings, modScope, fn.ReceiverType, cargoInfo); okStruct {
+				if traitNode, hitPkg, okTrait := resolveRustSymbolType(rc, bindings, modScope, traitName, cargoInfo); okTrait {
+					tier := resolver.TierQualifiedImport
+					if hitPkg == modScope {
+						tier = resolver.TierLocal
+					}
+					links = append(links, MakeResolvedLink(structNode.UID, structNode.QName, traitNode, graph.EdgeImplements, tier, fn.StartLine, "impl "+traitName+" for "+structNode.Name))
+				}
+			}
+		}
+	}
+
+	return DedupeResolvedLinks(links), nil
+}

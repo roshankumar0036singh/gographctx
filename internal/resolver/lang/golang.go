@@ -947,3 +947,86 @@ func isGoIdentStart(b byte) bool {
 func isGoIdentChar(b byte) bool {
 	return isGoIdentStart(b) || (b >= '0' && b <= '9')
 }
+
+// ResolveLinks resolves Go embedded struct/interface INHERITS edges and
+// structural interface satisfaction IMPLEMENTS edges.
+func (r *GoResolver) ResolveLinks(ctx context.Context, file *parser.ParsedFile, rc *resolver.ResolutionContext, imports []resolver.ResolvedImport) ([]resolver.ResolvedLink, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if file == nil {
+		return nil, nil
+	}
+	if rc == nil {
+		rc = &resolver.ResolutionContext{}
+	}
+
+	impByAlias := indexGoImportsByAlias(imports)
+	fileScope := file.Package
+	if len(file.Classes) > 0 {
+		if p := PackageScopePrefix(file.Classes[0].QName); p != "" {
+			fileScope = p
+		}
+	} else if len(file.Functions) > 0 {
+		if p := PackageScopePrefix(file.Functions[0].QName); p != "" {
+			fileScope = p
+		}
+	}
+
+	localClassByQName := make(map[string]parser.ParsedClass, len(file.Classes))
+	for _, cls := range file.Classes {
+		localClassByQName[cls.QName] = cls
+	}
+
+	var links []resolver.ResolvedLink
+	for _, cls := range file.Classes {
+		srcUID := ResolveClassOrSymbolUID(rc, cls.EffectiveKind(), cls.QName)
+		for _, base := range cls.Bases {
+			targetPkg := fileScope
+			baseType := resolver.StripTypeDecorations(base)
+			tier := resolver.TierSamePackage
+			if idx := strings.LastIndexByte(baseType, '.'); idx >= 0 {
+				alias := baseType[:idx]
+				baseType = baseType[idx+1:]
+				if imp, ok := impByAlias[alias]; ok && !imp.IsExternal && imp.TargetPackage != "" {
+					targetPkg = imp.TargetPackage
+					tier = resolver.TierQualifiedImport
+				}
+			}
+			targetQName := targetPkg + "::" + baseType
+			if _, isLocal := localClassByQName[targetQName]; isLocal {
+				tier = resolver.TierLocal
+			}
+			if targetNode, ok := lookupGoClassNode(rc, targetQName); ok {
+				links = append(links, MakeResolvedLink(srcUID, cls.QName, targetNode, graph.EdgeInherits, tier, cls.StartLine, "embedded: "+base))
+			}
+		}
+	}
+
+	if rc.View != nil && len(localClassByQName) > 0 {
+		for _, sat := range DetectInterfaceSatisfaction(rc.View) {
+			if cls, ok := localClassByQName[sat.StructQName]; ok {
+				if ifaceNode, okIface := lookupGoClassNode(rc, sat.InterfaceQName); okIface {
+					links = append(links, MakeResolvedLink(sat.StructUID, sat.StructQName, ifaceNode, graph.EdgeImplements, resolver.TierStructural, cls.StartLine, "structural interface satisfaction"))
+				}
+			}
+		}
+	}
+
+	return DedupeResolvedLinks(links), nil
+}
+
+func lookupGoClassNode(rc *resolver.ResolutionContext, qname string) (graph.Node, bool) {
+	if rc == nil || rc.View == nil || qname == "" {
+		return graph.Node{}, false
+	}
+	for _, n := range rc.View.GetByQName(qname) {
+		if n.Kind == graph.KindStruct || n.Kind == graph.KindInterface || n.Kind == graph.KindClass {
+			return n, true
+		}
+	}
+	return graph.Node{}, false
+}
