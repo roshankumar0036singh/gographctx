@@ -1243,14 +1243,15 @@ d:\gographctx\gographctx\
 #### Phase 7: Go Parser
 **Goal:** Implement full Go language parser.
 **Deliverables:**
+- `internal/parser/lang/common.go` — shared SHA-256 content hashing, 1-based line counting, `QName` scoping (`DeriveModuleScope`, `JoinQName`), syntax error collection, and leading doc-comment extraction
 - `internal/parser/lang/golang.go`:
-  - Extract: functions (name, params, returns, receiver, docs), methods, structs, interfaces, type aliases
-  - Extract: imports (path, alias), package declaration
-  - Extract: call sites (function calls, method calls with receiver expression)
-  - Extract: variables (package-level, with type info from declaration)
-  - Handle: init functions, embedded structs, interface embedding
-  - Handle: test files (recognize `Test*`, `Benchmark*` patterns)
-- Tests: golden tests with Go fixture files covering all extraction patterns
+  - Extract: functions (name, params, variadic params, returns, docs, cyclomatic complexity), methods (value/pointer/generic receivers), structs, interfaces, type aliases, and defined types
+  - Extract: imports (path, alias, `.` wildcard, `_` blank, relative), package declaration
+  - Extract: call sites (function calls, selector/method/chained calls, single-arg and multi-arg generic calls, `go`/`defer`/closures, package-level initializer calls)
+  - Extract: variables (package-level `var` and `const`, multi-identifier specs, with type info from declaration)
+  - Handle: multiple `init()` functions (`go:init`), embedded structs, interface embedding (`Bases`) and interface methods (`go:interface_method`)
+  - Handle: test files (`_test.go` recognizing `Test*`, `Benchmark*`, `Fuzz*`, `Example*` patterns)
+- Tests: golden tests with 500+ line Go fixture + `_test.go` fixture (`internal/parser/lang/testdata/`) covering all extraction patterns, error recovery, `Registry` integration, and concurrent parsing
 **Exit criteria:** Correctly extracts all symbols, imports, and calls from a 500+ line Go file
 
 #### Phase 8: Python Parser
