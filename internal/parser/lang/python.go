@@ -555,12 +555,70 @@ func (e *pythonExtractor) walkFunctionBody(node *gotreesitter.Node, funcQName st
 			e.extractFunction(child, nil, funcQName, nil, true)
 		case "class_definition":
 			e.extractClass(child, nil, funcQName, funcQName)
+		case "assignment":
+			e.recordPythonLocalAssignment(child, funcQName)
+			e.walkFunctionBody(child, funcQName)
 		case "call":
 			e.recordPythonCall(child, funcQName)
 			e.walkFunctionBody(child, funcQName)
 		default:
 			e.walkFunctionBody(child, funcQName)
 		}
+	}
+}
+
+func (e *pythonExtractor) recordPythonLocalAssignment(stmt *gotreesitter.Node, scopeQName string) {
+	leftNode := stmt.ChildByFieldName("left", e.lang)
+	if leftNode == nil {
+		return
+	}
+	var targetName string
+	switch leftNode.Type(e.lang) {
+	case "identifier", "attribute":
+		targetName = CollapseWhitespace(leftNode.Text(e.src))
+	default:
+		return
+	}
+	if targetName == "" || targetName == "_" {
+		return
+	}
+
+	lv := parser.ParsedLocalVar{
+		ScopeQName: scopeQName,
+		Name:       targetName,
+		Line:       NodeStartLine(stmt),
+	}
+	if typeNode := stmt.ChildByFieldName("type", e.lang); typeNode != nil {
+		lv.ExplicitType = CollapseWhitespace(typeNode.Text(e.src))
+	}
+	if rightNode := stmt.ChildByFieldName("right", e.lang); rightNode != nil {
+		switch rightNode.Type(e.lang) {
+		case "call":
+			if fn := rightNode.ChildByFieldName("function", e.lang); fn != nil {
+				switch fn.Type(e.lang) {
+				case "identifier":
+					lv.InitCallee = strings.TrimSpace(fn.Text(e.src))
+					if lv.InitCallee != "" && unicode.IsUpper(rune(lv.InitCallee[0])) {
+						lv.IsConstructor = true
+					}
+				case "attribute":
+					if obj := fn.ChildByFieldName("object", e.lang); obj != nil {
+						lv.InitReceiver = CollapseWhitespace(obj.Text(e.src))
+					}
+					if attr := fn.ChildByFieldName("attribute", e.lang); attr != nil {
+						lv.InitCallee = strings.TrimSpace(attr.Text(e.src))
+					}
+					if lv.InitCallee != "" && unicode.IsUpper(rune(lv.InitCallee[0])) {
+						lv.IsConstructor = true
+					}
+				}
+			}
+		case "identifier", "attribute":
+			lv.InitAlias = CollapseWhitespace(rightNode.Text(e.src))
+		}
+	}
+	if lv.ExplicitType != "" || lv.InitCallee != "" || lv.InitAlias != "" {
+		e.out.LocalVars = append(e.out.LocalVars, lv)
 	}
 }
 

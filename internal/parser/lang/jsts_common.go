@@ -1231,6 +1231,14 @@ func (e *jstsExtractor) collectCalls(node *gotreesitter.Node, callerQName string
 		return
 	}
 	switch node.Type(e.lang) {
+	case "lexical_declaration", "variable_declaration":
+		if callerQName != e.moduleCaller {
+			e.recordJSTSLocalVarDecl(node, callerQName)
+		}
+	case "assignment_expression":
+		if callerQName != e.moduleCaller {
+			e.recordJSTSLocalAssign(node, callerQName)
+		}
 	case "call_expression":
 		e.recordJSCall(node, callerQName)
 	case "new_expression":
@@ -1243,6 +1251,106 @@ func (e *jstsExtractor) collectCalls(node *gotreesitter.Node, callerQName string
 	count := node.NamedChildCount()
 	for i := 0; i < count; i++ {
 		e.collectCalls(node.NamedChild(i), callerQName)
+	}
+}
+
+func (e *jstsExtractor) recordJSTSLocalVarDecl(decl *gotreesitter.Node, scopeQName string) {
+	for i := 0; i < decl.NamedChildCount(); i++ {
+		vd := decl.NamedChild(i)
+		if vd == nil || vd.Type(e.lang) != "variable_declarator" {
+			continue
+		}
+		nameNode := vd.ChildByFieldName("name", e.lang)
+		if nameNode == nil || nameNode.Type(e.lang) != "identifier" {
+			continue
+		}
+		name := strings.TrimSpace(nameNode.Text(e.src))
+		if name == "" {
+			continue
+		}
+		lv := parser.ParsedLocalVar{
+			ScopeQName: scopeQName,
+			Name:       name,
+			Line:       NodeStartLine(vd),
+		}
+		if tNode := vd.ChildByFieldName("type", e.lang); tNode != nil {
+			lv.ExplicitType = cleanTSTypeAnnotation(tNode.Text(e.src))
+		}
+		if val := vd.ChildByFieldName("value", e.lang); val != nil {
+			e.populateJSTSRHS(&lv, val)
+		}
+		if lv.ExplicitType != "" || lv.InitCallee != "" || lv.InitAlias != "" {
+			e.out.LocalVars = append(e.out.LocalVars, lv)
+		}
+	}
+}
+
+func (e *jstsExtractor) recordJSTSLocalAssign(expr *gotreesitter.Node, scopeQName string) {
+	left := expr.ChildByFieldName("left", e.lang)
+	right := expr.ChildByFieldName("right", e.lang)
+	if left == nil || right == nil {
+		return
+	}
+	var name string
+	switch left.Type(e.lang) {
+	case "identifier", "member_expression":
+		name = CollapseWhitespace(left.Text(e.src))
+	default:
+		return
+	}
+	if name == "" {
+		return
+	}
+	lv := parser.ParsedLocalVar{
+		ScopeQName: scopeQName,
+		Name:       name,
+		Line:       NodeStartLine(expr),
+	}
+	e.populateJSTSRHS(&lv, right)
+	if lv.ExplicitType != "" || lv.InitCallee != "" || lv.InitAlias != "" {
+		e.out.LocalVars = append(e.out.LocalVars, lv)
+	}
+}
+
+func (e *jstsExtractor) populateJSTSRHS(lv *parser.ParsedLocalVar, rhs *gotreesitter.Node) {
+	for rhs != nil && (rhs.Type(e.lang) == "await_expression" || rhs.Type(e.lang) == "parenthesized_expression") {
+		rhs = rhs.NamedChild(0)
+	}
+	if rhs == nil {
+		return
+	}
+	switch rhs.Type(e.lang) {
+	case "new_expression":
+		if ctor := rhs.ChildByFieldName("constructor", e.lang); ctor != nil {
+			lv.IsConstructor = true
+			switch ctor.Type(e.lang) {
+			case "identifier":
+				lv.InitCallee = strings.TrimSpace(ctor.Text(e.src))
+			case "member_expression":
+				if obj := ctor.ChildByFieldName("object", e.lang); obj != nil {
+					lv.InitReceiver = CollapseWhitespace(obj.Text(e.src))
+				}
+				if prop := ctor.ChildByFieldName("property", e.lang); prop != nil {
+					lv.InitCallee = strings.TrimSpace(prop.Text(e.src))
+				}
+			}
+		}
+	case "call_expression":
+		if fn := rhs.ChildByFieldName("function", e.lang); fn != nil {
+			switch fn.Type(e.lang) {
+			case "identifier":
+				lv.InitCallee = strings.TrimSpace(fn.Text(e.src))
+			case "member_expression":
+				if obj := fn.ChildByFieldName("object", e.lang); obj != nil {
+					lv.InitReceiver = CollapseWhitespace(obj.Text(e.src))
+				}
+				if prop := fn.ChildByFieldName("property", e.lang); prop != nil {
+					lv.InitCallee = strings.TrimSpace(prop.Text(e.src))
+				}
+			}
+		}
+	case "identifier", "member_expression":
+		lv.InitAlias = CollapseWhitespace(rhs.Text(e.src))
 	}
 }
 

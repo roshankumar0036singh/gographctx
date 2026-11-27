@@ -723,6 +723,8 @@ func (e *rustExtractor) collectCalls(node *gotreesitter.Node, callerQName string
 		return
 	}
 	switch node.Type(e.lang) {
+	case "let_declaration":
+		e.recordRustLocalVar(node, callerQName)
 	case "call_expression":
 		e.recordRustCall(node, callerQName)
 	case "macro_invocation":
@@ -731,6 +733,74 @@ func (e *rustExtractor) collectCalls(node *gotreesitter.Node, callerQName string
 	count := node.NamedChildCount()
 	for i := 0; i < count; i++ {
 		e.collectCalls(node.NamedChild(i), callerQName)
+	}
+}
+
+func (e *rustExtractor) recordRustLocalVar(decl *gotreesitter.Node, scopeQName string) {
+	patNode := decl.ChildByFieldName("pattern", e.lang)
+	if patNode == nil || patNode.Type(e.lang) != "identifier" {
+		return
+	}
+	name := strings.TrimSpace(patNode.Text(e.src))
+	if name == "" || name == "_" {
+		return
+	}
+	lv := parser.ParsedLocalVar{
+		ScopeQName: scopeQName,
+		Name:       name,
+		Line:       NodeStartLine(decl),
+	}
+	if tNode := decl.ChildByFieldName("type", e.lang); tNode != nil {
+		lv.ExplicitType = CollapseWhitespace(tNode.Text(e.src))
+	}
+	if val := decl.ChildByFieldName("value", e.lang); val != nil {
+		cur := val
+		for cur != nil && (cur.Type(e.lang) == "try_expression" || cur.Type(e.lang) == "await_expression") {
+			cur = cur.NamedChild(0)
+		}
+		if cur != nil {
+			switch cur.Type(e.lang) {
+			case "struct_expression":
+				if t := cur.ChildByFieldName("name", e.lang); t != nil {
+					lv.ExplicitType = stripRustGenericsAndLifetimes(t.Text(e.src))
+					lv.IsConstructor = true
+				}
+			case "call_expression":
+				if fn := cur.ChildByFieldName("function", e.lang); fn != nil {
+					if fn.Type(e.lang) == "generic_function" {
+						if inner := fn.ChildByFieldName("function", e.lang); inner != nil {
+							fn = inner
+						}
+					}
+					switch fn.Type(e.lang) {
+					case "identifier":
+						lv.InitCallee = strings.TrimSpace(fn.Text(e.src))
+					case "field_expression":
+						if obj := fn.ChildByFieldName("value", e.lang); obj != nil {
+							lv.InitReceiver = CollapseWhitespace(obj.Text(e.src))
+						}
+						if field := fn.ChildByFieldName("field", e.lang); field != nil {
+							lv.InitCallee = strings.TrimSpace(field.Text(e.src))
+						}
+					case "scoped_identifier":
+						if pathNode := fn.ChildByFieldName("path", e.lang); pathNode != nil {
+							lv.InitReceiver = stripRustGenericsAndLifetimes(pathNode.Text(e.src))
+						}
+						if nameNode := fn.ChildByFieldName("name", e.lang); nameNode != nil {
+							lv.InitCallee = strings.TrimSpace(nameNode.Text(e.src))
+							if lv.InitCallee == "new" {
+								lv.IsConstructor = true
+							}
+						}
+					}
+				}
+			case "identifier", "field_expression":
+				lv.InitAlias = CollapseWhitespace(cur.Text(e.src))
+			}
+		}
+	}
+	if lv.ExplicitType != "" || lv.InitCallee != "" || lv.InitAlias != "" {
+		e.out.LocalVars = append(e.out.LocalVars, lv)
 	}
 }
 

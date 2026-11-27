@@ -1337,14 +1337,15 @@ d:\gographctx\gographctx\
 #### Phase 14: Type Inference Engine
 **Goal:** Implement pragmatic type inference for receiver resolution.
 **Deliverables:**
+- `internal/parser/result.go` & `internal/parser/lang/*.go`: single-pass `ParsedLocalVar` (`ParsedFile.LocalVars`) extraction across Go, Python, TS/JS, Rust, and Java without re-parsing
 - `internal/resolver/types.go`:
-  - `InferTypes(file *ParsedFile) → TypeMap`
-  - Assignment tracking: `x = SomeClass()` → x is SomeClass
-  - Parameter type tracking: `def foo(x: SomeClass)` → x is SomeClass
-  - Return type tracking: `x = getClient()` where getClient returns Client → x is Client
-  - Constructor pattern tracking: `x := NewClient()` → x is Client (Go), `x = Client()` → x is Client (Python)
-  - Scope-aware: variable types are valid within their scope
-- Tests: type inference on code samples with known expected types, scope boundary tests
+  - `InferTypes(ctx, file, rc) -> (*TypeMap, error)` & `LookupFlat` / `TypeMap.ToFlatMap`
+  - Assignment tracking: `x = SomeClass()`, `x = y`, `&Service{}`, `Client {}`, `new Foo<>()`
+  - Parameter & receiver type tracking: `def foo(x: SomeClass)`, Go `(s *Service)`, `self` / `this` / `cls`
+  - Return type tracking: `x = getClient()`, Go multi-return `(val, err := fn())` via `ResultIndex`
+  - Constructor pattern tracking: `x := NewClient()` (Go), `x = Client()` (Python), `new Client()` (TS/JS/Java), `Client::new()` (Rust)
+  - Scope-aware `TypeMap`: `Lookup` / `LookupReceiver` (dotted fields `s.cache`, `this.cfg`, `self.cache`) respecting lexical/class scopes without cross-function leaks
+- Tests: `internal/resolver/types_test.go` covering all 5 language families, scope isolation, cross-file return lookup, and context cancellation
 **Exit criteria:** Correctly infer receiver types for ≥80% of common patterns in test fixtures
 
 #### Phase 15: Go Resolver
