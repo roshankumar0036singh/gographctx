@@ -974,15 +974,11 @@ func resolveRustPathCandidates(curMod, rawPath string, cargoInfo CargoInfo) []st
 			rest = strings.TrimPrefix(rest, "super")
 			rest = strings.TrimPrefix(rest, "::")
 		}
-		if climbs <= len(segs) {
+		if climbs < len(segs) {
 			parent := strings.Join(segs[:len(segs)-climbs], "::")
 			if rest != "" {
-				if parent != "" {
-					add(parent + "::" + rest)
-				} else {
-					add(rest)
-				}
-			} else if parent != "" {
+				add(parent + "::" + rest)
+			} else {
 				add(parent)
 			}
 		}
@@ -1079,35 +1075,61 @@ func hasRustModuleAlias(b *rustBindings, recv string) bool {
 
 func stripRustWrapperType(raw string) string {
 	s := strings.TrimSpace(raw)
-	// Strip references & lifetimes: `&'a mut Foo` / `&mut Foo` / `&Foo`
-	for strings.HasPrefix(s, "&") {
-		s = strings.TrimSpace(s[1:])
-		if strings.HasPrefix(s, "'") {
-			if sp := strings.IndexByte(s, ' '); sp > 0 {
-				s = strings.TrimSpace(s[sp+1:])
+	for {
+		prev := s
+		// Strip references & lifetimes: `&'a mut Foo` / `&mut Foo` / `&Foo`
+		for strings.HasPrefix(s, "&") {
+			s = strings.TrimSpace(s[1:])
+			if strings.HasPrefix(s, "'") {
+				if sp := strings.IndexByte(s, ' '); sp > 0 {
+					s = strings.TrimSpace(s[sp+1:])
+				}
+			}
+			if strings.HasPrefix(s, "mut ") {
+				s = strings.TrimSpace(strings.TrimPrefix(s, "mut "))
 			}
 		}
-		if strings.HasPrefix(s, "mut ") {
-			s = strings.TrimSpace(strings.TrimPrefix(s, "mut "))
-		}
-	}
-	// Unwrap single smart-pointer / Result / Option wrappers (`Box<T>`, `Arc<T>`, `Result<T, E>`, `Option<T>`).
-	for _, wrap := range []string{"Box<", "Arc<", "Rc<", "RefCell<", "Mutex<", "Option<", "Result<"} {
-		if strings.HasPrefix(s, wrap) && strings.HasSuffix(s, ">") {
-			inner := s[len(wrap) : len(s)-1]
-			if comma := strings.IndexByte(inner, ','); comma > 0 && wrap == "Result<" {
-				inner = inner[:comma]
+		// Unwrap smart-pointer / Result / Option wrappers (`Box<T>`, `Arc<T>`, `Result<T, E>`, `Option<T>`).
+		for _, wrap := range []string{"Box<", "Arc<", "Rc<", "RefCell<", "Mutex<", "Option<", "Result<"} {
+			if strings.HasPrefix(s, wrap) && strings.HasSuffix(s, ">") {
+				inner := s[len(wrap) : len(s)-1]
+				if wrap == "Result<" {
+					if comma := topLevelCommaIndex(inner); comma > 0 {
+						inner = inner[:comma]
+					}
+				}
+				s = strings.TrimSpace(inner)
 			}
-			s = strings.TrimSpace(inner)
 		}
-	}
-	if strings.HasPrefix(s, "dyn ") {
 		s = strings.TrimSpace(strings.TrimPrefix(s, "dyn "))
+		s = strings.TrimSpace(strings.TrimPrefix(s, "impl "))
+		if s == prev {
+			break
+		}
 	}
 	if idx := strings.IndexByte(s, '<'); idx > 0 {
 		s = s[:idx]
 	}
 	return strings.TrimSpace(s)
+}
+
+func topLevelCommaIndex(s string) int {
+	depth := 0
+	for i := 0; i < len(s); i++ {
+		switch s[i] {
+		case '<', '(', '[', '{':
+			depth++
+		case '>', ')', ']', '}':
+			if depth > 0 {
+				depth--
+			}
+		case ',':
+			if depth == 0 {
+				return i
+			}
+		}
+	}
+	return -1
 }
 
 func makeRustResolvedCall(callerUID graph.UID, call parser.ParsedCall, target graph.Node, tier graph.ResolutionTier, methodDesc, pkgScope string) *resolver.ResolvedCall {

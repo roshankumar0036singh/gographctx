@@ -117,10 +117,16 @@ impl OrderService {
     }
 }
 
+pub fn build_repo() -> Result<Box<MemoryRepo>, &'static str> {
+    Ok(Box::new(MemoryRepo::new()))
+}
+
 pub fn run_once() {
     let repo = MemoryRepo::new();
     let svc = OrderService::new(repo);
     svc.process("ord-1");
+    let boxed = build_repo();
+    boxed.save("ord-2");
 }
 `),
 		},
@@ -193,6 +199,7 @@ pub fn run_once() {
 		{"src::store::repo::MemoryRepo::new", resolver.TierQualifiedImport, "re-exported MemoryRepo::new()"},
 		{"src::service::OrderService::new", resolver.TierLocal, "OrderService::new()"},
 		{"src::service::OrderService::process", resolver.TierReceiverType, "svc.process()"},
+		{"src::service::build_repo", resolver.TierLocal, "local build_repo()"},
 	}
 	for _, chk := range checks {
 		if !hasResolved(serviceRes, chk.target, chk.tier) {

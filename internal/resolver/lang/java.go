@@ -187,8 +187,7 @@ func (r *JavaResolver) InferTypes(ctx context.Context, file *parser.ParsedFile, 
 		} else if lv.InitReceiver != "" {
 			if ownerCls, ownerPkg, okCls := resolveJavaClassNode(rc, bindings, pkgScope, lv.InitReceiver, localClassByName); okCls {
 				if meths := findJavaMethodsInHierarchy(rc, ownerPkg, graphNodeToParsedClass(ownerCls), lv.InitCallee, bindings, localClassByName); len(meths) > 0 {
-					ret := resolver.StripTypeDecorations(meths[0].ReturnType)
-					if ret != "" {
+					if ret := pickJavaFactoryReturnType(meths); ret != "" {
 						typeNode, targetPkg, found = resolveJavaClassNode(rc, bindings, ownerPkg, ret, localClassByName)
 					}
 				}
@@ -865,6 +864,22 @@ func findJavaTypeFile(rc *resolver.ResolutionContext, pkg, simpleName string) (s
 		}
 	}
 	return "", false
+}
+
+func pickJavaFactoryReturnType(meths []graph.Node) string {
+	var agreed string
+	for _, m := range meths {
+		ret := resolver.StripTypeDecorations(m.ReturnType)
+		if ret == "" || ret == "void" {
+			continue
+		}
+		if agreed == "" {
+			agreed = ret
+		} else if agreed != ret {
+			return "" // Conflicting non-void overload return types
+		}
+	}
+	return agreed
 }
 
 func javaPackageFiles(rc *resolver.ResolutionContext, pkg string) []string {
