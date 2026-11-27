@@ -606,6 +606,12 @@ func resolveFilesParallel(
 	return out, errs, nil
 }
 
+// BuildViewNameIndex constructs a fresh NameIndex from all indexed nodes in view
+// overlaid with freshly parsed files in overlay so incremental resolvers see current symbols.
+func BuildViewNameIndex(view *graph.ReadView, overlay []*parser.ParsedFile) *parser.NameIndex {
+	return parser.BuildNameIndex(synthesizeIndexInputsFromView(view, overlay))
+}
+
 func synthesizeIndexInputsFromView(v *graph.ReadView, reParsed []*parser.ParsedFile) []*parser.ParsedFile {
 	byPath := make(map[string]*parser.ParsedFile)
 	for _, pf := range reParsed {
