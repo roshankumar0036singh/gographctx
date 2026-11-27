@@ -139,16 +139,24 @@ func (e *jstsExtractor) walkStatements(container *gotreesitter.Node, scopeQName,
 			e.extractClass(node, scopeQName, callerQName, false, LeadingDocComment(node, e.src, e.lang), decs)
 		case "interface_declaration":
 			pendingDecs = nil
-			e.extractInterface(node, scopeQName, false, LeadingDocComment(node, e.src, e.lang))
+			if e.cfg.supportsTypes {
+				e.extractInterface(node, scopeQName, false, LeadingDocComment(node, e.src, e.lang))
+			}
 		case "type_alias_declaration":
 			pendingDecs = nil
-			e.extractTypeAlias(node, scopeQName, false, LeadingDocComment(node, e.src, e.lang))
+			if e.cfg.supportsTypes {
+				e.extractTypeAlias(node, scopeQName, false, LeadingDocComment(node, e.src, e.lang))
+			}
 		case "enum_declaration":
 			pendingDecs = nil
-			e.extractEnum(node, scopeQName, false, LeadingDocComment(node, e.src, e.lang))
+			if e.cfg.supportsTypes {
+				e.extractEnum(node, scopeQName, false, LeadingDocComment(node, e.src, e.lang))
+			}
 		case "internal_module", "module":
 			pendingDecs = nil
-			e.extractNamespace(node, scopeQName, callerQName)
+			if e.cfg.supportsTypes {
+				e.extractNamespace(node, scopeQName, callerQName)
+			}
 		case "lexical_declaration", "variable_declaration":
 			pendingDecs = nil
 			e.extractVariableDecl(node, scopeQName, callerQName, false, LeadingDocComment(node, e.src, e.lang))
@@ -392,13 +400,21 @@ func (e *jstsExtractor) extractExportStatement(stmt *gotreesitter.Node, scopeQNa
 		nestedDecs := append(append([]string(nil), decs...), e.extractLeadingDecorators(decl, callerQName)...)
 		e.extractClass(decl, scopeQName, callerQName, true, doc, nestedDecs)
 	case "interface_declaration":
-		e.extractInterface(decl, scopeQName, true, doc)
+		if e.cfg.supportsTypes {
+			e.extractInterface(decl, scopeQName, true, doc)
+		}
 	case "type_alias_declaration":
-		e.extractTypeAlias(decl, scopeQName, true, doc)
+		if e.cfg.supportsTypes {
+			e.extractTypeAlias(decl, scopeQName, true, doc)
+		}
 	case "enum_declaration":
-		e.extractEnum(decl, scopeQName, true, doc)
+		if e.cfg.supportsTypes {
+			e.extractEnum(decl, scopeQName, true, doc)
+		}
 	case "internal_module", "module":
-		e.extractNamespace(decl, scopeQName, callerQName)
+		if e.cfg.supportsTypes {
+			e.extractNamespace(decl, scopeQName, callerQName)
+		}
 	case "lexical_declaration", "variable_declaration":
 		e.extractVariableDecl(decl, scopeQName, callerQName, true, doc)
 	case "identifier":
@@ -976,10 +992,33 @@ func (e *jstsExtractor) extractExpressionStatement(stmt *gotreesitter.Node, scop
 				case "object":
 					for i := 0; i < right.NamedChildCount(); i++ {
 						prop := right.NamedChild(i)
-						if prop != nil && prop.Type(e.lang) == "shorthand_property_identifier" {
+						if prop == nil {
+							continue
+						}
+						switch prop.Type(e.lang) {
+						case "shorthand_property_identifier":
 							e.exportedNames[strings.TrimSpace(prop.Text(e.src))] = struct{}{}
+						case "pair":
+							keyNode := prop.ChildByFieldName("key", e.lang)
+							valNode := prop.ChildByFieldName("value", e.lang)
+							if valNode == nil {
+								continue
+							}
+							switch valNode.Type(e.lang) {
+							case "identifier":
+								e.exportedNames[strings.TrimSpace(valNode.Text(e.src))] = struct{}{}
+							case "function_expression", "arrow_function", "generator_function":
+								if keyNode != nil {
+									if fnName := strings.TrimSpace(keyNode.Text(e.src)); fnName != "" {
+										e.extractFunctionValue(valNode, fnName, scopeQName, true, LeadingDocComment(prop, e.src, e.lang), nil)
+									}
+								}
+							default:
+								e.collectCalls(valNode, callerQName)
+							}
 						}
 					}
+					return
 				}
 			} else if strings.HasPrefix(leftTxt, "module.exports.") || strings.HasPrefix(leftTxt, "exports.") {
 				exportName := leftTxt[strings.LastIndexByte(leftTxt, '.')+1:]
@@ -1140,7 +1179,8 @@ func (e *jstsExtractor) extractJSParams(paramsNode, ownerFnNode *gotreesitter.No
 			}
 		case "required_parameter", "optional_parameter":
 			var pName, pType string
-			if pat := p.ChildByFieldName("pattern", e.lang); pat != nil {
+			pat := p.ChildByFieldName("pattern", e.lang)
+			if pat != nil {
 				pName = CollapseWhitespace(pat.Text(e.src))
 			}
 			if typeNode := p.ChildByFieldName("type", e.lang); typeNode != nil {
@@ -1148,7 +1188,7 @@ func (e *jstsExtractor) extractJSParams(paramsNode, ownerFnNode *gotreesitter.No
 			}
 			if pName != "" {
 				params = append(params, graph.Param{Name: pName, Type: pType})
-				if hasAnyAccessibilityKeyword(p, e.src) {
+				if pat != nil && pat.Type(e.lang) == "identifier" && hasAnyAccessibilityKeyword(p, e.src) {
 					isPriv := hasAccessibilityKeyword(p, e.src, "private")
 					propFields = append(propFields, parser.ParsedField{
 						Name:      pName,
@@ -1180,6 +1220,9 @@ func (e *jstsExtractor) extractTSTypeParams(tpNode *gotreesitter.Node) []string 
 	return out
 }
 
+// collectCalls traverses expressions and control-flow blocks recursively.
+// Nested anonymous callbacks (arrow_function, function_expression) roll their
+// call sites into the enclosing callerQName so callback invocations connect directly.
 func (e *jstsExtractor) collectCalls(node *gotreesitter.Node, callerQName string) {
 	if node == nil {
 		return

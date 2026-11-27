@@ -301,3 +301,62 @@ func TestJavaScriptCommonJSPrivateMembersAndErrors(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+func TestJSTSReviewEdgeCasesCommonJSObjectsAndNestedJSX(t *testing.T) {
+	mgr, err := treesitter.NewManager()
+	if err != nil {
+		t.Fatalf("NewManager failed: %v", err)
+	}
+	defer mgr.Close()
+
+	jp, err := NewJavaScriptParser(mgr)
+	if err != nil {
+		t.Fatalf("NewJavaScriptParser failed: %v", err)
+	}
+	tsxp, err := NewTSXParser(mgr)
+	if err != nil {
+		t.Fatalf("NewTSXParser failed: %v", err)
+	}
+
+	jsSrc := []byte(`const fnShorthand = () => 1;
+function helperFn() { return 2; }
+module.exports = {
+  fnShorthand,
+  exportedAlias: helperFn,
+  inlineMethod: (x) => x + 1,
+};
+`)
+	jsPF, err := jp.Parse(context.Background(), "cjs_obj.js", jsSrc)
+	if err != nil || jsPF.HasErrors() {
+		t.Fatalf("Parse CommonJS object export failed: err=%v errs=%v", err, jsPF.ParseErrors)
+	}
+	fnByName := make(map[string]parser.ParsedFunction, len(jsPF.Functions))
+	for _, fn := range jsPF.Functions {
+		fnByName[fn.Name] = fn
+	}
+	if !fnByName["fnShorthand"].Exported || !fnByName["helperFn"].Exported || !fnByName["inlineMethod"].Exported {
+		t.Fatalf("expected all CommonJS object exports marked Exported=true: %+v", fnByName)
+	}
+
+	tsxSrc := []byte(`export const View = () => <NS.Sub.Comp />;
+export class CtorTest {
+  constructor(private readonly cfg: string, public label: number) {}
+}
+`)
+	tsxPF, err := tsxp.Parse(context.Background(), "deep.tsx", tsxSrc)
+	if err != nil || tsxPF.HasErrors() {
+		t.Fatalf("Parse deep TSX failed: err=%v errs=%v", err, tsxPF.ParseErrors)
+	}
+	var sawDeepJSX bool
+	for _, c := range tsxPF.Calls {
+		if c.CallerQName == "deep::View" && c.ReceiverName == "NS.Sub" && c.CalleeName == "Comp" && c.IsMethodCall {
+			sawDeepJSX = true
+		}
+	}
+	if !sawDeepJSX {
+		t.Fatalf("missing deep nested JSX call <NS.Sub.Comp />: %+v", tsxPF.Calls)
+	}
+	if len(tsxPF.Classes) != 1 || len(tsxPF.Classes[0].Fields) != 2 || tsxPF.Classes[0].Fields[0].Exported || !tsxPF.Classes[0].Fields[1].Exported {
+		t.Fatalf("constructor parameter properties mismatch: %+v", tsxPF.Classes)
+	}
+}
