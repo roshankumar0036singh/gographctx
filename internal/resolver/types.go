@@ -213,6 +213,7 @@ func InferTypes(ctx context.Context, file *parser.ParsedFile, rc *ResolutionCont
 
 	knownClasses := make(map[string]parser.ParsedClass, len(file.Classes)*2)
 	fnReturnsByName := make(map[string]string, len(file.Functions))
+	ambiguousShortReturns := make(map[string]bool)
 	fnReturnsByQName := make(map[string]string, len(file.Functions))
 
 	// Pass 1: Classes, fields, module variables, function params & receivers.
@@ -259,8 +260,13 @@ func InferTypes(ctx context.Context, file *parser.ParsedFile, rc *ResolutionCont
 			if fn.ReceiverType != "" {
 				fnReturnsByName[fn.ReceiverType+"::"+fn.Name] = fn.ReturnType
 			}
-			if _, exists := fnReturnsByName[fn.Name]; !exists {
-				fnReturnsByName[fn.Name] = fn.ReturnType
+			if !ambiguousShortReturns[fn.Name] {
+				if prev, exists := fnReturnsByName[fn.Name]; !exists {
+					fnReturnsByName[fn.Name] = fn.ReturnType
+				} else if prev != fn.ReturnType {
+					delete(fnReturnsByName, fn.Name)
+					ambiguousShortReturns[fn.Name] = true
+				}
 			}
 		}
 

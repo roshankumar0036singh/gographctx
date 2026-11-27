@@ -438,7 +438,7 @@ func (r *TypeScriptResolver) resolveOneCall(
 	localClassesByQName map[string]parser.ParsedClass,
 	types map[string]resolver.TypeInfo,
 ) (*resolver.ResolvedCall, *resolver.UnresolvedCall) {
-	enclosingClass := findEnclosingPythonClass(call.CallerQName, localClassesByQName, rc)
+	enclosingClass := FindEnclosingClass(call.CallerQName, localClassesByQName, rc)
 
 	// 1. Direct / unqualified call: fn(), new Foo(), <Component />
 	if !call.IsMethodCall || call.ReceiverName == "" {
@@ -564,7 +564,7 @@ func (r *TypeScriptResolver) resolveOneCall(
 	}
 
 	// Tier 4: Receiver type inferred (`this.repo.save()`, `svc.fetch()`, `client.query()`).
-	if recvType, ok := lookupTSReceiverType(call.CallerQName, enclosingClass.QName, recv, types, localClassesByQName); ok {
+	if recvType, ok := LookupScopedReceiverType(rc, call.CallerQName, enclosingClass.QName, recv, types, localClassesByQName); ok {
 		typeName := stripTSPromiseWrapper(resolver.StripTypeDecorations(recvType.Name))
 		targetPkg := recvType.Package
 		if targetPkg == "" && recvType.QName != "" {
@@ -1120,14 +1120,6 @@ func resolveTSBaseRef(
 	return curPkg, clean
 }
 
-func lookupTSReceiverType(
-	callerQName, enclosingClsQName, recv string,
-	types map[string]resolver.TypeInfo,
-	localClassesByQName map[string]parser.ParsedClass,
-) (resolver.TypeInfo, bool) {
-	return lookupPythonReceiverType(callerQName, enclosingClsQName, recv, types, localClassesByQName)
-}
-
 func resolveTSImportTarget(rc *resolver.ResolutionContext, cfg TSConfig, fileDir, spec string) (targetFile, targetScope string, isNodeModules, found bool) {
 	trimmed := strings.TrimSpace(spec)
 	if trimmed == "" {
@@ -1495,10 +1487,18 @@ func stripJSONCommentsAndTrailingCommas(src []byte) []byte {
 			}
 			if src[i+1] == '*' {
 				i += 2
-				for i+1 < len(src) && !(src[i] == '*' && src[i+1] == '/') {
+				closed := false
+				for i+1 < len(src) {
+					if src[i] == '*' && src[i+1] == '/' {
+						i++
+						closed = true
+						break
+					}
 					i++
 				}
-				i++
+				if !closed {
+					break
+				}
 				continue
 			}
 		}

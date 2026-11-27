@@ -124,6 +124,143 @@ func hasInterfaceMethodDecorator(decs []string) bool {
 	return false
 }
 
+// FindEnclosingClass walks parent "::" segments from callerQName to locate the
+// innermost enclosing class/struct/interface definition locally or in rc.View.
+func FindEnclosingClass(callerQName string, localClassesByQName map[string]parser.ParsedClass, rc *resolver.ResolutionContext) parser.ParsedClass {
+	cur := callerQName
+	for cur != "" {
+		idx := strings.LastIndex(cur, "::")
+		if idx <= 0 {
+			break
+		}
+		parent := cur[:idx]
+		if localClassesByQName != nil {
+			if cls, ok := localClassesByQName[parent]; ok {
+				return cls
+			}
+		}
+		if rc != nil && rc.View != nil {
+			for _, n := range rc.View.GetByQName(parent) {
+				if n.Kind == graph.KindClass || n.Kind == graph.KindStruct || n.Kind == graph.KindInterface {
+					return parser.ParsedClass{Name: n.Name, QName: n.QName, Kind: n.Kind, Bases: n.Bases}
+				}
+			}
+		}
+		cur = parent
+	}
+	return parser.ParsedClass{}
+}
+
+// LookupScopedReceiverType resolves direct or dotted receiver chains (including
+// `self.attr`, `cls.attr`, `this.attr`, and cross-file struct/class fields).
+func LookupScopedReceiverType(
+	rc *resolver.ResolutionContext,
+	callerQName, enclosingClsQName, recv string,
+	types map[string]resolver.TypeInfo,
+	localClassesByQName map[string]parser.ParsedClass,
+) (resolver.TypeInfo, bool) {
+	if info, ok := resolver.LookupFlat(types, callerQName, recv); ok {
+		return info, true
+	}
+	if enclosingClsQName != "" {
+		if info, ok := resolver.LookupFlat(types, enclosingClsQName, recv); ok {
+			return info, true
+		}
+	}
+
+	parts := strings.Split(recv, ".")
+	if len(parts) < 2 {
+		return resolver.TypeInfo{}, false
+	}
+
+	startIdx := 1
+	var cur resolver.TypeInfo
+	var ok bool
+
+	first := strings.TrimSpace(parts[0])
+	if first == "self" || first == "cls" || first == "this" {
+		twoPart := first + "." + strings.TrimSpace(parts[1])
+		if cur, ok = resolver.LookupFlat(types, callerQName, twoPart); ok {
+			startIdx = 2
+		} else if enclosingClsQName != "" {
+			if cur, ok = resolver.LookupFlat(types, enclosingClsQName, strings.TrimSpace(parts[1])); ok {
+				startIdx = 2
+			}
+		}
+	}
+	if !ok {
+		cur, ok = resolver.LookupFlat(types, callerQName, first)
+		if !ok {
+			return resolver.TypeInfo{}, false
+		}
+	}
+
+	for _, seg := range parts[startIdx:] {
+		fieldName := strings.TrimSpace(seg)
+		if fieldName == "" {
+			return resolver.TypeInfo{}, false
+		}
+		if info, found := resolver.LookupFlat(types, cur.QName, fieldName); found {
+			cur = info
+			continue
+		}
+		if info, found := resolver.LookupFlat(types, cur.Name, fieldName); found {
+			cur = info
+			continue
+		}
+		if localClassesByQName != nil {
+			if cls, found := localClassesByQName[cur.QName]; found {
+				if next, matched := lookupFieldOnParsedClass(cls, fieldName, cur.Package); matched {
+					cur = next
+					continue
+				}
+			}
+		}
+		if next, matched := lookupCrossFileFieldType(rc, cur, fieldName); matched {
+			cur = next
+			continue
+		}
+		return resolver.TypeInfo{}, false
+	}
+
+	return cur, true
+}
+
+func lookupFieldOnParsedClass(cls parser.ParsedClass, fieldName, fallbackPkg string) (resolver.TypeInfo, bool) {
+	for _, f := range cls.Fields {
+		if f.Name == fieldName && f.Type != "" {
+			return resolver.TypeInfo{Name: resolver.StripTypeDecorations(f.Type), Package: fallbackPkg}, true
+		}
+	}
+	return resolver.TypeInfo{}, false
+}
+
+func lookupCrossFileFieldType(rc *resolver.ResolutionContext, cur resolver.TypeInfo, fieldName string) (resolver.TypeInfo, bool) {
+	if rc == nil || rc.View == nil {
+		return resolver.TypeInfo{}, false
+	}
+	var classQNames []string
+	if cur.QName != "" {
+		classQNames = append(classQNames, cur.QName)
+	} else if cur.Package != "" && cur.Name != "" {
+		classQNames = append(classQNames, cur.Package+"::"+resolver.StripTypeDecorations(cur.Name))
+	}
+	for _, cq := range classQNames {
+		for _, n := range rc.View.GetByQName(cq) {
+			if pf := rc.LookupFile(n.File); pf != nil {
+				for _, pc := range pf.Classes {
+					if pc.QName == n.QName {
+						if info, ok := lookupFieldOnParsedClass(pc, fieldName, PackageScopePrefix(n.QName)); ok {
+							return info, true
+						}
+					}
+				}
+			}
+		}
+	}
+	return resolver.TypeInfo{}, false
+}
+
 // AddParsedFileToGraph materializes nodes from pf into g cleanly (useful for
 // multi-file resolver tests and standalone resolution pipelines prior to Phase 21).
 func AddParsedFileToGraph(g *graph.Graph, pf *parser.ParsedFile) error {

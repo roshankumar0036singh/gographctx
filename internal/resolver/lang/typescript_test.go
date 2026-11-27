@@ -62,6 +62,16 @@ func TestParseTSConfigAndPackageJSON(t *testing.T) {
 	if pkg.Exports["."] != "./dist/index.mjs" || pkg.Exports["./format"] != "./dist/format.js" {
 		t.Fatalf("unexpected package exports: %+v", pkg.Exports)
 	}
+
+	// Ensure unclosed /* comment at EOF does not fail or panic.
+	unclosedDir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(unclosedDir, "tsconfig.json"), []byte(`{"compilerOptions":{"baseUrl":"src"}} /* unclosed`), 0o600); err != nil {
+		t.Fatalf("WriteFile unclosed tsconfig failed: %v", err)
+	}
+	uCfg, err := resolverlang.ParseTSConfig(unclosedDir)
+	if err != nil || uCfg.BaseURL != "src" {
+		t.Fatalf("ParseTSConfig unclosed comment = %+v, err=%v", uCfg, err)
+	}
 }
 
 func TestTypeScriptAndJSXResolverEndToEnd(t *testing.T) {

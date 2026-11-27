@@ -17,6 +17,9 @@ import (
 
 func TestParseGoModAndReplace(t *testing.T) {
 	dir := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(dir, "packages", "nolink"), 0o755); err != nil {
+		t.Fatalf("MkdirAll local replace dir failed: %v", err)
+	}
 	modContent := `// sample module
 module github.com/example/shop
 
@@ -26,6 +29,7 @@ replace github.com/example/shared => ./local/shared
 
 replace (
 	github.com/example/ext => github.com/fork/ext v1.2.0
+	github.com/example/nolink => packages/nolink
 )
 `
 	if err := os.WriteFile(filepath.Join(dir, "go.mod"), []byte(modContent), 0o600); err != nil {
@@ -38,7 +42,7 @@ replace (
 	if info.ModulePath != "github.com/example/shop" || info.GoVersion != "1.22" {
 		t.Fatalf("GoModInfo header mismatch: %+v", info)
 	}
-	if info.Replaces["github.com/example/shared"] != "local/shared" {
+	if info.Replaces["github.com/example/shared"] != "local/shared" || info.Replaces["github.com/example/nolink"] != "packages/nolink" {
 		t.Fatalf("GoModInfo Replaces = %+v", info.Replaces)
 	}
 	if _, hasExt := info.Replaces["github.com/example/ext"]; hasExt {
