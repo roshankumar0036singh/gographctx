@@ -263,6 +263,9 @@ func (e *pythonExtractor) extractImportStatement(stmt *gotreesitter.Node) {
 	}
 }
 
+// extractImportFromStatement records unaliased names as one ParsedImport entry
+// and each aliased symbol ("name as alias") as its own entry so downstream
+// import resolution always receives unambiguous 1:1 Alias bindings.
 func (e *pythonExtractor) extractImportFromStatement(stmt *gotreesitter.Node) {
 	line := NodeStartLine(stmt)
 	modNode := stmt.ChildByFieldName("module_name", e.lang)
@@ -940,14 +943,17 @@ func cleanPythonDocstring(raw string) string {
 	if len(lines) <= 1 {
 		return strings.TrimSpace(s)
 	}
-	// Mimic inspect.cleandoc: trim first line, compute common indent over lines[1:].
+	// Mimic inspect.cleandoc: expand tabs to 8-column stops, trim first line,
+	// compute minimum indent over non-blank lines[1:], and trim leading columns.
 	lines[0] = strings.TrimSpace(lines[0])
 	minIndent := -1
-	for _, line := range lines[1:] {
-		if strings.TrimSpace(line) == "" {
+	for i := 1; i < len(lines); i++ {
+		expanded := expandTabs8(lines[i])
+		lines[i] = expanded
+		if strings.TrimSpace(expanded) == "" {
 			continue
 		}
-		indent := len(line) - len(strings.TrimLeft(line, " \t"))
+		indent := len(expanded) - len(strings.TrimLeft(expanded, " "))
 		if minIndent < 0 || indent < minIndent {
 			minIndent = indent
 		}
@@ -957,11 +963,33 @@ func cleanPythonDocstring(raw string) string {
 			if len(lines[i]) >= minIndent {
 				lines[i] = lines[i][minIndent:]
 			} else {
-				lines[i] = strings.TrimLeft(lines[i], " \t")
+				lines[i] = strings.TrimLeft(lines[i], " ")
 			}
 		}
 	}
 	return strings.TrimSpace(strings.Join(lines, "\n"))
+}
+
+func expandTabs8(s string) string {
+	if !strings.ContainsRune(s, '\t') {
+		return s
+	}
+	var b strings.Builder
+	b.Grow(len(s) + 8)
+	col := 0
+	for _, r := range s {
+		if r == '\t' {
+			spaces := 8 - (col % 8)
+			for i := 0; i < spaces; i++ {
+				b.WriteByte(' ')
+			}
+			col += spaces
+			continue
+		}
+		b.WriteRune(r)
+		col++
+	}
+	return b.String()
 }
 
 func stripOuterMatchingQuotes(s string) string {

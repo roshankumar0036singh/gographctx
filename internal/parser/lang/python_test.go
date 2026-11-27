@@ -165,6 +165,13 @@ func TestPythonParserFlaskGoldenFixture(t *testing.T) {
 	if !syncFn.IsAsync || syncFn.IsMethod || len(syncFn.Decorators) != 2 || !strings.HasPrefix(syncFn.Decorators[0], "app.route(") {
 		t.Fatalf("sync_orders async/decorators mismatch: %+v", syncFn)
 	}
+	if len(syncFn.Params) != 4 ||
+		syncFn.Params[0] != (graph.Param{Name: "order_id", Type: "str"}) ||
+		syncFn.Params[1] != (graph.Param{Name: "limit", Type: "int"}) ||
+		syncFn.Params[2] != (graph.Param{Name: "*extra", Type: "str"}) ||
+		syncFn.Params[3] != (graph.Param{Name: "**opts", Type: "Any"}) {
+		t.Fatalf("sync_orders params mismatch: %+v", syncFn.Params)
+	}
 
 	// Verify call sites: <module> scope calls, decorator calls, chained method calls, generator call.
 	hasCall := func(caller, receiver, callee string) bool {
@@ -295,5 +302,53 @@ func TestPythonParserInitModuleRegistryAndErrorRecovery(t *testing.T) {
 	close(errCh)
 	for err := range errCh {
 		t.Fatal(err)
+	}
+}
+
+func TestPythonParserMixedDocstringsAwaitAndLambda(t *testing.T) {
+	mgr, err := treesitter.NewManager()
+	if err != nil {
+		t.Fatalf("NewManager failed: %v", err)
+	}
+	defer mgr.Close()
+
+	pp, err := NewPythonParser(mgr)
+	if err != nil {
+		t.Fatalf("NewPythonParser failed: %v", err)
+	}
+
+	src := "async def fetch(client, items):\n" +
+		"\t\"\"\"Summary line.\n" +
+		"\t\n" +
+		"        Indented with 8 spaces matching 1 tab.\n" +
+		"\t    Extra 4-space detail.\n" +
+		"\t\"\"\"\n" +
+		"\tfn = lambda v: normalize(v)\n" +
+		"\treturn await client.send(fn(items))\n"
+
+	pf, err := pp.Parse(context.Background(), "worker.py", []byte(src))
+	if err != nil {
+		t.Fatalf("Parse failed: %v", err)
+	}
+	if pf.HasErrors() || len(pf.Functions) != 1 {
+		t.Fatalf("unexpected parse result: errs=%v funcs=%d", pf.ParseErrors, len(pf.Functions))
+	}
+
+	fn := pf.Functions[0]
+	wantDoc := "Summary line.\n\nIndented with 8 spaces matching 1 tab.\n    Extra 4-space detail."
+	if fn.Docstring != wantDoc {
+		t.Fatalf("Docstring = %q, want %q", fn.Docstring, wantDoc)
+	}
+
+	hasCall := func(receiver, callee string) bool {
+		for _, c := range pf.Calls {
+			if c.CallerQName == "worker::fetch" && c.ReceiverName == receiver && c.CalleeName == callee {
+				return true
+			}
+		}
+		return false
+	}
+	if !hasCall("", "normalize") || !hasCall("", "fn") || !hasCall("client", "send") {
+		t.Fatalf("expected lambda and await calls recorded under worker::fetch, got %+v", pf.Calls)
 	}
 }
