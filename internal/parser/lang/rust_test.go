@@ -47,11 +47,11 @@ func TestRustParserCrateGoldenFixture(t *testing.T) {
 	var hasHashMap, hasSetAlias, hasPubWildcard, hasExtMod, hasSuperSet bool
 	for _, imp := range pf.Imports {
 		switch {
-		case imp.Path == "std::collections" && slices.Contains(imp.Names, "HashMap") && !imp.IsRelative:
+		case imp.Path == "std::collections" && slices.Contains(imp.Names, "HashMap") && !imp.IsRelative && !imp.Exported:
 			hasHashMap = true
-		case imp.Path == "std::collections" && imp.Alias == "IdSet" && slices.Equal(imp.Names, []string{"HashSet"}):
+		case imp.Path == "std::collections" && imp.Alias == "IdSet" && slices.Equal(imp.Names, []string{"HashSet"}) && !imp.Exported:
 			hasSetAlias = true
-		case imp.Path == "self::storage" && imp.IsWildcard && imp.IsRelative:
+		case imp.Path == "self::storage" && imp.IsWildcard && imp.IsRelative && imp.Exported:
 			hasPubWildcard = true
 		case imp.Path == "./internal_helpers" && slices.Equal(imp.Names, []string{"internal_helpers"}) && imp.IsRelative:
 			hasExtMod = true
@@ -207,5 +207,71 @@ func TestRustParserErrorsGuardsAndConcurrency(t *testing.T) {
 	close(errCh)
 	for err := range errCh {
 		t.Fatal(err)
+	}
+}
+
+func TestRustParserTurbofishWhereClausePubUseAndTryComplexity(t *testing.T) {
+	mgr, err := treesitter.NewManager()
+	if err != nil {
+		t.Fatalf("NewManager failed: %v", err)
+	}
+	defer mgr.Close()
+
+	rp, err := NewRustParser(mgr)
+	if err != nil {
+		t.Fatalf("NewRustParser failed: %v", err)
+	}
+
+	src := []byte(`pub use crate::core::Client as PublicClient;
+use crate::internal::Secret;
+
+pub trait Extended: Send where Self: Clone + Sync {
+    fn make(&self) -> Result<Box<dyn Send>, String>;
+}
+
+fn caller() -> Result<(), ()> {
+    let _ = a::b::<Box<String>>::c(1)?;
+    let _ = a::<String>::b::d(1)?;
+    let _ = foo::<i32>(2);
+    Ok(())
+}
+`)
+
+	pf, err := rp.Parse(context.Background(), "src/lib.rs", src)
+	if err != nil || pf.HasErrors() {
+		t.Fatalf("Parse failed: err=%v errs=%v", err, pf.ParseErrors)
+	}
+	if pf.Package != "src::lib" {
+		t.Fatalf("Package = %q, want src::lib", pf.Package)
+	}
+
+	if len(pf.Imports) != 2 || !pf.Imports[0].Exported || pf.Imports[0].Alias != "PublicClient" || pf.Imports[1].Exported {
+		t.Fatalf("pub use / use Exported mismatch: %+v", pf.Imports)
+	}
+	if len(pf.Classes) != 1 || !slices.Equal(pf.Classes[0].Bases, []string{"Send", "Clone", "Sync"}) {
+		t.Fatalf("Extended trait where Self bounds mismatch: %+v", pf.Classes)
+	}
+
+	var callerFn *parser.ParsedFunction
+	for i := range pf.Functions {
+		if pf.Functions[i].Name == "caller" {
+			callerFn = &pf.Functions[i]
+			break
+		}
+	}
+	if callerFn == nil || callerFn.Complexity != 3 {
+		t.Fatalf("caller function / try complexity mismatch: %+v", callerFn)
+	}
+
+	hasCall := func(receiver, callee string, isDynamic bool) bool {
+		for _, c := range pf.Calls {
+			if c.CallerQName == "src::lib::caller" && c.ReceiverName == receiver && c.CalleeName == callee && c.IsDynamic == isDynamic {
+				return true
+			}
+		}
+		return false
+	}
+	if !hasCall("a::b", "c", false) || !hasCall("a::b", "d", false) || !hasCall("", "foo", false) {
+		t.Fatalf("turbofish calls mismatch: %+v", pf.Calls)
 	}
 }

@@ -328,6 +328,7 @@ func (e *jstsExtractor) extractExportStatement(stmt *gotreesitter.Node, scopeQNa
 				IsWildcard: true,
 				IsTypeOnly: isTypeOnly,
 				IsRelative: isRel,
+				Exported:   true,
 			})
 			return
 		}
@@ -359,6 +360,7 @@ func (e *jstsExtractor) extractExportStatement(stmt *gotreesitter.Node, scopeQNa
 						Line:       line,
 						IsTypeOnly: isTypeOnly,
 						IsRelative: isRel,
+						Exported:   true,
 					})
 				} else if sym != "" {
 					names = append(names, sym)
@@ -372,6 +374,7 @@ func (e *jstsExtractor) extractExportStatement(stmt *gotreesitter.Node, scopeQNa
 				Line:       line,
 				IsTypeOnly: isTypeOnly,
 				IsRelative: isRel,
+				Exported:   true,
 			})
 		}
 		return

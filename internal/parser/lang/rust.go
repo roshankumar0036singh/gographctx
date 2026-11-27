@@ -91,6 +91,9 @@ func (p *RustParser) Parse(ctx context.Context, path string, source []byte) (*pa
 	return out, nil
 }
 
+// deriveRustModuleScope maps a Rust source file path to a "::"-delimited crate
+// module scope: "src/store/mod.rs" -> "src::store", "src/lib.rs" -> "src::lib",
+// "src/main.rs" -> "src::main", and "src/foo/bar.rs" -> "src::foo::bar".
 func deriveRustModuleScope(path string) string {
 	trimmed := strings.TrimSpace(path)
 	if trimmed == "" {
@@ -199,6 +202,7 @@ func (e *rustExtractor) flattenUseTree(prefix string, node *gotreesitter.Node, l
 				Path:       sym,
 				Line:       line,
 				IsRelative: isRustRelativePath(sym),
+				Exported:   isPub,
 			})
 			return
 		}
@@ -207,6 +211,7 @@ func (e *rustExtractor) flattenUseTree(prefix string, node *gotreesitter.Node, l
 			Names:      []string{sym},
 			Line:       line,
 			IsRelative: isRustRelativePath(prefix),
+			Exported:   isPub,
 		})
 
 	case "scoped_identifier":
@@ -222,12 +227,14 @@ func (e *rustExtractor) flattenUseTree(prefix string, node *gotreesitter.Node, l
 				Names:      []string{sym},
 				Line:       line,
 				IsRelative: isRustRelativePath(modPath),
+				Exported:   isPub,
 			})
 		} else {
 			e.out.Imports = append(e.out.Imports, parser.ParsedImport{
 				Path:       full,
 				Line:       line,
 				IsRelative: isRustRelativePath(full),
+				Exported:   isPub,
 			})
 		}
 
@@ -254,6 +261,7 @@ func (e *rustExtractor) flattenUseTree(prefix string, node *gotreesitter.Node, l
 			Names:      names,
 			Line:       line,
 			IsRelative: isRustRelativePath(modPath),
+			Exported:   isPub,
 		})
 
 	case "use_wildcard":
@@ -275,6 +283,7 @@ func (e *rustExtractor) flattenUseTree(prefix string, node *gotreesitter.Node, l
 				Line:       line,
 				IsWildcard: true,
 				IsRelative: isRustRelativePath(modPath),
+				Exported:   isPub,
 			})
 		}
 
@@ -299,7 +308,6 @@ func (e *rustExtractor) flattenUseTree(prefix string, node *gotreesitter.Node, l
 			e.flattenUseTree(prefix, node.NamedChild(i), line, isPub)
 		}
 	}
-	_ = isPub
 }
 
 func (e *rustExtractor) extractModItem(modNode *gotreesitter.Node, scopeQName string) {
@@ -456,13 +464,22 @@ func (e *rustExtractor) extractTrait(node *gotreesitter.Node, scopeQName string)
 
 	var bases []string
 	if bounds := node.ChildByFieldName("bounds", e.lang); bounds != nil {
-		for i := 0; i < bounds.NamedChildCount(); i++ {
-			b := bounds.NamedChild(i)
-			if b == nil || b.Type(e.lang) == "lifetime" {
+		bases = appendRustTraitBounds(bases, bounds, e.lang, e.src)
+	}
+	for i := 0; i < node.NamedChildCount(); i++ {
+		wc := node.NamedChild(i)
+		if wc == nil || wc.Type(e.lang) != "where_clause" {
+			continue
+		}
+		for j := 0; j < wc.NamedChildCount(); j++ {
+			pred := wc.NamedChild(j)
+			if pred == nil || pred.Type(e.lang) != "where_predicate" {
 				continue
 			}
-			if base := stripRustGenericsAndLifetimes(b.Text(e.src)); base != "" {
-				bases = append(bases, base)
+			target := pred.ChildByFieldName("left", e.lang)
+			bounds := pred.ChildByFieldName("bounds", e.lang)
+			if target != nil && bounds != nil && strings.TrimSpace(target.Text(e.src)) == "Self" {
+				bases = appendRustTraitBounds(bases, bounds, e.lang, e.src)
 			}
 		}
 	}
@@ -732,6 +749,14 @@ func (e *rustExtractor) recordRustCall(callNode *gotreesitter.Node, callerQName 
 		ArgumentCount: argCount,
 	}
 
+	if fnNode.Type(e.lang) == "generic_function" {
+		if inner := fnNode.ChildByFieldName("function", e.lang); inner != nil {
+			fnNode = inner
+		} else if fnNode.NamedChildCount() > 0 {
+			fnNode = fnNode.NamedChild(0)
+		}
+	}
+
 	switch fnNode.Type(e.lang) {
 	case "identifier":
 		call.CalleeName = strings.TrimSpace(fnNode.Text(e.src))
@@ -824,7 +849,7 @@ func computeRustComplexity(body *gotreesitter.Node, lang *gotreesitter.Language,
 			return
 		}
 		switch n.Type(lang) {
-		case "if_expression", "for_expression", "while_expression", "loop_expression", "match_arm":
+		case "if_expression", "for_expression", "while_expression", "loop_expression", "match_arm", "try_expression":
 			complexity++
 		case "binary_expression":
 			if op := n.ChildByFieldName("operator", lang); op != nil {
@@ -918,17 +943,47 @@ func hasRustAsyncModifier(node *gotreesitter.Node, src []byte, lang *gotreesitte
 	return false
 }
 
+func appendRustTraitBounds(bases []string, bounds *gotreesitter.Node, lang *gotreesitter.Language, src []byte) []string {
+	for i := 0; i < bounds.NamedChildCount(); i++ {
+		b := bounds.NamedChild(i)
+		if b == nil || b.Type(lang) == "lifetime" {
+			continue
+		}
+		if base := stripRustGenericsAndLifetimes(b.Text(src)); base != "" && !containsString(bases, base) {
+			bases = append(bases, base)
+		}
+	}
+	return bases
+}
+
 func stripRustGenericsAndLifetimes(raw string) string {
 	s := CollapseWhitespace(raw)
 	s = strings.TrimPrefix(s, "&mut ")
 	s = strings.TrimLeft(s, "&")
 	s = strings.TrimSpace(s)
-	// Strip ::<...> turbofish and <...> generic/lifetime params from base type name.
+	// Strip balanced ::<...> turbofish and <...> generic/lifetime groups while
+	// keeping multi-segment paths such as a::<T>::b intact.
 	s = strings.ReplaceAll(s, "::<", "<")
-	if idx := strings.IndexByte(s, '<'); idx >= 0 {
-		s = s[:idx]
+	var b strings.Builder
+	b.Grow(len(s))
+	depth := 0
+	for i := 0; i < len(s); i++ {
+		switch s[i] {
+		case '<':
+			depth++
+		case '>':
+			if depth > 0 {
+				depth--
+			} else {
+				b.WriteByte('>')
+			}
+		default:
+			if depth == 0 {
+				b.WriteByte(s[i])
+			}
+		}
 	}
-	return strings.TrimSpace(s)
+	return strings.TrimSpace(b.String())
 }
 
 func isRustRelativePath(p string) bool {
