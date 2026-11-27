@@ -1363,13 +1363,13 @@ d:\gographctx\gographctx\
 #### Phase 16: Python Resolver
 **Goal:** Implement Python-specific import and call resolution.
 **Deliverables:**
+- `internal/resolver/resolver.go`: `ResolutionContext.IndexFiles` & `LookupFile` for in-memory re-export and barrel inspection
 - `internal/resolver/lang/python.go`:
-  - Resolve relative imports (`from . import`, `from ..pkg import`)
-  - Resolve absolute imports against indexed packages
-  - `__init__.py` handling (directory = package)
-  - Method resolution via type inference (self.x, cls.y)
-  - Handle: `*` imports (wildcard), re-exports, conditional imports
-- Tests: Python project with packages, relative imports, class hierarchies, decorators
+  - Resolve relative imports (`from . import`, `from ..pkg import`) with parent-package climbing
+  - Resolve absolute imports against indexed Python packages and `__init__.py` directory modules
+  - Method and constructor resolution via `self`/`cls`/`super()`, `self.x`/`cls.x` field promotion, and class `Bases` MRO traversal
+  - Handle `*` wildcard imports, transitive `__init__.py` re-exports (cycle-guarded), conditional `try`/`except ImportError` imports, and Python builtins/external libraries
+- Tests: `internal/resolver/lang/python_test.go` (`TestPythonResolverFlaskStylePackages` covering Flask-style multi-package layout, relative/`__init__.py`/wildcard/conditional imports, inheritance, and ≥85% internal strong-tier resolution)
 **Exit criteria:** ≥85% of calls in Flask resolve to strong tiers (vs CGC's 39%)
 
 #### Phase 17: TypeScript/JavaScript Resolver
