@@ -1351,13 +1351,13 @@ d:\gographctx\gographctx\
 #### Phase 15: Go Resolver
 **Goal:** Implement Go-specific module and call resolution.
 **Deliverables:**
+- `internal/resolver/lang/common.go`: shared resolver utilities (`ResolveCallerUID` with multi-`init()` span matching, `FindSameFileFuncUID`, `PackageScopePrefix`, `FilterUniqueFunctionMatches`, `AddParsedFileToGraph`)
 - `internal/resolver/lang/golang.go`:
-  - Parse `go.mod` for module path
-  - Resolve import paths to packages within the indexed project
-  - Method resolution via receiver types (from type inference)
-  - Interface satisfaction detection (struct implements interface)
-  - Handle: embedded struct methods, package-level functions, init functions
-- Tests: multi-package Go project with cross-package calls, method calls, interface usage
+  - `ParseGoMod` parsing `go.mod` module path, Go version, and local `replace` directives
+  - `GoResolver` (`LanguageResolver`): resolves project-local/replaced/relative/external imports, cross-package `New<Type>` constructors, and Tier 1–8 calls (`CALLS` vs external/unresolved)
+  - Embedded struct method promotion via breadth-first traversal of struct `Bases` (`resolveGoReceiverMethod`)
+  - `DetectInterfaceSatisfaction`: structural interface satisfaction detection with embedded struct methods and package-qualifier normalization
+- Tests: `internal/resolver/lang/golang_test.go` (`TestParseGoModAndReplace`, `TestGoResolverMultiPackageResolution` verifying 100% cross-package/receiver/embedded/init call resolution and interface satisfaction)
 **Exit criteria:** ≥90% of calls in a multi-package Go project resolve to strong tiers
 
 #### Phase 16: Python Resolver
