@@ -1270,17 +1270,17 @@ d:\gographctx\gographctx\
 #### Phase 9: TypeScript & JavaScript Parsers
 **Goal:** Implement TypeScript and JavaScript parsers.
 **Deliverables:**
+- `internal/parser/lang/jsts_common.go` — shared TypeScript/TSX/JavaScript AST extractor (`parseJSTS`)
 - `internal/parser/lang/typescript.go`:
-  - Extract: functions, arrow functions, classes, interfaces, type aliases, enums
-  - Extract: imports (ES modules, CommonJS require, dynamic import)
-  - Extract: exports (named, default, re-exports)
-  - Extract: call sites, JSX component usage
-  - Handle: decorators (TypeScript), generics, namespaces
+  - `TypeScriptParser` (`.ts`, `.mts`, `.cts`) and `TSXParser` (`.tsx`) sharing `jsts_common.go`
+  - Extract: functions, arrow functions, classes, interfaces (with `ts:interface_method`), type aliases, enums, namespaces (`internal_module`)
+  - Extract: imports (ES modules, `import type`, CommonJS `require()`, dynamic `import()`), exports (named, default, re-exports)
+  - Extract: call sites (`call_expression`, `new_expression`, optional chaining), JSX component usage (`<Panel>`, `<UI.Header>`)
+  - Handle: decorators (`@sealed`), generics, constructor parameter properties, private `#syntax`
 - `internal/parser/lang/javascript.go`:
-  - Share common extraction with TS parser (via `common.go` helpers)
-  - Handle: CommonJS patterns (`module.exports`, `require()`)
-  - Handle: class fields, private methods (#syntax)
-- Tests: golden tests covering ES modules, CommonJS, TypeScript-specific features
+  - `JavaScriptParser` (`.js`, `.mjs`, `.cjs`, `.jsx`) sharing extraction via `jsts_common.go`
+  - Handle: CommonJS patterns (`module.exports`, `exports.*`, destructured `require()`), class fields, private methods (`#syntax`), JSX elements
+- Tests: golden tests (`jsts_test.go`, `sample_service.ts`, `sample_component.tsx`, `sample_worker.js`) covering ES modules, CommonJS, TypeScript-specific features, TSX/JSX, error recovery, and concurrency
 **Exit criteria:** Correctly parse a medium TypeScript project structure
 
 #### Phase 10: Rust Parser
