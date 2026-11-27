@@ -651,6 +651,18 @@ func synthesizeIndexInputsFromView(v *graph.ReadView, reParsed []*parser.ParsedF
 		if isParsed {
 			continue
 		}
+		classFields := make(map[string][]parser.ParsedField)
+		for _, n := range v.GetByFile(pathKey) {
+			if n.Kind == graph.KindProperty && n.Receiver != "" {
+				classFields[n.Receiver] = append(classFields[n.Receiver], parser.ParsedField{
+					Name:      n.Name,
+					QName:     n.QName,
+					Type:      n.Type,
+					StartLine: n.StartLine,
+					Exported:  n.Exported,
+				})
+			}
+		}
 		for _, n := range v.GetByFile(pathKey) {
 			switch n.Kind {
 			case graph.KindModule:
@@ -661,16 +673,21 @@ func synthesizeIndexInputsFromView(v *graph.ReadView, reParsed []*parser.ParsedF
 					QName:      n.QName,
 					StartLine:  n.StartLine,
 					Exported:   n.Exported,
+					Receiver:   n.Receiver,
+					Params:     slices.Clone(n.Params),
 					ReturnType: n.ReturnType,
+					Decorators: slices.Clone(n.Decorators),
 				})
 			case graph.KindClass, graph.KindStruct, graph.KindInterface, graph.KindEnum:
 				pf.Classes = append(pf.Classes, parser.ParsedClass{
-					Name:      n.Name,
-					QName:     n.QName,
-					Kind:      n.Kind,
-					StartLine: n.StartLine,
-					Exported:  n.Exported,
-					Bases:     n.Bases,
+					Name:       n.Name,
+					QName:      n.QName,
+					Kind:       n.Kind,
+					StartLine:  n.StartLine,
+					Exported:   n.Exported,
+					Decorators: slices.Clone(n.Decorators),
+					Bases:      n.Bases,
+					Fields:     classFields[n.Name],
 				})
 			case graph.KindVariable:
 				pf.Variables = append(pf.Variables, parser.ParsedVariable{
