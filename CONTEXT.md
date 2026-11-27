@@ -1324,15 +1324,14 @@ d:\gographctx\gographctx\
 #### Phase 13: Resolver Interface & Tier System
 **Goal:** Define resolution interfaces, tier system, and confidence scoring.
 **Deliverables:**
-- `internal/resolver/resolver.go` — `LanguageResolver` interface
+- `internal/resolver/resolver.go` — `LanguageResolver` interface (`ResolveImports`, `InferTypes`, `ResolveCalls`), `TypeInfo`/`TypeOrigin`, `ResolvedImport`, `FileResolution`, `ResolutionContext` (read-only `*graph.ReadView` + `*parser.NameIndex`), and thread-safe `Registry`
 - `internal/resolver/tiers.go`:
-  - Tier enum (1–8) with descriptions
-  - Confidence scores per tier
-  - Edge type determination (CALLS vs LIKELY_CALLS vs unresolved)
-  - `ResolvedCall` struct (source, target, tier, confidence, resolution method description)
-  - `UnresolvedCall` struct (source, candidates, reason)
-- `internal/resolver/common.go` — shared utilities (name matching, scope analysis)
-- Tests: tier assignment logic, confidence scoring
+  - Re-exported `graph.ResolutionTier` constants (`TierStructural` 0 through `TierUnresolved` 8) with descriptions
+  - Confidence scores (`ConfidenceForTier`) and labels (`LabelForTier`) derived strictly from `ResolutionTier`
+  - Edge type determination (`EdgeKindForTier`, `ShouldEmitCallEdge`, `ValidateCallTierAndKind` blocking Tiers 7–8 from emitting `CALLS`)
+  - `ResolvedCall` struct (`ToEdge()`, `ToCallSiteRef()`, `Validate()`) and `UnresolvedCall` struct (`ToCallSite()`, `Validate()`)
+- `internal/resolver/common.go` — shared utilities (`BuildLookupKey`, `IsSelfOrSuperReceiver`, `StripTypeDecorations`, `MatchUniqueNode`)
+- Tests: `resolver_test.go` covering tier assignment discipline, confidence scoring, edge/callsite invariants, helper normalization, and `Registry` workflow
 **Exit criteria:** Tier system correctly classifies resolution outcomes
 
 #### Phase 14: Type Inference Engine
