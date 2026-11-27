@@ -574,11 +574,20 @@ func (e *goExtractor) extractMethod(mNode *gotreesitter.Node) {
 		return
 	}
 
-	recvRaw, recvBase := e.extractReceiver(mNode.ChildByFieldName("receiver", e.lang))
+	recvRaw, recvBase, recvVar := e.extractReceiver(mNode.ChildByFieldName("receiver", e.lang))
 	params := e.extractParameters(mNode.ChildByFieldName("parameters", e.lang))
 	retType := e.extractReturnType(mNode.ChildByFieldName("result", e.lang))
 	qname := JoinQName(e.scope, recvBase, name)
 	body := mNode.ChildByFieldName("body", e.lang)
+
+	if recvVar != "" && recvRaw != "" {
+		e.out.LocalVars = append(e.out.LocalVars, parser.ParsedLocalVar{
+			ScopeQName:   qname,
+			Name:         recvVar,
+			ExplicitType: recvRaw,
+			Line:         NodeStartLine(mNode),
+		})
+	}
 
 	e.out.Functions = append(e.out.Functions, parser.ParsedFunction{
 		Name:         name,
@@ -602,9 +611,9 @@ func (e *goExtractor) extractMethod(mNode *gotreesitter.Node) {
 	}
 }
 
-func (e *goExtractor) extractReceiver(recvList *gotreesitter.Node) (rawType, baseType string) {
+func (e *goExtractor) extractReceiver(recvList *gotreesitter.Node) (rawType, baseType, varName string) {
 	if recvList == nil {
-		return "", ""
+		return "", "", ""
 	}
 	for i := 0; i < recvList.NamedChildCount(); i++ {
 		pd := recvList.NamedChild(i)
@@ -615,11 +624,14 @@ func (e *goExtractor) extractReceiver(recvList *gotreesitter.Node) (rawType, bas
 		if typeNode == nil {
 			continue
 		}
+		if nameNode := pd.ChildByFieldName("name", e.lang); nameNode != nil {
+			varName = strings.TrimSpace(nameNode.Text(e.src))
+		}
 		rawType = CollapseWhitespace(typeNode.Text(e.src))
 		baseType = stripGoReceiverType(rawType)
-		return rawType, baseType
+		return rawType, baseType, varName
 	}
-	return "", ""
+	return "", "", ""
 }
 
 func (e *goExtractor) extractParameters(paramList *gotreesitter.Node) []graph.Param {
@@ -712,6 +724,14 @@ func (e *goExtractor) collectCalls(node *gotreesitter.Node, callerQName string) 
 		return
 	}
 	switch node.Type(e.lang) {
+	case "short_var_declaration", "assignment_statement":
+		if callerQName != e.pkgInitCaller {
+			e.recordGoLocalAssign(node, callerQName)
+		}
+	case "var_declaration":
+		if callerQName != e.pkgInitCaller {
+			e.recordGoLocalVarDecl(node, callerQName)
+		}
 	case "call_expression":
 		e.recordCallExpression(node, callerQName)
 	case "type_conversion_expression":
@@ -725,6 +745,157 @@ func (e *goExtractor) collectCalls(node *gotreesitter.Node, callerQName string) 
 	for i := 0; i < count; i++ {
 		e.collectCalls(node.NamedChild(i), callerQName)
 	}
+}
+
+func (e *goExtractor) recordGoLocalVarDecl(decl *gotreesitter.Node, scopeQName string) {
+	for i := 0; i < decl.NamedChildCount(); i++ {
+		c := decl.NamedChild(i)
+		if c == nil {
+			continue
+		}
+		switch c.Type(e.lang) {
+		case "var_spec":
+			e.recordGoLocalVarSpec(c, scopeQName)
+		case "var_spec_list":
+			for j := 0; j < c.NamedChildCount(); j++ {
+				if sc := c.NamedChild(j); sc != nil && sc.Type(e.lang) == "var_spec" {
+					e.recordGoLocalVarSpec(sc, scopeQName)
+				}
+			}
+		}
+	}
+}
+
+func (e *goExtractor) recordGoLocalVarSpec(spec *gotreesitter.Node, scopeQName string) {
+	names := ChildrenByField(spec, "name", e.lang)
+	if len(names) == 0 {
+		for i := 0; i < spec.NamedChildCount(); i++ {
+			if c := spec.NamedChild(i); c != nil && c.Type(e.lang) == "identifier" {
+				names = append(names, c)
+			}
+		}
+	}
+	var explicitType string
+	if tNode := spec.ChildByFieldName("type", e.lang); tNode != nil {
+		explicitType = CollapseWhitespace(tNode.Text(e.src))
+	}
+	var rhsExprs []*gotreesitter.Node
+	if valNode := spec.ChildByFieldName("value", e.lang); valNode != nil {
+		rhsExprs = collectExprList(valNode, e.lang)
+	}
+	e.emitGoLocalBindings(scopeQName, NodeStartLine(spec), names, explicitType, rhsExprs)
+}
+
+func (e *goExtractor) recordGoLocalAssign(stmt *gotreesitter.Node, scopeQName string) {
+	leftNode := stmt.ChildByFieldName("left", e.lang)
+	rightNode := stmt.ChildByFieldName("right", e.lang)
+	if leftNode == nil || rightNode == nil {
+		return
+	}
+	lhsNodes := collectExprList(leftNode, e.lang)
+	rhsNodes := collectExprList(rightNode, e.lang)
+	e.emitGoLocalBindings(scopeQName, NodeStartLine(stmt), lhsNodes, "", rhsNodes)
+}
+
+func (e *goExtractor) emitGoLocalBindings(scopeQName string, line uint32, lhs []*gotreesitter.Node, explicitType string, rhs []*gotreesitter.Node) {
+	multiReturn := len(lhs) > 1 && len(rhs) == 1
+	for i, lNode := range lhs {
+		if lNode == nil {
+			continue
+		}
+		var name string
+		switch lNode.Type(e.lang) {
+		case "identifier", "selector_expression":
+			name = CollapseWhitespace(lNode.Text(e.src))
+		}
+		if name == "" || name == "_" {
+			continue
+		}
+		lv := parser.ParsedLocalVar{
+			ScopeQName:   scopeQName,
+			Name:         name,
+			ExplicitType: explicitType,
+			Line:         line,
+		}
+		if explicitType == "" && len(rhs) > 0 {
+			var rNode *gotreesitter.Node
+			if multiReturn {
+				rNode = rhs[0]
+				if i <= 255 {
+					lv.ResultIndex = uint8(i)
+				}
+			} else if i < len(rhs) {
+				rNode = rhs[i]
+			}
+			e.populateGoLocalRHS(&lv, rNode)
+		}
+		if lv.ExplicitType != "" || lv.InitCallee != "" || lv.InitAlias != "" {
+			e.out.LocalVars = append(e.out.LocalVars, lv)
+		}
+	}
+}
+
+func (e *goExtractor) populateGoLocalRHS(lv *parser.ParsedLocalVar, rhs *gotreesitter.Node) {
+	if rhs == nil {
+		return
+	}
+	for rhs != nil && rhs.Type(e.lang) == "parenthesized_expression" {
+		rhs = rhs.NamedChild(0)
+	}
+	if rhs == nil {
+		return
+	}
+	switch rhs.Type(e.lang) {
+	case "composite_literal":
+		if t := rhs.ChildByFieldName("type", e.lang); t != nil {
+			lv.ExplicitType = CollapseWhitespace(t.Text(e.src))
+			lv.IsConstructor = true
+		}
+	case "unary_expression":
+		if op := rhs.ChildByFieldName("operand", e.lang); op != nil && op.Type(e.lang) == "composite_literal" {
+			if t := op.ChildByFieldName("type", e.lang); t != nil {
+				lv.ExplicitType = "*" + CollapseWhitespace(t.Text(e.src))
+				lv.IsConstructor = true
+			}
+		}
+	case "call_expression":
+		if fn := rhs.ChildByFieldName("function", e.lang); fn != nil {
+			for fn != nil && fn.Type(e.lang) == "parenthesized_expression" {
+				fn = fn.NamedChild(0)
+			}
+			if fn != nil {
+				switch fn.Type(e.lang) {
+				case "identifier":
+					lv.InitCallee = strings.TrimSpace(fn.Text(e.src))
+				case "selector_expression":
+					if op := fn.ChildByFieldName("operand", e.lang); op != nil {
+						lv.InitReceiver = CollapseWhitespace(op.Text(e.src))
+					}
+					if f := fn.ChildByFieldName("field", e.lang); f != nil {
+						lv.InitCallee = strings.TrimSpace(f.Text(e.src))
+					}
+				}
+			}
+		}
+	case "identifier", "selector_expression":
+		lv.InitAlias = CollapseWhitespace(rhs.Text(e.src))
+	}
+}
+
+func collectExprList(node *gotreesitter.Node, lang *gotreesitter.Language) []*gotreesitter.Node {
+	if node == nil {
+		return nil
+	}
+	if node.Type(lang) != "expression_list" {
+		return []*gotreesitter.Node{node}
+	}
+	out := make([]*gotreesitter.Node, 0, node.NamedChildCount())
+	for i := 0; i < node.NamedChildCount(); i++ {
+		if c := node.NamedChild(i); c != nil {
+			out = append(out, c)
+		}
+	}
+	return out
 }
 
 func (e *goExtractor) recordGenericConversionCall(convNode, genericType *gotreesitter.Node, callerQName string) {

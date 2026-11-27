@@ -747,6 +747,10 @@ func (e *javaExtractor) collectCalls(node *gotreesitter.Node, callerQName string
 		return
 	}
 	switch node.Type(e.lang) {
+	case "local_variable_declaration":
+		e.recordJavaLocalVar(node, callerQName)
+	case "assignment_expression":
+		e.recordJavaLocalAssign(node, callerQName)
 	case "method_invocation":
 		e.recordJavaMethodCall(node, callerQName)
 	case "object_creation_expression":
@@ -759,6 +763,91 @@ func (e *javaExtractor) collectCalls(node *gotreesitter.Node, callerQName string
 	count := node.NamedChildCount()
 	for i := 0; i < count; i++ {
 		e.collectCalls(node.NamedChild(i), callerQName)
+	}
+}
+
+func (e *javaExtractor) recordJavaLocalVar(decl *gotreesitter.Node, scopeQName string) {
+	var typeStr string
+	if tNode := decl.ChildByFieldName("type", e.lang); tNode != nil {
+		t := CollapseWhitespace(tNode.Text(e.src))
+		if t != "var" {
+			typeStr = t
+		}
+	}
+	for i := 0; i < decl.NamedChildCount(); i++ {
+		vd := decl.NamedChild(i)
+		if vd == nil || vd.Type(e.lang) != "variable_declarator" {
+			continue
+		}
+		nameNode := vd.ChildByFieldName("name", e.lang)
+		if nameNode == nil {
+			continue
+		}
+		name := strings.TrimSpace(nameNode.Text(e.src))
+		if name == "" {
+			continue
+		}
+		lv := parser.ParsedLocalVar{
+			ScopeQName:   scopeQName,
+			Name:         name,
+			ExplicitType: typeStr,
+			Line:         NodeStartLine(decl),
+		}
+		if val := vd.ChildByFieldName("value", e.lang); val != nil {
+			e.populateJavaRHS(&lv, val)
+		}
+		if lv.ExplicitType != "" || lv.InitCallee != "" || lv.InitAlias != "" {
+			e.out.LocalVars = append(e.out.LocalVars, lv)
+		}
+	}
+}
+
+func (e *javaExtractor) recordJavaLocalAssign(expr *gotreesitter.Node, scopeQName string) {
+	left := expr.ChildByFieldName("left", e.lang)
+	right := expr.ChildByFieldName("right", e.lang)
+	if left == nil || right == nil {
+		return
+	}
+	var name string
+	switch left.Type(e.lang) {
+	case "identifier", "field_access":
+		name = CollapseWhitespace(left.Text(e.src))
+	default:
+		return
+	}
+	if name == "" {
+		return
+	}
+	lv := parser.ParsedLocalVar{
+		ScopeQName: scopeQName,
+		Name:       name,
+		Line:       NodeStartLine(expr),
+	}
+	e.populateJavaRHS(&lv, right)
+	if lv.ExplicitType != "" || lv.InitCallee != "" || lv.InitAlias != "" {
+		e.out.LocalVars = append(e.out.LocalVars, lv)
+	}
+}
+
+func (e *javaExtractor) populateJavaRHS(lv *parser.ParsedLocalVar, rhs *gotreesitter.Node) {
+	if rhs == nil {
+		return
+	}
+	switch rhs.Type(e.lang) {
+	case "object_creation_expression":
+		if t := rhs.ChildByFieldName("type", e.lang); t != nil {
+			lv.InitCallee = stripJavaGenerics(t.Text(e.src))
+			lv.IsConstructor = true
+		}
+	case "method_invocation":
+		if obj := rhs.ChildByFieldName("object", e.lang); obj != nil {
+			lv.InitReceiver = CollapseWhitespace(obj.Text(e.src))
+		}
+		if nm := rhs.ChildByFieldName("name", e.lang); nm != nil {
+			lv.InitCallee = strings.TrimSpace(nm.Text(e.src))
+		}
+	case "identifier", "field_access":
+		lv.InitAlias = CollapseWhitespace(rhs.Text(e.src))
 	}
 }
 
