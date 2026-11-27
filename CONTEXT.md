@@ -1435,13 +1435,11 @@ d:\gographctx\gographctx\
 **Goal:** Wire all stages into a single pipeline: discover → parse → build → resolve → serialize.
 **Deliverables:**
 - `internal/pipeline/pipeline.go`:
-  - `IndexRepository(path string, config Config) → (*Graph, error)`
-  - Orchestrate all stages in order
-  - Report timing per stage (like CGC's summary table)
-  - Error handling: continue on individual file errors, report at end
-  - Support `--force` (re-index everything) and smart mode (skip unchanged files via mtime+size)
-- End-to-end tests: index a test fixture project, verify graph correctness
-- Performance benchmark: index test fixture, measure time and memory
+  - `IndexRepository(ctx, repoPath, cfg, opts) (*IndexResult, error)` orchestrating discover -> load/diff manifest -> parallel parse -> skeleton build -> parallel resolve -> finalize -> persist (`.ggctx/index.ggctx` + `manifest.json`)
+  - `DefaultParserRegistry` & `DefaultResolverRegistry` wiring all 7 parser/resolver registrations (`go`, `python`, `typescript`, `tsx`, `javascript`, `rust`, `java`)
+  - `StageTimings` & `IndexResult.FormatSummary()` reporting stage timings, counts, and resilient per-file error collection
+  - `IndexOptions.Force` (`--force`) and smart incremental skip mode reusing unchanged files via `size` + `modTimeUnixNano` + language manifest checks
+- Tests: `internal/pipeline/pipeline_test.go` (`TestIndexRepositoryEndToEndAndSmartMode`, `BenchmarkIndexRepository`) verifying multi-language persistence round-trip, smart skip, delta re-index, and `--force`
 **Exit criteria:** Successfully index a multi-language project end-to-end, producing a correct .ggctx file
 
 #### Phase 23: Incremental Indexing Engine
