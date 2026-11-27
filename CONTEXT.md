@@ -1424,13 +1424,11 @@ d:\gographctx\gographctx\
 **Goal:** Construct the graph from parsed results.
 **Deliverables:**
 - `internal/pipeline/builder.go`:
-  - Build File and Module nodes from discovered files
-  - Build symbol nodes from ParsedFile results
-  - Build CONTAINS edges (File → symbols)
-  - Build IMPORTS edges from resolved imports
-  - Build all indexes
-  - Deterministic: sorted input → sorted output
-- Tests: build graph from parse results, verify all nodes and edges present, determinism test
+  - `BuildSymbolFragment`: deterministic `KindFile`, `KindModule` (`mod:<path>`), class/struct/interface/enum, function/method, property/field, variable, and type-alias nodes with `EdgeContains`
+  - `BuildResolvedFragment`: coalesced `EdgeCalls` / `EdgeLikelyCalls`, internal & external (`KindExternal`) `EdgeImports`, `EdgeInherits` / `EdgeImplements` / `EdgeDecoratedBy`, and `graph.CallSite` records
+  - `BuildGraph`: deterministic two-pass construction (structural skeleton merge + read-view-backed resolved replacement) with canonical node/edge/site ordering
+- `internal/pipeline/discover.go`: track every visited directory's canonical path in `visitedDirs` when `FollowSymlinks` is true
+- Tests: `internal/pipeline/builder_test.go` (`TestBuildGraphNodesEdgesIndexesAndDeterminism` verifying nodes, edges, call sites, rev-deps, and byte-identical snapshot determinism)
 **Exit criteria:** Graph correctly represents all parsed symbols and relationships
 
 #### Phase 22: Full Indexing Pipeline
