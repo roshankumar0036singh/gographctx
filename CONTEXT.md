@@ -1414,12 +1414,10 @@ d:\gographctx\gographctx\
 **Goal:** Implement the discovery stage of the indexing pipeline.
 **Deliverables:**
 - `internal/pipeline/discover.go`:
-  - Walk file tree with `filepath.WalkDir`
-  - Apply `.ggctxignore` patterns
-  - Detect language by file extension
-  - Group files by language
-  - Report: total files found, files per language, files ignored
-- Tests: discovery on various directory structures, ignore pattern application, symlink handling
+  - `DiscoverFiles` recursive directory traversal with nested `.gitignore` / `.ggctxignore` inheritance (`ChildFromFile`) and `FollowSymlinks` cycle protection
+  - `DetectLanguage` extension detection using `*parser.Registry` with standard extension fallback and `cfg.Languages` allow-list filtering
+  - Deterministic grouping (`Files`, `FilesByLang`) and `DiscoveryStats` (`TotalScanned`, `MatchedFiles`, `IgnoredFiles`, `IgnoredDirs`, `UnsupportedFiles`, `SymlinksSkipped`, `CountByLang`, `Duration`)
+- Tests: `internal/pipeline/discover_test.go` (`TestDiscoverFilesMixedLanguagesIgnoresAndDeterminism`, `TestDiscoverFilesSymlinkHandling`)
 **Exit criteria:** Correctly discover and filter files in a mixed-language project
 
 #### Phase 21: Graph Builder
