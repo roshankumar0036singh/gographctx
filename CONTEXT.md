@@ -1258,13 +1258,13 @@ d:\gographctx\gographctx\
 **Goal:** Implement full Python language parser.
 **Deliverables:**
 - `internal/parser/lang/python.go`:
-  - Extract: functions (name, params, type hints, decorators, docstring, complexity), classes (bases, metaclass, methods)
-  - Extract: imports (`import x`, `from x import y`, `from . import z`, `import x as y`)
-  - Extract: call sites (function calls, method calls, chained calls)
-  - Extract: variables (module-level, class-level, with type annotations)
-  - Handle: nested functions, closures, `__init__.py` module markers
-  - Synthetic `<module>` scope for module-level calls
-- Tests: golden tests covering decorators, type hints, nested classes, relative imports, comprehensions
+  - Extract: functions (name, params including defaults/`*args`/`**kwargs`, type hints, decorators, async defs, docstring, per-function complexity), classes (bases, metaclass metadata, class fields, methods)
+  - Extract: imports (`import x`, `import x as y`, `from __future__ import ...`, `from x import y`, `from x import y as z`, `from . import z`, `from mod import *`)
+  - Extract: call sites (function calls, attribute/method calls, chained calls, decorator calls, generator/comprehension calls, dynamic calls)
+  - Extract: variables (module-level and annotation-only vars, tuple unpacking, `ALL_CAPS` constants, class-level attributes as `ParsedField`s) and PEP 695 `type` aliases
+  - Handle: nested functions, closures, nested classes, `__init__.py` / `__init__.pyi` package module scope markers
+  - Synthetic `<module>` scope (`<scope>::<module>`) for module-level calls
+- Tests: golden tests with Flask-style module & `__init__.py` fixtures (`internal/parser/lang/testdata/`) covering decorators, type hints, nested classes, relative imports, comprehensions, match/case, error recovery, and concurrency
 **Exit criteria:** Correctly extracts all symbols from a complex Python file (Flask-style)
 
 #### Phase 9: TypeScript & JavaScript Parsers
