@@ -739,6 +739,9 @@ func (e *javaExtractor) extractModifiers(node *gotreesitter.Node) (decorators []
 	return decorators, flags
 }
 
+// collectCalls walks method/constructor bodies recursively. Calls inside
+// lambda expressions and anonymous class bodies intentionally roll into the
+// enclosing callerQName so inline callbacks connect directly in the call graph.
 func (e *javaExtractor) collectCalls(node *gotreesitter.Node, callerQName string) {
 	if node == nil {
 		return
@@ -824,10 +827,25 @@ func (e *javaExtractor) recordJavaExplicitCtorCall(node *gotreesitter.Node, call
 }
 
 func (e *javaExtractor) recordJavaMethodRef(node *gotreesitter.Node, callerQName string) {
-	if node.NamedChildCount() < 2 {
+	if node.NamedChildCount() == 0 {
 		return
 	}
 	recv := CollapseWhitespace(node.NamedChild(0).Text(e.src))
+	if node.NamedChildCount() == 1 && hasJavaToken(node, e.lang, e.src, "new") {
+		e.out.Calls = append(e.out.Calls, parser.ParsedCall{
+			CallerQName:   callerQName,
+			CalleeName:    "new",
+			ReceiverName:  recv,
+			Line:          NodeStartLine(node),
+			Col:           NodeStartCol(node),
+			IsMethodCall:  recv != "",
+			IsConstructor: true,
+		})
+		return
+	}
+	if node.NamedChildCount() < 2 {
+		return
+	}
 	callee := strings.TrimSpace(node.NamedChild(node.NamedChildCount() - 1).Text(e.src))
 	if callee == "" {
 		return
