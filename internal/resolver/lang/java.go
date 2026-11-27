@@ -987,3 +987,75 @@ func isJavaStdReceiver(recv string, b *javaBindings) bool {
 	}
 	return strings.HasPrefix(recv, "System.")
 }
+
+// ResolveLinks resolves Java class/interface inheritance (extends -> INHERITS),
+// interface implementations (implements -> IMPLEMENTS), and annotations (DECORATED_BY).
+func (r *JavaResolver) ResolveLinks(ctx context.Context, file *parser.ParsedFile, rc *resolver.ResolutionContext, imports []resolver.ResolvedImport) ([]resolver.ResolvedLink, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if file == nil {
+		return nil, nil
+	}
+	if rc == nil {
+		rc = &resolver.ResolutionContext{}
+	}
+
+	pkgScope := javaPackageScope(file)
+	bindings := buildJavaBindings(file, imports, rc)
+	localClassByName := make(map[string]parser.ParsedClass, len(file.Classes))
+	for _, cls := range file.Classes {
+		localClassByName[cls.Name] = cls
+	}
+
+	resolveJavaTier := func(targetPkg string, targetName string) graph.ResolutionTier {
+		if targetPkg == pkgScope {
+			if _, isLocal := localClassByName[targetName]; isLocal {
+				return resolver.TierLocal
+			}
+			return resolver.TierSamePackage
+		}
+		return resolver.TierQualifiedImport
+	}
+
+	var links []resolver.ResolvedLink
+	for _, cls := range file.Classes {
+		srcUID := ResolveClassOrSymbolUID(rc, cls.EffectiveKind(), cls.QName)
+		for _, base := range cls.Bases {
+			if targetNode, targetPkg, ok := resolveJavaClassNode(rc, bindings, pkgScope, base, localClassByName); ok {
+				links = append(links, MakeResolvedLink(srcUID, cls.QName, targetNode, graph.EdgeInherits, resolveJavaTier(targetPkg, targetNode.Name), cls.StartLine, "extends: "+base))
+			}
+		}
+		for _, iface := range cls.Implements {
+			if targetNode, targetPkg, ok := resolveJavaClassNode(rc, bindings, pkgScope, iface, localClassByName); ok {
+				links = append(links, MakeResolvedLink(srcUID, cls.QName, targetNode, graph.EdgeImplements, resolveJavaTier(targetPkg, targetNode.Name), cls.StartLine, "implements: "+iface))
+			}
+		}
+		for _, dec := range cls.Decorators {
+			if annName := NormalizeDecoratorTarget(dec); annName != "" {
+				if targetNode, targetPkg, ok := resolveJavaClassNode(rc, bindings, pkgScope, annName, localClassByName); ok {
+					links = append(links, MakeResolvedLink(srcUID, cls.QName, targetNode, graph.EdgeDecoratedBy, resolveJavaTier(targetPkg, targetNode.Name), cls.StartLine, "annotation: "+dec))
+				}
+			}
+		}
+	}
+
+	for _, fn := range file.Functions {
+		if len(fn.Decorators) == 0 {
+			continue
+		}
+		srcUID := ResolveCallerUID(rc, fn.QName, fn.StartLine)
+		for _, dec := range fn.Decorators {
+			if annName := NormalizeDecoratorTarget(dec); annName != "" {
+				if targetNode, targetPkg, ok := resolveJavaClassNode(rc, bindings, pkgScope, annName, localClassByName); ok {
+					links = append(links, MakeResolvedLink(srcUID, fn.QName, targetNode, graph.EdgeDecoratedBy, resolveJavaTier(targetPkg, targetNode.Name), fn.StartLine, "annotation: "+dec))
+				}
+			}
+		}
+	}
+
+	return DedupeResolvedLinks(links), nil
+}

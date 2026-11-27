@@ -70,7 +70,42 @@ type ResolvedImport struct {
 	IsExternal    bool     `json:"is_external,omitempty"`
 }
 
-// FileResolution aggregates imports, inferred types, and call outcomes for one file.
+// ResolvedLink represents a resolved inheritance, interface/trait implementation,
+// or decorator/annotation relationship between two indexed graph symbols.
+type ResolvedLink struct {
+	SourceUID   graph.UID            `json:"source_uid"`
+	SourceQName string               `json:"source_qname"`
+	TargetUID   graph.UID            `json:"target_uid"`
+	TargetQName string               `json:"target_qname"`
+	Kind        graph.EdgeKind       `json:"kind"`
+	Tier        graph.ResolutionTier `json:"tier"`
+	Line        uint32               `json:"line,omitempty"`
+	Method      string               `json:"method,omitempty"`
+}
+
+// Validate enforces structural invariants for a ResolvedLink before Edge emission.
+func (l ResolvedLink) Validate() error {
+	if l.SourceUID.IsZero() {
+		return fmt.Errorf("%w: resolved link missing source UID", ErrInvalidResolver)
+	}
+	if l.TargetUID.IsZero() {
+		return fmt.Errorf("%w: resolved link missing target UID", ErrInvalidResolver)
+	}
+	if l.SourceUID == l.TargetUID {
+		return fmt.Errorf("%w: self-referential link %s", ErrInvalidResolver, l.SourceQName)
+	}
+	switch l.Kind {
+	case graph.EdgeInherits, graph.EdgeImplements, graph.EdgeDecoratedBy:
+	default:
+		return fmt.Errorf("%w: invalid link kind %s", ErrInvalidResolver, l.Kind)
+	}
+	if !l.Tier.IsValid() || l.Tier < TierStructural || l.Tier > TierTypeNarrowed {
+		return fmt.Errorf("%w: invalid link tier %d", ErrInvalidResolver, l.Tier)
+	}
+	return nil
+}
+
+// FileResolution aggregates imports, inferred types, call outcomes, and semantic links for one file.
 type FileResolution struct {
 	Path       string              `json:"path"`
 	Language   string              `json:"language"`
@@ -78,6 +113,7 @@ type FileResolution struct {
 	Types      map[string]TypeInfo `json:"types,omitempty"`
 	Resolved   []ResolvedCall      `json:"resolved,omitempty"`
 	Unresolved []UnresolvedCall    `json:"unresolved,omitempty"`
+	Links      []ResolvedLink      `json:"links,omitempty"`
 }
 
 // ResolutionContext supplies read-only access to the indexed symbol graph and
@@ -152,6 +188,12 @@ type LanguageResolver interface {
 	ResolveImports(ctx context.Context, file *parser.ParsedFile, rc *ResolutionContext) ([]ResolvedImport, error)
 	InferTypes(ctx context.Context, file *parser.ParsedFile, rc *ResolutionContext) (map[string]TypeInfo, error)
 	ResolveCalls(ctx context.Context, file *parser.ParsedFile, rc *ResolutionContext, imports []ResolvedImport, types map[string]TypeInfo) ([]ResolvedCall, []UnresolvedCall, error)
+}
+
+// LinkResolver is an optional extension interface for LanguageResolver that resolves
+// semantic relationships: INHERITS, IMPLEMENTS, and DECORATED_BY edges.
+type LinkResolver interface {
+	ResolveLinks(ctx context.Context, file *parser.ParsedFile, rc *ResolutionContext, imports []ResolvedImport) ([]ResolvedLink, error)
 }
 
 // Registry stores registered LanguageResolver implementations keyed by canonical language.
@@ -264,6 +306,14 @@ func (r *Registry) ResolveFile(ctx context.Context, file *parser.ParsedFile, rc 
 		return nil, err
 	}
 
+	var links []ResolvedLink
+	if linkRes, ok := lr.(LinkResolver); ok {
+		links, err = linkRes.ResolveLinks(ctx, file, rc, imports)
+		if err != nil {
+			return nil, err
+		}
+	}
+
 	return &FileResolution{
 		Path:       file.Path,
 		Language:   parser.NormalizeLanguage(file.Language),
@@ -271,5 +321,6 @@ func (r *Registry) ResolveFile(ctx context.Context, file *parser.ParsedFile, rc 
 		Types:      types,
 		Resolved:   resolved,
 		Unresolved: unresolved,
+		Links:      links,
 	}, nil
 }
