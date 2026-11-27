@@ -1287,11 +1287,11 @@ d:\gographctx\gographctx\
 **Goal:** Implement Rust language parser.
 **Deliverables:**
 - `internal/parser/lang/rust.go`:
-  - Extract: functions, methods, structs, enums, traits, impl blocks, type aliases
-  - Extract: `use` statements, `mod` declarations, `pub use` re-exports
-  - Extract: call sites (function calls, method calls, associated functions, macro invocations)
-  - Handle: trait implementations, generic types, lifetimes (ignore for resolution), closures
-- Tests: golden tests covering modules, traits, impls, associated functions
+  - `RustParser` (`RegisterRust`, `.rs`) extracting functions (`async fn`, complexity), methods (`&self`/`&mut self`/`self`), associated functions (`new` constructor), structs, enums, traits (supertraits + `rust:trait_method`), inherent/trait `impl` blocks, `const`/`static`, and `type` aliases
+  - Extract: `use` trees (scoped lists, aliases, wildcards, `crate::`/`self::`/`super::` relative imports), inline & external `mod` declarations, and `pub use` re-exports
+  - Extract: call sites (function calls, field/method calls, turbofish/scoped associated functions, `!` macro invocations, closures)
+  - Handle: trait implementation attribution (`Implements` + `rust:impl_trait:<Trait>`), generic types, lifetimes stripped for resolution, `///` doc comments, and `#[...]` attributes
+- Tests: golden tests (`rust_test.go`, `testdata/rust_crate_sample.rs`) covering modules, traits, impls, associated functions, macros, error recovery, and concurrency
 **Exit criteria:** Correctly parse a multi-module Rust crate
 
 #### Phase 11: Java Parser
