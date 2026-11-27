@@ -1298,11 +1298,11 @@ d:\gographctx\gographctx\
 **Goal:** Implement Java language parser.
 **Deliverables:**
 - `internal/parser/lang/java.go`:
-  - Extract: classes, interfaces, enums, records, annotations, methods, constructors
-  - Extract: imports, package declaration
-  - Extract: call sites (method calls, static calls, constructor calls, chained calls)
-  - Handle: inner classes, anonymous classes, lambda expressions, generics
-- Tests: golden tests covering inheritance, generics, annotations, inner classes
+  - `JavaParser` (`RegisterJava`, `.java`) extracting classes, interfaces (`java:interface_method`), enums (`KindEnum`), records (`java:record`), annotation types (`java:annotation`), methods, constructors, varargs (`spread_parameter`), annotations, fields, and cyclomatic complexity
+  - Extract: imports (regular, static, wildcard), package declaration (`com.example.*`)
+  - Extract: call sites (method calls, static/receiver calls, constructor `new` calls, `this()`/`super()`, chained calls, method references `::`)
+  - Handle: inner classes (`Outer::Inner`), anonymous classes, lambda expressions, generics
+- Tests: golden tests (`java_test.go`, `testdata/OrderService.java`) covering inheritance, generics, records, enums, annotations, inner/anonymous classes, lambdas, error recovery, and concurrency
 **Exit criteria:** Correctly parse a typical Java project structure
 
 #### Phase 12: Parallel Parse Orchestration
