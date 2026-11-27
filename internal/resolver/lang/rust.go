@@ -454,7 +454,7 @@ func (r *RustResolver) resolveOneCall(
 	}
 
 	// Tier 4: Value method call via inferred receiver type (`svc.fetch()`, `self.repo.load()`).
-	if recvType, ok := lookupPythonReceiverType(call.CallerQName, enclosingPkg+"::"+enclosingType, recv, types, localClassByQName); ok {
+	if recvType, ok := LookupScopedReceiverType(rc, call.CallerQName, enclosingPkg+"::"+enclosingType, recv, types, localClassByQName); ok {
 		typeName := stripRustWrapperType(recvType.Name)
 		targetPkg := recvType.Package
 		if targetPkg == "" && recvType.QName != "" {

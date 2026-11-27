@@ -276,7 +276,7 @@ func (r *JavaResolver) resolveOneCall(
 	localClassByQName map[string]parser.ParsedClass,
 	types map[string]resolver.TypeInfo,
 ) (*resolver.ResolvedCall, *resolver.UnresolvedCall) {
-	enclosingClass := findEnclosingPythonClass(call.CallerQName, localClassByQName, rc)
+	enclosingClass := FindEnclosingClass(call.CallerQName, localClassByQName, rc)
 
 	// 1. Constructor instantiation: `new Foo(...)`, `new Outer.Inner(...)`, or `Foo::new`.
 	if call.IsConstructor {
@@ -412,7 +412,7 @@ func (r *JavaResolver) resolveOneCall(
 	}
 
 	// Tier 4: Instance method call via inferred receiver type (`repo.load()`, `this.repo.save()`).
-	if recvType, ok := lookupJavaReceiverType(call.CallerQName, enclosingClass.QName, recv, types, localClassByQName); ok {
+	if recvType, ok := LookupScopedReceiverType(rc, call.CallerQName, enclosingClass.QName, recv, types, localClassByQName); ok {
 		typeName := resolver.StripTypeDecorations(recvType.Name)
 		targetPkg := recvType.Package
 		if targetPkg == "" && recvType.QName != "" {
@@ -831,14 +831,6 @@ func collectJavaEnclosingHierarchy(inner parser.ParsedClass, localClassByQName m
 		cur = parentQName
 	}
 	return out
-}
-
-func lookupJavaReceiverType(
-	callerQName, enclosingClsQName, recv string,
-	types map[string]resolver.TypeInfo,
-	localClassByQName map[string]parser.ParsedClass,
-) (resolver.TypeInfo, bool) {
-	return lookupPythonReceiverType(callerQName, enclosingClsQName, recv, types, localClassByQName)
 }
 
 func resolveJavaStaticOrInnerTarget(rc *resolver.ResolutionContext, dotPath string) (pkg, clsQName, targetFile string, ok bool) {

@@ -2,10 +2,12 @@ package lang
 
 import (
 	"bufio"
+	"cmp"
 	"context"
 	"os"
 	"path"
 	"path/filepath"
+	"slices"
 	"strings"
 	"unicode"
 	"unicode/utf8"
@@ -53,7 +55,7 @@ func ParseGoMod(repoRoot string) (GoModInfo, error) {
 				inReplaceBlock = false
 				continue
 			}
-			parseGoModReplaceLine(line, info.Replaces)
+			parseGoModReplaceLine(line, repoRoot, info.Replaces)
 			continue
 		}
 		switch {
@@ -64,7 +66,7 @@ func ParseGoMod(repoRoot string) (GoModInfo, error) {
 		case line == "replace (" || strings.HasPrefix(line, "replace("):
 			inReplaceBlock = true
 		case strings.HasPrefix(line, "replace "):
-			parseGoModReplaceLine(strings.TrimPrefix(line, "replace "), info.Replaces)
+			parseGoModReplaceLine(strings.TrimPrefix(line, "replace "), repoRoot, info.Replaces)
 		}
 	}
 	return info, sc.Err()
@@ -77,7 +79,7 @@ func stripGoLineComment(s string) string {
 	return s
 }
 
-func parseGoModReplaceLine(line string, out map[string]string) {
+func parseGoModReplaceLine(line, repoRoot string, out map[string]string) {
 	parts := strings.SplitN(line, "=>", 2)
 	if len(parts) != 2 {
 		return
@@ -88,9 +90,16 @@ func parseGoModReplaceLine(line string, out map[string]string) {
 		return
 	}
 	oldMod := leftFields[0]
-	target := filepath.ToSlash(filepath.Clean(rightFields[0]))
-	if strings.HasPrefix(rightFields[0], "./") || strings.HasPrefix(rightFields[0], "../") || strings.HasPrefix(target, ".") {
+	rawTarget := rightFields[0]
+	target := filepath.ToSlash(filepath.Clean(rawTarget))
+	if strings.HasPrefix(rawTarget, "./") || strings.HasPrefix(rawTarget, "../") || strings.HasPrefix(target, ".") {
 		out[oldMod] = strings.TrimPrefix(target, "./")
+		return
+	}
+	if repoRoot != "" && !filepath.IsAbs(rawTarget) {
+		if st, err := os.Stat(filepath.Join(repoRoot, filepath.FromSlash(target))); err == nil && st.IsDir() {
+			out[oldMod] = strings.TrimPrefix(target, "./")
+		}
 	}
 }
 
@@ -629,8 +638,10 @@ func lookupGoReceiverType(
 				continue
 			}
 		}
-		// Check embedded struct promotion in rc.View or localClassByName.
-		_ = rc
+		if next, matched := lookupCrossFileFieldType(rc, cur, fieldName); matched {
+			cur = next
+			continue
+		}
 		return resolver.TypeInfo{}, false
 	}
 	return cur, true
@@ -852,11 +863,18 @@ func DetectInterfaceSatisfaction(view *graph.ReadView) []InterfaceSatisfaction {
 		if len(reqMethods) == 0 {
 			continue
 		}
+		reqNames := make([]string, 0, len(reqMethods))
+		for mName := range reqMethods {
+			reqNames = append(reqNames, mName)
+		}
+		slices.Sort(reqNames)
+
 		for _, st := range structs {
 			stMethods := collectStructMethods(st)
 			var matched []string
 			satisfied := true
-			for mName, reqFn := range reqMethods {
+			for _, mName := range reqNames {
+				reqFn := reqMethods[mName]
 				implFn, ok := stMethods[mName]
 				if !ok || !goInterfaceMethodMatch(implFn, reqFn) {
 					satisfied = false
@@ -875,6 +893,12 @@ func DetectInterfaceSatisfaction(view *graph.ReadView) []InterfaceSatisfaction {
 			}
 		}
 	}
+	slices.SortFunc(results, func(a, b InterfaceSatisfaction) int {
+		if c := cmp.Compare(a.StructQName, b.StructQName); c != 0 {
+			return c
+		}
+		return cmp.Compare(a.InterfaceQName, b.InterfaceQName)
+	})
 	return results
 }
 

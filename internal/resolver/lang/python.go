@@ -319,7 +319,7 @@ func (r *PythonResolver) resolveOneCall(
 	localClassesByQName map[string]parser.ParsedClass,
 	types map[string]resolver.TypeInfo,
 ) (*resolver.ResolvedCall, *resolver.UnresolvedCall) {
-	enclosingClass := findEnclosingPythonClass(call.CallerQName, localClassesByQName, rc)
+	enclosingClass := FindEnclosingClass(call.CallerQName, localClassesByQName, rc)
 
 	// 1. Direct / unqualified call: foo(...) or ClassName(...)
 	if !call.IsMethodCall || call.ReceiverName == "" {
@@ -461,7 +461,7 @@ func (r *PythonResolver) resolveOneCall(
 	}
 
 	// Tier 4: Receiver type inference (`self.repo.load()`, `svc.fetch()`, `client.save()`)
-	if recvType, ok := lookupPythonReceiverType(call.CallerQName, enclosingClass.QName, recv, types, localClassesByName); ok {
+	if recvType, ok := LookupScopedReceiverType(rc, call.CallerQName, enclosingClass.QName, recv, types, localClassesByQName); ok {
 		typeName := resolver.StripTypeDecorations(recvType.Name)
 		targetPkg := recvType.Package
 		if targetPkg == "" && recvType.QName != "" {
@@ -634,7 +634,7 @@ func buildPythonBindings(file *parser.ParsedFile, resolved []resolver.ResolvedIm
 					continue
 				}
 			}
-			if hasPythonModule(rc, targetMod) && isExt && !isExt {
+			if isExt && hasPythonModule(rc, targetMod) {
 				isExt = false
 			}
 			b.Symbols[localName] = append(b.Symbols[localName], pySymbolBinding{
@@ -950,18 +950,19 @@ func resolvePythonMethodOnHierarchy(
 	if className == "" || methodName == "" {
 		return graph.Node{}, "", false
 	}
+	// Traverse bases left-to-right depth-first (matching Python's base resolution order
+	// for mixins and inheritance chains) while tracking visited classes to prevent cycles.
 	type item struct {
-		pkg  string
-		cls  string
-		via  string
-		step int
+		pkg string
+		cls string
+		via string
 	}
 	visited := make(map[string]struct{})
-	queue := []item{{pkg: pkgScope, cls: className}}
+	stack := []item{{pkg: pkgScope, cls: className}}
 
-	for len(queue) > 0 {
-		cur := queue[0]
-		queue = queue[1:]
+	for len(stack) > 0 {
+		cur := stack[len(stack)-1]
+		stack = stack[:len(stack)-1]
 
 		key := cur.pkg + "::" + cur.cls
 		if _, seen := visited[key]; seen {
@@ -976,8 +977,9 @@ func resolvePythonMethodOnHierarchy(
 			}
 		}
 
-		for _, base := range lookupPythonBases(rc, cur.pkg, cur.cls, localClassesByName) {
-			basePkg, baseName := resolvePythonBaseRef(rc, cur.pkg, base, localClassesByName, bindings, fallbackMod)
+		bases := lookupPythonBases(rc, cur.pkg, cur.cls, localClassesByName)
+		for i := len(bases) - 1; i >= 0; i-- {
+			basePkg, baseName := resolvePythonBaseRef(rc, cur.pkg, bases[i], localClassesByName, bindings, fallbackMod)
 			if baseName == "" {
 				continue
 			}
@@ -985,7 +987,7 @@ func resolvePythonMethodOnHierarchy(
 			if cur.via != "" {
 				via = cur.via + " -> " + baseName
 			}
-			queue = append(queue, item{pkg: basePkg, cls: baseName, via: via, step: cur.step + 1})
+			stack = append(stack, item{pkg: basePkg, cls: baseName, via: via})
 		}
 	}
 
@@ -1047,102 +1049,6 @@ func resolvePythonBaseRef(
 		}
 	}
 	return curPkg, clean
-}
-
-func lookupPythonReceiverType(
-	callerQName, enclosingClsQName, recv string,
-	types map[string]resolver.TypeInfo,
-	localClassesByQName map[string]parser.ParsedClass,
-) (resolver.TypeInfo, bool) {
-	if info, ok := resolver.LookupFlat(types, callerQName, recv); ok {
-		return info, true
-	}
-	if enclosingClsQName != "" {
-		if info, ok := resolver.LookupFlat(types, enclosingClsQName, recv); ok {
-			return info, true
-		}
-	}
-
-	parts := strings.Split(recv, ".")
-	if len(parts) < 2 {
-		return resolver.TypeInfo{}, false
-	}
-
-	// Handle `self.attr` / `cls.attr` first via direct lookup, then walk dotted chain.
-	startIdx := 1
-	var cur resolver.TypeInfo
-	var ok bool
-
-	if parts[0] == "self" || parts[0] == "cls" {
-		twoPart := parts[0] + "." + strings.TrimSpace(parts[1])
-		if cur, ok = resolver.LookupFlat(types, callerQName, twoPart); ok {
-			startIdx = 2
-		} else if enclosingClsQName != "" {
-			if cur, ok = resolver.LookupFlat(types, enclosingClsQName, strings.TrimSpace(parts[1])); ok {
-				startIdx = 2
-			}
-		}
-	}
-	if !ok {
-		cur, ok = resolver.LookupFlat(types, callerQName, strings.TrimSpace(parts[0]))
-		if !ok {
-			return resolver.TypeInfo{}, false
-		}
-	}
-
-	for _, seg := range parts[startIdx:] {
-		fieldName := strings.TrimSpace(seg)
-		if fieldName == "" {
-			return resolver.TypeInfo{}, false
-		}
-		if info, found := resolver.LookupFlat(types, cur.QName, fieldName); found {
-			cur = info
-			continue
-		}
-		if info, found := resolver.LookupFlat(types, cur.Name, fieldName); found {
-			cur = info
-			continue
-		}
-		if cls, found := localClassesByQName[cur.QName]; found {
-			matched := false
-			for _, f := range cls.Fields {
-				if f.Name == fieldName && f.Type != "" {
-					cur = resolver.TypeInfo{Name: resolver.StripTypeDecorations(f.Type), Package: cur.Package}
-					matched = true
-					break
-				}
-			}
-			if matched {
-				continue
-			}
-		}
-		return resolver.TypeInfo{}, false
-	}
-
-	return cur, true
-}
-
-func findEnclosingPythonClass(callerQName string, localClassesByQName map[string]parser.ParsedClass, rc *resolver.ResolutionContext) parser.ParsedClass {
-	cur := callerQName
-	for cur != "" {
-		idx := strings.LastIndex(cur, "::")
-		if idx <= 0 {
-			break
-		}
-		parent := cur[:idx]
-		if cls, ok := localClassesByQName[parent]; ok {
-			return cls
-		}
-		if rc != nil && rc.View != nil {
-			for _, n := range rc.View.GetByQName(parent) {
-				if n.Kind == graph.KindClass {
-					return parser.ParsedClass{Name: n.Name, QName: n.QName, Bases: n.Bases}
-				}
-			}
-		}
-		cur = parent
-	}
-	return parser.ParsedClass{}
 }
 
 func pythonModuleContext(file *parser.ParsedFile) (modName, pkgName string, isInit bool) {
