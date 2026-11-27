@@ -173,6 +173,13 @@ func (w *discoveryWalker) walkDir(absDir, relDir string, matcher *config.IgnoreM
 	if err := w.ctx.Err(); err != nil {
 		return err
 	}
+	if w.cfg.FollowSymlinks {
+		canonDir := absDir
+		if resolved, err := filepath.EvalSymlinks(absDir); err == nil {
+			canonDir = resolved
+		}
+		w.visitedDirs[canonDir] = struct{}{}
+	}
 
 	// Layer nested directory ignore files (.gitignore, then .ggctxignore).
 	curMatcher := matcher
