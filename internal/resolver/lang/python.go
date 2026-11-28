@@ -70,8 +70,8 @@ func (r *PythonResolver) ResolveImports(ctx context.Context, file *parser.Parsed
 			if ri.Alias == "" {
 				ri.Alias = topSegment(imp.Path)
 			}
-			if targetFile, found := findPythonModuleFile(rc, targetMod); found {
-				ri.TargetPackage = targetMod
+			if canonMod, targetFile, found := resolveCanonicalPythonModuleFile(rc, targetMod); found {
+				ri.TargetPackage = canonMod
 				ri.TargetFile = targetFile
 				ri.IsExternal = false
 			} else {
@@ -85,8 +85,8 @@ func (r *PythonResolver) ResolveImports(ctx context.Context, file *parser.Parsed
 		if ri.Alias == "" && len(imp.Names) == 1 && imp.Names[0] != "*" {
 			ri.Alias = imp.Names[0]
 		}
-		if targetFile, found := findPythonModuleFile(rc, targetMod); found {
-			ri.TargetPackage = targetMod
+		if canonMod, targetFile, found := resolveCanonicalPythonModuleFile(rc, targetMod); found {
+			ri.TargetPackage = canonMod
 			ri.TargetFile = targetFile
 			ri.IsExternal = false
 			out = append(out, ri)
@@ -97,8 +97,8 @@ func (r *PythonResolver) ResolveImports(ctx context.Context, file *parser.Parsed
 		// existing at the anchor, check "<targetMod>.<name>".
 		if len(imp.Names) == 1 && imp.Names[0] != "*" && targetMod != "" {
 			subMod := targetMod + "." + imp.Names[0]
-			if targetFile, found := findPythonModuleFile(rc, subMod); found {
-				ri.TargetPackage = subMod
+			if canonMod, targetFile, found := resolveCanonicalPythonModuleFile(rc, subMod); found {
+				ri.TargetPackage = canonMod
 				ri.TargetFile = targetFile
 				ri.IsExternal = false
 				out = append(out, ri)
@@ -193,6 +193,16 @@ func (r *PythonResolver) InferTypes(ctx context.Context, file *parser.ParsedFile
 							pkg = modPkg
 						}
 					} else if recvInfo, ok := tm.LookupReceiver(lv.ScopeQName, lv.InitReceiver); ok {
+						recvPkg := pkgOrDefault(recvInfo.Package, modScope)
+						if target, _, okMethod := resolvePythonMethodOnHierarchy(rc, recvPkg, resolver.StripTypeDecorations(recvInfo.Name), lv.InitCallee, nil, bindings, modScope); okMethod {
+							clsNode, pkg, found = inferTargetReturnOrClass(rc, target)
+						}
+					} else if recvInfo, ok := LookupScopedReceiverType(rc, lv.ScopeQName, "", lv.InitReceiver, tm.ToFlatMap(), nil); ok {
+						recvPkg := pkgOrDefault(recvInfo.Package, modScope)
+						if target, _, okMethod := resolvePythonMethodOnHierarchy(rc, recvPkg, resolver.StripTypeDecorations(recvInfo.Name), lv.InitCallee, nil, bindings, modScope); okMethod {
+							clsNode, pkg, found = inferTargetReturnOrClass(rc, target)
+						}
+					} else if recvInfo, ok := resolvePythonImportedVarType(rc, bindings, lv.InitReceiver, 0); ok {
 						recvPkg := pkgOrDefault(recvInfo.Package, modScope)
 						if target, _, okMethod := resolvePythonMethodOnHierarchy(rc, recvPkg, resolver.StripTypeDecorations(recvInfo.Name), lv.InitCallee, nil, bindings, modScope); okMethod {
 							clsNode, pkg, found = inferTargetReturnOrClass(rc, target)
@@ -295,7 +305,7 @@ func (r *PythonResolver) ResolveCalls(
 	var unresolved []resolver.UnresolvedCall
 
 	for _, call := range file.Calls {
-		callerUID := ResolveCallerUID(rc, call.CallerQName, call.Line)
+		callerUID := ResolveCallerUIDForFile(rc, file, call.CallerQName, call.Line)
 		res, unres := r.resolveOneCall(file, rc, callerUID, call, modScope, bindings, localClassesByName, localClassesByQName, types)
 		if res != nil {
 			resolved = append(resolved, *res)
@@ -346,6 +356,18 @@ func (r *PythonResolver) resolveOneCall(
 		if cls, ok := localClassesByName[call.CalleeName]; ok {
 			if target, okInit := resolvePythonConstructorTarget(rc, modScope, cls.Name, localClassesByName, bindings, modScope); okInit {
 				return makePythonResolvedCall(callerUID, call, target, resolver.TierLocal, "local class constructor: "+target.QName, modScope), nil
+			}
+		}
+
+		// Local callable alias (`fn = helper; fn()`) or instance `__call__` invocation (`obj()`).
+		if target, ok := ResolveCallableAlias(rc, call.CallerQName, call.CalleeName, types); ok {
+			return makePythonResolvedCall(callerUID, call, target, resolver.TierLocal, "local callable alias: "+target.QName, modScope), nil
+		}
+		if recvType, ok := LookupScopedReceiverType(rc, call.CallerQName, enclosingClass.QName, call.CalleeName, types, localClassesByQName); ok && recvType.Name != "" {
+			typeName := resolver.StripTypeDecorations(recvType.Name)
+			targetPkg := pkgOrDefault(recvType.Package, pkgOrDefault(PackageScopePrefix(recvType.QName), modScope))
+			if target, _, found := resolvePythonMethodOnHierarchy(rc, targetPkg, typeName, "__call__", localClassesByName, bindings, modScope); found {
+				return makePythonResolvedCall(callerUID, call, target, resolver.TierReceiverType, "callable instance __call__: "+target.QName, targetPkg), nil
 			}
 		}
 
@@ -461,7 +483,11 @@ func (r *PythonResolver) resolveOneCall(
 	}
 
 	// Tier 4: Receiver type inference (`self.repo.load()`, `svc.fetch()`, `client.save()`)
-	if recvType, ok := LookupScopedReceiverType(rc, call.CallerQName, enclosingClass.QName, recv, types, localClassesByQName); ok {
+	recvType, hasRecvType := LookupScopedReceiverType(rc, call.CallerQName, enclosingClass.QName, recv, types, localClassesByQName)
+	if !hasRecvType {
+		recvType, hasRecvType = resolvePythonImportedVarType(rc, bindings, recv, 0)
+	}
+	if hasRecvType {
 		typeName := resolver.StripTypeDecorations(recvType.Name)
 		targetPkg := recvType.Package
 		if targetPkg == "" && recvType.QName != "" {
@@ -596,9 +622,10 @@ func buildPythonBindings(file *parser.ParsedFile, resolved []resolver.ResolvedIm
 				b.Modules[imp.Path] = pyModuleBinding{TargetModule: targetMod, IsExternal: isExt}
 				first := topSegment(imp.Path)
 				if _, exists := b.Modules[first]; !exists {
+					canonFirst, _, foundFirst := resolveCanonicalPythonModuleFile(rc, first)
 					b.Modules[first] = pyModuleBinding{
-						TargetModule: first,
-						IsExternal:   !hasPythonModule(rc, first),
+						TargetModule: pkgOrDefault(canonFirst, first),
+						IsExternal:   !foundFirst,
 					}
 				}
 			}
@@ -707,6 +734,9 @@ func resolvePythonSymbolOrReexport(rc *resolver.ResolutionContext, modScope, sym
 	if rc == nil || modScope == "" || symName == "" || depth > 5 {
 		return graph.Node{}, "", false
 	}
+	if canon, _, ok := resolveCanonicalPythonModuleFile(rc, modScope); ok {
+		modScope = canon
+	}
 	visitKey := modScope + "::" + symName
 	if _, seen := visited[visitKey]; seen {
 		return graph.Node{}, "", false
@@ -719,10 +749,17 @@ func resolvePythonSymbolOrReexport(rc *resolver.ResolutionContext, modScope, sym
 		if fn, ok, _ := FilterUniqueFunctionMatches(rc.View.GetByQName(qname), false, nil); ok {
 			return fn, modScope, true
 		}
-		// Direct class (prefer __init__ constructor target, fallback to Class node).
+		// Direct class (prefer __init__ constructor target including cross-file base __init__, fallback to Class node).
 		for _, n := range rc.View.GetByQName(qname) {
 			if n.Kind == graph.KindClass {
-				if ctor, okInit := resolvePythonConstructorTarget(rc, modScope, symName, nil, nil, modScope); okInit {
+				var targetBindings *pyBindings
+				for _, fpath := range pythonModuleFiles(rc, modScope) {
+					if pf := rc.LookupFile(fpath); pf != nil {
+						targetBindings = buildPythonBindings(pf, nil, rc)
+						break
+					}
+				}
+				if ctor, okInit := resolvePythonConstructorTarget(rc, modScope, symName, nil, targetBindings, modScope); okInit {
 					return ctor, modScope, true
 				}
 				return n, modScope, true
@@ -833,6 +870,96 @@ func resolvePythonBindingCall(rc *resolver.ResolutionContext, b *pyBindings, mod
 		return targets[0], true
 	}
 	return graph.Node{}, false
+}
+
+// resolvePythonImportedVarType infers the concrete class type of an imported
+// module-level variable (e.g. `from miniapp.views import app` where `app = Flask(...)`).
+func resolvePythonImportedVarType(rc *resolver.ResolutionContext, b *pyBindings, expr string, depth int) (resolver.TypeInfo, bool) {
+	if rc == nil || b == nil || expr == "" || depth > 3 {
+		return resolver.TypeInfo{}, false
+	}
+	parts := splitReceiverChain(expr)
+	if len(parts) == 0 {
+		return resolver.TypeInfo{}, false
+	}
+	root := strings.TrimSpace(parts[0])
+	binds := b.Symbols[root]
+	if len(binds) == 0 {
+		return resolver.TypeInfo{}, false
+	}
+
+	var rootInfo resolver.TypeInfo
+	var matched bool
+	for _, sb := range binds {
+		if sb.IsExternal {
+			continue
+		}
+		targetMod := sb.TargetModule
+		if canon, _, ok := resolveCanonicalPythonModuleFile(rc, targetMod); ok {
+			targetMod = canon
+		}
+		for _, fpath := range pythonModuleFiles(rc, targetMod) {
+			pf := rc.LookupFile(fpath)
+			if pf == nil {
+				continue
+			}
+			for _, lv := range pf.LocalVars {
+				if lv.ScopeQName != "" || lv.Name != sb.OrigName {
+					continue
+				}
+				targetBindings := buildPythonBindings(pf, nil, rc)
+				if lv.ExplicitType != "" {
+					base := resolver.StripTypeDecorations(lv.ExplicitType)
+					if clsNode, pkg, ok := resolvePythonSymbolType(rc, targetBindings, targetMod, base); ok {
+						rootInfo = resolver.TypeInfo{Name: clsNode.Name, QName: clsNode.QName, Package: pkg, Origin: resolver.OriginAssignment, Confidence: 0.90, Line: lv.Line}
+						matched = true
+						break
+					}
+				}
+				if lv.InitCallee != "" {
+					var clsNode graph.Node
+					var pkg string
+					var ok bool
+					if lv.InitReceiver == "" {
+						if target, found := resolvePythonBindingCall(rc, targetBindings, targetMod, lv.InitCallee); found {
+							clsNode, pkg, ok = inferTargetReturnOrClass(rc, target)
+						}
+					} else if recvInfo, found := resolvePythonImportedVarType(rc, targetBindings, lv.InitReceiver, depth+1); found {
+						recvPkg := pkgOrDefault(recvInfo.Package, targetMod)
+						if target, _, okMeth := resolvePythonMethodOnHierarchy(rc, recvPkg, resolver.StripTypeDecorations(recvInfo.Name), lv.InitCallee, nil, targetBindings, targetMod); okMeth {
+							clsNode, pkg, ok = inferTargetReturnOrClass(rc, target)
+						}
+					}
+					if ok && clsNode.Name != "" {
+						rootInfo = resolver.TypeInfo{Name: clsNode.Name, QName: clsNode.QName, Package: pkg, Origin: resolver.OriginConstructor, Confidence: 0.88, Line: lv.Line}
+						matched = true
+						break
+					}
+				}
+				if lv.InitAlias != "" {
+					if aliasInfo, found := resolvePythonImportedVarType(rc, targetBindings, lv.InitAlias, depth+1); found {
+						rootInfo = aliasInfo
+						matched = true
+						break
+					}
+				}
+			}
+			if matched {
+				break
+			}
+		}
+		if matched {
+			break
+		}
+	}
+	if !matched {
+		return resolver.TypeInfo{}, false
+	}
+	if len(parts) == 1 {
+		return rootInfo, true
+	}
+	tmpTypes := map[string]resolver.TypeInfo{root: rootInfo}
+	return LookupScopedReceiverType(rc, "", "", expr, tmpTypes, nil)
 }
 
 func resolvePythonSymbolType(rc *resolver.ResolutionContext, b *pyBindings, modScope, name string) (graph.Node, string, bool) {
@@ -1119,19 +1246,27 @@ func resolvePythonImportModule(curPkg, impPath string, isRel bool) (targetMod st
 	return strings.Join(baseParts, "."), true
 }
 
-func findPythonModuleFile(rc *resolver.ResolutionContext, modName string) (string, bool) {
-	files := pythonModuleFiles(rc, modName)
-	if len(files) == 0 {
-		return "", false
+func resolveCanonicalPythonModuleFile(rc *resolver.ResolutionContext, modName string) (canonMod string, filePath string, ok bool) {
+	for _, cand := range pythonModuleCandidates(modName) {
+		if files := exactPythonModuleFiles(rc, cand); len(files) > 0 {
+			return cand, files[0], true
+		}
 	}
-	return files[0], true
+	return "", "", false
 }
 
 func hasPythonModule(rc *resolver.ResolutionContext, modName string) bool {
 	return len(pythonModuleFiles(rc, modName)) > 0
 }
 
-func pythonModuleFiles(rc *resolver.ResolutionContext, modName string) []string {
+func pythonModuleCandidates(modName string) []string {
+	if modName == "" {
+		return nil
+	}
+	return []string{modName, "src." + modName, "lib." + modName}
+}
+
+func exactPythonModuleFiles(rc *resolver.ResolutionContext, modName string) []string {
 	if rc == nil || modName == "" {
 		return nil
 	}
@@ -1149,6 +1284,15 @@ func pythonModuleFiles(rc *resolver.ResolutionContext, modName string) []string 
 		}
 		if len(matches) > 0 {
 			return matches
+		}
+	}
+	return nil
+}
+
+func pythonModuleFiles(rc *resolver.ResolutionContext, modName string) []string {
+	for _, cand := range pythonModuleCandidates(modName) {
+		if files := exactPythonModuleFiles(rc, cand); len(files) > 0 {
+			return files
 		}
 	}
 	return nil

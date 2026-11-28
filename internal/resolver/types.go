@@ -431,6 +431,32 @@ func inferLocalVarType(
 			aliased.Line = lv.Line
 			return aliased, true
 		}
+		for _, fn := range file.Functions {
+			if fn.Name == lv.InitAlias && !fn.IsMethod {
+				return TypeInfo{
+					Name:          fn.Name,
+					QName:         fn.QName,
+					CallableQName: fn.QName,
+					Package:       file.Package,
+					Origin:        OriginCallable,
+					Confidence:    0.90,
+					Line:          lv.Line,
+				}, true
+			}
+		}
+		if rc != nil {
+			if nodes := rc.LookupByName(lv.InitAlias); len(nodes) == 1 && nodes[0].Kind == graph.KindFunction {
+				return TypeInfo{
+					Name:          nodes[0].Name,
+					QName:         nodes[0].QName,
+					CallableQName: nodes[0].QName,
+					Package:       file.Package,
+					Origin:        OriginCallable,
+					Confidence:    0.85,
+					Line:          lv.Line,
+				}, true
+			}
+		}
 	}
 
 	return TypeInfo{}, false

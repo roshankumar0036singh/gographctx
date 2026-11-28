@@ -191,6 +191,17 @@ func (r *JavaResolver) InferTypes(ctx context.Context, file *parser.ParsedFile, 
 						typeNode, targetPkg, found = resolveJavaClassNode(rc, bindings, ownerPkg, ret, localClassByName)
 					}
 				}
+			} else if recvType, okRecv := LookupScopedReceiverType(rc, lv.ScopeQName, "", lv.InitReceiver, tm.ToFlatMap(), nil); okRecv {
+				// Chained call on inferred/factory receiver: e.g. `Client.builder().build()` or `factory.open().client()`.
+				recvTypeName := resolver.StripTypeDecorations(recvType.Name)
+				recvPkg := pkgOrDefault(recvType.Package, pkgScope)
+				if ownerCls, ownerPkg, okOwner := resolveJavaClassNode(rc, bindings, recvPkg, recvTypeName, localClassByName); okOwner {
+					if meths := findJavaMethodsInHierarchy(rc, ownerPkg, graphNodeToParsedClass(ownerCls), lv.InitCallee, bindings, localClassByName); len(meths) > 0 {
+						if ret := pickJavaFactoryReturnType(meths); ret != "" {
+							typeNode, targetPkg, found = resolveJavaClassNode(rc, bindings, ownerPkg, ret, localClassByName)
+						}
+					}
+				}
 			}
 		}
 
@@ -251,7 +262,7 @@ func (r *JavaResolver) ResolveCalls(
 	var unresolved []resolver.UnresolvedCall
 
 	for _, call := range file.Calls {
-		callerUID := ResolveCallerUID(rc, call.CallerQName, call.Line)
+		callerUID := ResolveCallerUIDForFile(rc, file, call.CallerQName, call.Line)
 		res, unres := r.resolveOneCall(file, rc, callerUID, call, pkgScope, bindings, localClassByName, localClassByQName, types)
 		if res != nil {
 			resolved = append(resolved, *res)

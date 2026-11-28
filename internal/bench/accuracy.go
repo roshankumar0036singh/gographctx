@@ -7,29 +7,43 @@ import (
 	"github.com/roshankumar0036singh/gographctx/internal/graph"
 )
 
-// CallEdgeTruth represents one ground-truth intra-repo call edge extracted from a compiler oracle (e.g. SCIP).
+// CallEdgeTruth represents one ground-truth intra-repo call edge extracted from a compiler/analyzer oracle (e.g. SCIP or Jedi).
 type CallEdgeTruth struct {
 	CallerFile string `json:"caller_file"`
 	CallerName string `json:"caller_name"`
 	CalleeFile string `json:"callee_file"`
 	CalleeName string `json:"callee_name"`
+	Category   string `json:"category,omitempty"` // optional: var_or_module, decorator, constructor, plain, self_cls
 	Line       uint32 `json:"line,omitempty"`
 }
 
-// AccuracyReport summarizes GoGraphCtx call resolution precision, recall, and strong-tier share.
+// CategoryAccuracy captures precision/recall for one call-pattern bucket.
+type CategoryAccuracy struct {
+	Total   int     `json:"total"`
+	Matched int     `json:"matched"`
+	Recall  float64 `json:"recall"`
+}
+
+// AccuracyReport summarizes GoGraphCtx call resolution precision, recall, library-vs-test split, and strong-tier share.
 type AccuracyReport struct {
-	Corpus            string   `json:"corpus"`
-	GroundTruthEdges  int      `json:"ground_truth_edges"`
-	PredictedCertain  int      `json:"predicted_certain"`
-	PredictedLikely   int      `json:"predicted_likely"`
-	MatchedCertain    int      `json:"matched_certain"`
-	MatchedWithLikely int      `json:"matched_with_likely"`
-	PrecisionCertain  float64  `json:"precision_certain"`
-	PrecisionOverall  float64  `json:"precision_overall"`
-	Recall            float64  `json:"recall"`
-	StrongTierRatio   float64  `json:"strong_tier_ratio"`
-	FalsePositives    []string `json:"false_positives,omitempty"`
-	FalseNegatives    []string `json:"false_negatives,omitempty"`
+	Corpus              string                      `json:"corpus"`
+	GroundTruthEdges    int                         `json:"ground_truth_edges"`
+	PredictedCertain    int                         `json:"predicted_certain"`
+	PredictedLikely     int                         `json:"predicted_likely"`
+	MatchedCertain      int                         `json:"matched_certain"`
+	MatchedWithLikely   int                         `json:"matched_with_likely"`
+	UnresolvedCallSites int                         `json:"unresolved_call_sites"`
+	PrecisionCertain    float64                     `json:"precision_certain"`
+	PrecisionOverall    float64                     `json:"precision_overall"`
+	Recall              float64                     `json:"recall"`
+	LibraryTruthEdges   int                         `json:"library_truth_edges,omitempty"`
+	LibraryRecall       float64                     `json:"library_recall,omitempty"`
+	TestTruthEdges      int                         `json:"test_truth_edges,omitempty"`
+	TestRecall          float64                     `json:"test_recall,omitempty"`
+	ByCategory          map[string]CategoryAccuracy `json:"by_category,omitempty"`
+	StrongTierRatio     float64                     `json:"strong_tier_ratio"`
+	FalsePositives      []string                    `json:"false_positives,omitempty"`
+	FalseNegatives      []string                    `json:"false_negatives,omitempty"`
 }
 
 // EvaluateGraphAccuracy compares g's EdgeCalls (certain) and EdgeLikelyCalls (likely) edges
@@ -47,7 +61,29 @@ func EvaluateGraphAccuracy(corpus string, g *graph.Graph, truth []CallEdgeTruth)
 
 	certainSet := make(map[string]struct{})
 	likelySet := make(map[string]struct{})
+	var predKeysForEdge = func(src, tgt graph.Node) []string {
+		callerNames := []string{src.Name}
+		if src.Kind == graph.KindModule {
+			callerNames = append(callerNames, "<module>", "<package_init>")
+		}
+		calleeNames := []string{tgt.Name}
+		if tgt.Name == "__init__" || tgt.Name == "__new__" || tgt.Name == "constructor" {
+			parts := strings.Split(tgt.QName, "::")
+			if len(parts) >= 2 {
+				calleeNames = append(calleeNames, parts[len(parts)-2])
+			}
+		}
+		out := make([]string, 0, len(callerNames)*len(calleeNames))
+		for _, cn := range callerNames {
+			for _, tn := range calleeNames {
+				out = append(out, edgeMatchKey(src.File, cn, tgt.File, tn))
+			}
+		}
+		return out
+	}
+
 	g.View(func(v *graph.ReadView) {
+		rep.UnresolvedCallSites = v.CallSiteCount()
 		for _, e := range v.AllEdges() {
 			if e.Kind != graph.EdgeCalls && e.Kind != graph.EdgeLikelyCalls {
 				continue
@@ -57,11 +93,18 @@ func EvaluateGraphAccuracy(corpus string, g *graph.Graph, truth []CallEdgeTruth)
 			if !okS || !okT || src.File == "" || tgt.File == "" || tgt.Kind == graph.KindExternal {
 				continue
 			}
-			k := edgeMatchKey(src.File, src.Name, tgt.File, tgt.Name)
+			keys := predKeysForEdge(src, tgt)
+			canonical := keys[0]
+			for _, candidate := range keys {
+				if _, ok := truthSet[candidate]; ok {
+					canonical = candidate
+					break
+				}
+			}
 			if e.Kind == graph.EdgeCalls {
-				certainSet[k] = struct{}{}
+				certainSet[canonical] = struct{}{}
 			} else {
-				likelySet[k] = struct{}{}
+				likelySet[canonical] = struct{}{}
 			}
 		}
 	})
@@ -87,12 +130,52 @@ func EvaluateGraphAccuracy(corpus string, g *graph.Graph, truth []CallEdgeTruth)
 	}
 	rep.MatchedWithLikely = unionMatched
 
-	for k := range truthSet {
+	var libMatched, testMatched int
+	catCounts := make(map[string]*CategoryAccuracy)
+	for k, t := range truthSet {
 		_, cOK := certainSet[k]
 		_, lOK := likelySet[k]
-		if !cOK && !lOK && len(rep.FalseNegatives) < 20 {
+		hit := cOK || lOK
+		if !hit && len(rep.FalseNegatives) < 20 {
 			rep.FalseNegatives = append(rep.FalseNegatives, k)
 		}
+		if isTestOrExampleFile(t.CallerFile) {
+			rep.TestTruthEdges++
+			if hit {
+				testMatched++
+			}
+		} else {
+			rep.LibraryTruthEdges++
+			if hit {
+				libMatched++
+			}
+		}
+		if t.Category != "" {
+			ca := catCounts[t.Category]
+			if ca == nil {
+				ca = &CategoryAccuracy{}
+				catCounts[t.Category] = ca
+			}
+			ca.Total++
+			if hit {
+				ca.Matched++
+			}
+		}
+	}
+	if len(catCounts) > 0 {
+		rep.ByCategory = make(map[string]CategoryAccuracy, len(catCounts))
+		for k, v := range catCounts {
+			if v.Total > 0 {
+				v.Recall = float64(v.Matched) / float64(v.Total)
+			}
+			rep.ByCategory[k] = *v
+		}
+	}
+	if rep.LibraryTruthEdges > 0 {
+		rep.LibraryRecall = float64(libMatched) / float64(rep.LibraryTruthEdges)
+	}
+	if rep.TestTruthEdges > 0 {
+		rep.TestRecall = float64(testMatched) / float64(rep.TestTruthEdges)
 	}
 
 	if rep.PredictedCertain > 0 {
@@ -106,6 +189,13 @@ func EvaluateGraphAccuracy(corpus string, g *graph.Graph, truth []CallEdgeTruth)
 		rep.Recall = float64(rep.MatchedWithLikely) / float64(rep.GroundTruthEdges)
 	}
 	return rep
+}
+
+func isTestOrExampleFile(rel string) bool {
+	s := strings.ReplaceAll(strings.ToLower(rel), "\\", "/")
+	return strings.HasPrefix(s, "tests/") || strings.HasPrefix(s, "test/") ||
+		strings.HasPrefix(s, "examples/") || strings.Contains(s, "/tests/") ||
+		strings.HasSuffix(s, "_test.go") || strings.HasPrefix(s, "test_")
 }
 
 // CheckAccuracyGates verifies accuracy targets and returns any breach descriptions.

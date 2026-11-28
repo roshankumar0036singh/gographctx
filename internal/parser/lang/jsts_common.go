@@ -178,10 +178,41 @@ func (e *jstsExtractor) extractLeadingDecorators(node *gotreesitter.Node, caller
 			if dec := cleanJSTSDecorator(c.Text(e.src)); dec != "" {
 				decs = append(decs, dec)
 			}
+			before := len(e.out.Calls)
 			e.collectCalls(c, callerQName)
+			if len(e.out.Calls) == before && c.NamedChildCount() > 0 {
+				e.recordJSCallableExpr(c.NamedChild(0), callerQName, 1)
+			}
 		}
 	}
 	return decs
+}
+
+func (e *jstsExtractor) recordJSCallableExpr(expr *gotreesitter.Node, callerQName string, argCount uint16) {
+	if expr == nil || callerQName == "" {
+		return
+	}
+	call := parser.ParsedCall{
+		CallerQName:   callerQName,
+		Line:          NodeStartLine(expr),
+		Col:           NodeStartCol(expr),
+		ArgumentCount: argCount,
+	}
+	switch expr.Type(e.lang) {
+	case "identifier":
+		call.CalleeName = strings.TrimSpace(expr.Text(e.src))
+	case "member_expression":
+		call.IsMethodCall = true
+		if obj := expr.ChildByFieldName("object", e.lang); obj != nil {
+			call.ReceiverName = CollapseWhitespace(obj.Text(e.src))
+		}
+		if prop := expr.ChildByFieldName("property", e.lang); prop != nil {
+			call.CalleeName = strings.TrimSpace(prop.Text(e.src))
+		}
+	}
+	if call.CalleeName != "" {
+		e.out.Calls = append(e.out.Calls, call)
+	}
 }
 
 func cleanJSTSDecorator(raw string) string {
@@ -963,6 +994,21 @@ func (e *jstsExtractor) extractVariableDecl(decl *gotreesitter.Node, scopeQName,
 		}
 
 		if valNode != nil {
+			if callerQName == e.moduleCaller && !isRequireCall(valNode, e.lang, e.src) && nameNode != nil && nameNode.Type(e.lang) == "identifier" {
+				vname := strings.TrimSpace(nameNode.Text(e.src))
+				if vname != "" {
+					lv := parser.ParsedLocalVar{
+						ScopeQName:   "",
+						Name:         vname,
+						ExplicitType: typeStr,
+						Line:         line,
+					}
+					e.populateJSTSRHS(&lv, valNode)
+					if lv.ExplicitType != "" || lv.InitCallee != "" || lv.InitAlias != "" {
+						e.out.LocalVars = append(e.out.LocalVars, lv)
+					}
+				}
+			}
 			e.collectCalls(valNode, callerQName)
 		}
 	}

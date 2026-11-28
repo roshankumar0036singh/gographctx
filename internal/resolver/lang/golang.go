@@ -399,7 +399,7 @@ func (r *GoResolver) ResolveCalls(
 	var unresolved []resolver.UnresolvedCall
 
 	for _, call := range file.Calls {
-		callerUID := ResolveCallerUID(rc, call.CallerQName, call.Line)
+		callerUID := ResolveCallerUIDForFile(rc, file, call.CallerQName, call.Line)
 
 		// Tier 1 / Tier 2 / Tier 3 / Tier 4 / Tier 6 cascade.
 		if res, unres, handled := r.resolveOneCall(file, rc, callerUID, call, fileScope, fnByQName, localClassByName, impByAlias, dotImports, types); handled {
@@ -443,6 +443,22 @@ func (r *GoResolver) resolveOneCall(
 				Line:        call.Line,
 				Column:      uint16(call.Col),
 				Method:      "local definition: " + call.CalleeName,
+				LookupKey:   resolver.BuildLookupKey("", fileScope, call.CalleeName),
+			}, nil, true
+		}
+
+		// Local function value binding (`fn := helper; fn()`).
+		if targetNode, ok := ResolveCallableAlias(rc, call.CallerQName, call.CalleeName, types); ok {
+			return &resolver.ResolvedCall{
+				CallerUID:   callerUID,
+				CallerQName: call.CallerQName,
+				TargetUID:   targetNode.UID,
+				TargetQName: targetNode.QName,
+				Tier:        resolver.TierLocal,
+				EdgeKind:    graph.EdgeCalls,
+				Line:        call.Line,
+				Column:      uint16(call.Col),
+				Method:      "local callable alias: " + targetNode.QName,
 				LookupKey:   resolver.BuildLookupKey("", fileScope, call.CalleeName),
 			}, nil, true
 		}
@@ -672,10 +688,10 @@ func lookupGoReceiverType(
 	localClassByName map[string]parser.ParsedClass,
 	rc *resolver.ResolutionContext,
 ) (resolver.TypeInfo, bool) {
-	if info, ok := resolver.LookupFlat(types, callerQName, expr); ok {
+	if info, ok := LookupScopedReceiverType(rc, callerQName, "", expr, types, nil); ok {
 		return info, true
 	}
-	parts := strings.Split(expr, ".")
+	parts := splitReceiverChain(expr)
 	if len(parts) < 2 {
 		return resolver.TypeInfo{}, false
 	}
@@ -688,20 +704,9 @@ func lookupGoReceiverType(
 		if fieldName == "" {
 			return resolver.TypeInfo{}, false
 		}
-		if info, found := resolver.LookupFlat(types, cur.Name, fieldName); found {
-			cur = info
-			continue
-		}
 		if cls, found := localClassByName[resolver.StripTypeDecorations(cur.Name)]; found {
-			matched := false
-			for _, f := range cls.Fields {
-				if f.Name == fieldName && f.Type != "" {
-					cur = resolver.TypeInfo{Name: resolver.StripTypeDecorations(f.Type), Package: cur.Package}
-					matched = true
-					break
-				}
-			}
-			if matched {
+			if next, matched := lookupFieldOnParsedClass(cls, fieldName, cur.Package); matched {
+				cur = next
 				continue
 			}
 		}

@@ -27,8 +27,8 @@ Verified via `go run ./cmd/ggctx-bench --corpus flask-synth --tools all --assert
 
 | Tool | Category | Index Architecture | Call Graph | Transitive Impact | Confidence Tiers | Zero External DB / Runtime |
 |---|---|---|---|---|---|---|
-| **GoGraphCtx** | Code-Graph MCP | In-memory + compact binary snapshot/WAL | Yes | Yes (`get_impact` BFS) | Yes (8 tiers + `LIKELY_CALLS`) | **Yes** (`15.8 MB` static binary) |
-| **CodeGraphContext (CGC)** | Code-Graph MCP | Python + external/embedded Cypher DB (Neo4j/FalkorDB/Kuzu) | Yes | Yes | Partial (tier guesses emitted as facts; ~39% strong tiers measured on Flask) | No (`~90` pip deps / DB server) |
+| **GoGraphCtx** | Code-Graph MCP | In-memory + compact binary snapshot/WAL | Yes | Yes (`get_impact` BFS) | Yes (8 tiers + `LIKELY_CALLS` + `unresolved_hints`) | **Yes** (`15.8 MB` static binary) |
+| **CodeGraphContext (CGC)** | Code-Graph MCP | Python + external/embedded Cypher DB (Neo4j/FalkorDB/Kuzu) | Yes | Yes | Partial (heuristic guesses in Tiers 7–8; ~61% of Flask edges) | No (`~90` pip deps / DB server) |
 | **SCIP** (`scip-python`, `scip-go`) | Compiler Oracle | Language type-checker emit `.scip` protobuf | Yes | External tooling needed | Compiler-exact | No (requires venv/toolchain/build env) |
 | **Universal Ctags** | Tag Indexer | Regex/heuristic symbol tags | No | No | No | Yes |
 | **ast-grep (`sg`)** | AST Search CLI | Ad-hoc per-query AST pattern matching | No | No | Exact AST syntax | Yes |
@@ -36,6 +36,20 @@ Verified via `go run ./cmd/ggctx-bench --corpus flask-synth --tools all --assert
 | **ripgrep (`rg`)** | Lexical Search | Streaming regex file scan | No | No | Lexical match (includes comments/imports/homonyms) | Yes |
 
 *(Note: When running on CI release runners with comparator CLIs installed in `$PATH`, `ggctx-bench` captures live head-to-head index duration, Peak RSS, query p50/p95, noise ratio, and token footprint across all installed tools.)*
+
+---
+
+## Independent Call-Graph Precision vs. Recall (Flask vs. Jedi Oracle)
+
+Evaluated across 3,904 Flask call sites against Jedi (1,268 intra-repo ground-truth edges):
+
+| Metric | GoGraphCtx (Baseline) | CodeGraphContext (CGC) |
+|---|---|---|
+| **Precision (checkable edges)** | **98.4%** (`100.0%` on Tier 3/4) | 69.2% (`~61%` of edges in weak Tier 7/8 heuristics) |
+| **Overall Recall vs. Jedi** | 29.2% (`69%` in `src/flask` library code; `15%` in `tests/`/`examples/`) | **70.3%** (high false-positive noise) |
+| **Zero-Caller Transparency** | Stores unresolved `CallSite` evidence and surfaces `unresolved_hints` | Silent gaps or speculative heuristic links |
+
+Recent improvements close the primary baseline recall gaps—module-level `<module>` callers, constructors (`__init__` / `Class`), decorators, PEP 517 `src/` package resolution, chained/context-manager inference (`with ... as client:`), local callable aliases, and explicit `unresolved_hints` disclosure in `get_callers` / `get_impact`—without promoting heuristic guesses into `CALLS`.
 
 ---
 

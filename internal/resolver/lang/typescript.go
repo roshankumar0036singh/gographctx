@@ -338,6 +338,13 @@ func (r *TypeScriptResolver) InferTypes(ctx context.Context, file *parser.Parsed
 						modPkg = PackageScopePrefix(n.QName)
 						foundTarget = true
 					}
+				} else if recvInfo, ok := LookupScopedReceiverType(rc, lv.ScopeQName, "", lv.InitReceiver, tm.ToFlatMap(), nil); ok {
+					recvPkg := pkgOrDefault(recvInfo.Package, modScope)
+					if n, _, okMeth := resolveTSMethodOnHierarchy(rc, recvPkg, resolver.StripTypeDecorations(recvInfo.Name), lv.InitCallee, nil, bindings, modScope); okMeth {
+						target = n
+						modPkg = PackageScopePrefix(n.QName)
+						foundTarget = true
+					}
 				}
 
 				if foundTarget {
@@ -414,7 +421,7 @@ func (r *TypeScriptResolver) ResolveCalls(
 	var unresolved []resolver.UnresolvedCall
 
 	for _, call := range file.Calls {
-		callerUID := ResolveCallerUID(rc, call.CallerQName, call.Line)
+		callerUID := ResolveCallerUIDForFile(rc, file, call.CallerQName, call.Line)
 		res, unres := r.resolveOneCall(file, rc, callerUID, call, modScope, bindings, localClassesByName, localClassesByQName, types)
 		if res != nil {
 			resolved = append(resolved, *res)
@@ -446,6 +453,13 @@ func (r *TypeScriptResolver) resolveOneCall(
 		if !call.IsConstructor {
 			if target, ok := FindSameFileFuncUID(rc, file, call.CalleeName, ""); ok {
 				return makeTSResolvedCall(callerUID, call, target, resolver.TierLocal, "local definition: "+target.QName, modScope), nil
+			}
+		}
+
+		// Local callable variable alias (`const fn = helper; fn()`).
+		if !call.IsConstructor {
+			if target, ok := ResolveCallableAlias(rc, call.CallerQName, call.CalleeName, types); ok {
+				return makeTSResolvedCall(callerUID, call, target, resolver.TierLocal, "local callable alias: "+target.QName, modScope), nil
 			}
 		}
 

@@ -22,6 +22,7 @@ const (
 	OriginConstructor
 	OriginField
 	OriginLiteral
+	OriginCallable
 )
 
 // String returns a concise name for TypeOrigin.
@@ -39,20 +40,23 @@ func (o TypeOrigin) String() string {
 		return "field"
 	case OriginLiteral:
 		return "literal"
+	case OriginCallable:
+		return "callable"
 	default:
 		return "unknown"
 	}
 }
 
 // TypeInfo captures an inferred type binding for a local variable, parameter,
-// or expression within a parsed file.
+// callable alias, or expression within a parsed file.
 type TypeInfo struct {
-	Name       string     `json:"name"`
-	QName      string     `json:"qualified_name,omitempty"`
-	Package    string     `json:"package,omitempty"`
-	Origin     TypeOrigin `json:"origin"`
-	Confidence float32    `json:"confidence"`
-	Line       uint32     `json:"line,omitempty"`
+	Name          string     `json:"name"`
+	QName         string     `json:"qualified_name,omitempty"`
+	CallableQName string     `json:"callable_qname,omitempty"`
+	Package       string     `json:"package,omitempty"`
+	Origin        TypeOrigin `json:"origin"`
+	Confidence    float32    `json:"confidence"`
+	Line          uint32     `json:"line,omitempty"`
 }
 
 // ResolvedImport represents an import edge resolved against workspace modules/files.
