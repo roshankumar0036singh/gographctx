@@ -254,6 +254,26 @@ func (r *RustResolver) InferTypes(ctx context.Context, file *parser.ParsedFile, 
 			recvClean := stripRustWrapperType(lv.InitReceiver)
 			if fn, modPkg, ok := resolveRustAssociatedTarget(rc, bindings, modScope, recvClean, lv.InitCallee, cargoInfo); ok {
 				typeNode, pkg, found = inferRustReturnOrType(rc, fn, modPkg, bindings, modScope, cargoInfo)
+			} else if recvType, okRecv := LookupScopedReceiverType(rc, lv.ScopeQName, "", lv.InitReceiver, tm.ToFlatMap(), nil); okRecv {
+				// Chained call / smart unwrapping: e.g. `Client::builder().build()` or `make_client().unwrap()`.
+				if lv.InitCallee == "unwrap" || lv.InitCallee == "expect" {
+					unwrapped := stripRustWrapperType(recvType.Name)
+					if clsNode, targetPkg, okCls := resolveRustSymbolType(rc, bindings, modScope, unwrapped, cargoInfo); okCls {
+						typeNode = clsNode
+						pkg = targetPkg
+						found = true
+					} else if unwrapped != "" {
+						typeNode = graph.Node{Name: unwrapped, QName: recvType.QName}
+						pkg = recvType.Package
+						found = true
+					}
+				} else {
+					recvTypeName := stripRustWrapperType(recvType.Name)
+					recvPkg := pkgOrDefault(recvType.Package, PackageScopePrefix(recvType.QName))
+					if fnNode, _, okMeth := resolveRustTypeMethod(rc, pkgOrDefault(recvPkg, modScope), recvTypeName, lv.InitCallee); okMeth {
+						typeNode, pkg, found = inferRustReturnOrType(rc, fnNode, pkgOrDefault(recvPkg, modScope), bindings, modScope, cargoInfo)
+					}
+				}
 			}
 		}
 
@@ -319,7 +339,7 @@ func (r *RustResolver) ResolveCalls(
 	var unresolved []resolver.UnresolvedCall
 
 	for _, call := range file.Calls {
-		callerUID := ResolveCallerUID(rc, call.CallerQName, call.Line)
+		callerUID := ResolveCallerUIDForFile(rc, file, call.CallerQName, call.Line)
 		res, unres := r.resolveOneCall(file, rc, callerUID, call, modScope, cargoInfo, bindings, localFnByQName, localClassByName, localClassByQName, types)
 		if res != nil {
 			resolved = append(resolved, *res)
@@ -396,6 +416,11 @@ func (r *RustResolver) resolveOneCall(
 				Tier:        resolver.TierUnresolved,
 				Reason:      "external crate/std function",
 			}
+		}
+
+		// Local callable binding (`let fn_ref = helper; fn_ref()`).
+		if target, ok := ResolveCallableAlias(rc, call.CallerQName, call.CalleeName, types); ok {
+			return makeRustResolvedCall(callerUID, call, target, resolver.TierLocal, "callable alias: "+call.CalleeName+" -> "+target.QName, modScope), nil
 		}
 
 		return nil, &resolver.UnresolvedCall{

@@ -97,6 +97,22 @@ type ImpactEntry struct {
 	Via             []string      `json:"via,omitempty"`
 }
 
+// UnresolvedSiteSample summarizes one unresolved or ambiguous call site that might target the queried symbol.
+type UnresolvedSiteSample struct {
+	File       string `json:"file"`
+	Line       uint32 `json:"line"`
+	Column     uint16 `json:"column,omitempty"`
+	CalleeExpr string `json:"callee_expr"`
+	Status     string `json:"status"`
+	Reason     string `json:"reason,omitempty"`
+}
+
+// UnresolvedHints discloses plausible unresolved/ambiguous call sites so agents are warned of incomplete call graphs.
+type UnresolvedHints struct {
+	Count   int                    `json:"count"`
+	Samples []UnresolvedSiteSample `json:"samples,omitempty"`
+}
+
 // HandleCall validates rawArgs, executes toolName against the graph, and returns
 // token-budget-enforced JSON bytes.
 func (h *Handler) HandleCall(ctx context.Context, toolName string, rawArgs json.RawMessage) ([]byte, error) {
@@ -279,19 +295,36 @@ func (h *Handler) handleCallNeighbor(v *graph.ReadView, rawArgs json.RawMessage,
 		dirWord = "callers of"
 	}
 
+	var hints UnresolvedHints
+	if isCallers {
+		hints = h.collectUnresolvedHints(v, target)
+	}
+	summary := fmt.Sprintf("%d %s %s", total, dirWord, target.QName)
+	if isCallers && hints.Count > 0 {
+		if total == 0 {
+			summary = fmt.Sprintf("0 confirmed callers of %s (%d unresolved call site(s) might match)", target.QName, hints.Count)
+		} else {
+			summary = fmt.Sprintf("%d callers of %s (%d unresolved call site(s) might match)", total, target.QName, hints.Count)
+		}
+	}
+
 	return ToolPayload{
-		Summary:      fmt.Sprintf("%d %s %s", total, dirWord, target.QName),
+		Summary:      summary,
 		Total:        total,
 		MaxItems:     len(capped),
 		PreTruncated: preTruncated,
 		ItemTiers:    tiers,
 		BuildEnvelope: func(n int) (int, any) {
 			n = min(n, len(capped))
-			return n, map[string]any{
+			env := map[string]any{
 				"found":  true,
 				"target": targetSummary,
 				key:      capped[:n],
 			}
+			if isCallers && hints.Count > 0 {
+				env["unresolved_hints"] = hints
+			}
+			return n, env
 		},
 	}, nil
 }
@@ -371,16 +404,25 @@ func (h *Handler) handleGetImpact(v *graph.ReadView, rawArgs json.RawMessage) (T
 		preTruncated = true
 	}
 	targetSummary := h.toSymbolSummary(target)
+	hints := h.collectUnresolvedHints(v, target)
+	summary := fmt.Sprintf("%d impacted symbol(s) across %d file(s) within depth %d", impact.TotalImpacted, len(affectedFiles), depth)
+	if hints.Count > 0 {
+		if impact.TotalImpacted == 0 {
+			summary = fmt.Sprintf("0 confirmed impacted symbols for %s (%d unresolved call site(s) might match)", target.QName, hints.Count)
+		} else {
+			summary = fmt.Sprintf("%s (%d unresolved call site(s) might match)", summary, hints.Count)
+		}
+	}
 
 	return ToolPayload{
-		Summary:      fmt.Sprintf("%d impacted symbol(s) across %d file(s) within depth %d", impact.TotalImpacted, len(affectedFiles), depth),
+		Summary:      summary,
 		Total:        impact.TotalImpacted,
 		MaxItems:     len(capped),
 		PreTruncated: preTruncated,
 		ItemTiers:    tiers,
 		BuildEnvelope: func(n int) (int, any) {
 			n = min(n, len(capped))
-			return n, map[string]any{
+			env := map[string]any{
 				"found":          true,
 				"target":         targetSummary,
 				"max_depth":      impact.MaxDepth,
@@ -391,8 +433,62 @@ func (h *Handler) handleGetImpact(v *graph.ReadView, rawArgs json.RawMessage) (T
 				"affected_files": affectedFiles,
 				"impacted":       capped[:n],
 			}
+			if hints.Count > 0 {
+				env["unresolved_hints"] = hints
+			}
+			return n, env
 		},
 	}, nil
+}
+
+func (h *Handler) collectUnresolvedHints(v *graph.ReadView, target graph.Node) UnresolvedHints {
+	if v == nil || target.UID.IsZero() || target.Name == "" {
+		return UnresolvedHints{}
+	}
+	const maxSamples = 5
+	var samples []UnresolvedSiteSample
+	total := 0
+	for _, cs := range v.GetCallSites() {
+		if cs.Status == graph.CallStatusExternal {
+			continue
+		}
+		matched := cs.Status == graph.CallStatusAmbiguous && slices.Contains(cs.Candidates, target.UID)
+		if !matched && callSiteMatchesTargetName(cs.LookupKey, cs.CalleeExpr, target.Name) {
+			matched = true
+		}
+		if !matched {
+			continue
+		}
+		total++
+		if len(samples) < maxSamples {
+			samples = append(samples, UnresolvedSiteSample{
+				File:       h.formatter.StripRepoPath(cs.File),
+				Line:       cs.Line,
+				Column:     cs.Column,
+				CalleeExpr: cs.CalleeExpr,
+				Status:     cs.Status.String(),
+				Reason:     cs.Reason,
+			})
+		}
+	}
+	return UnresolvedHints{Count: total, Samples: samples}
+}
+
+func callSiteMatchesTargetName(lookupKey, calleeExpr, targetName string) bool {
+	if targetName == "" {
+		return false
+	}
+	if idx := strings.LastIndex(lookupKey, "::"); idx >= 0 {
+		if lookupKey[idx+2:] == targetName {
+			return true
+		}
+	} else if lookupKey == targetName {
+		return true
+	}
+	if calleeExpr == targetName || strings.HasSuffix(calleeExpr, "."+targetName) || strings.HasSuffix(calleeExpr, "::"+targetName) {
+		return true
+	}
+	return false
 }
 
 func (h *Handler) handleFileOutline(v *graph.ReadView, rawArgs json.RawMessage) (ToolPayload, error) {

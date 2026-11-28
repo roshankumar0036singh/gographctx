@@ -293,6 +293,9 @@ func (e *goExtractor) extractValueSpec(spec *gotreesitter.Node, isConst bool, de
 	}
 
 	if valueNode := spec.ChildByFieldName("value", e.lang); valueNode != nil {
+		if !isConst {
+			e.recordGoLocalVarSpec(spec, "")
+		}
 		e.collectCalls(valueNode, e.pkgInitCaller)
 	}
 }

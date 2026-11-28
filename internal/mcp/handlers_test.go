@@ -129,3 +129,61 @@ func TestAllSevenMCPToolHandlers(t *testing.T) {
 		t.Fatalf("expected ErrInvalidArgs for empty symbol, got %v", err)
 	}
 }
+
+func TestGetCallersAndImpactSurfaceUnresolvedHints(t *testing.T) {
+	g := buildMockHandlerGraph(t)
+	var privUID, routeUID graph.UID
+	g.View(func(v *graph.ReadView) {
+		privUID = v.GetByQName("pkg::helper")[0].UID
+		routeUID = v.GetByQName("api.handler::handle_order")[0].UID
+	})
+	if err := g.AddCallSite(graph.CallSite{
+		Caller:     routeUID,
+		File:       "api/handler.py",
+		Line:       11,
+		Column:     8,
+		CalleeExpr: "dyn.helper",
+		LookupKey:  "api.handler::helper",
+		Status:     graph.CallStatusUnresolved,
+		Tier:       graph.TierUnresolved,
+		Reason:     "dynamic receiver type unknown",
+	}); err != nil {
+		t.Fatalf("AddCallSite(unresolved) failed: %v", err)
+	}
+	if err := g.AddCallSite(graph.CallSite{
+		Caller:     routeUID,
+		File:       "api/handler.py",
+		Line:       12,
+		Column:     4,
+		CalleeExpr: "print",
+		LookupKey:  "builtins::print",
+		Status:     graph.CallStatusExternal,
+		Tier:       graph.TierUnresolved,
+		Reason:     "external builtin",
+	}); err != nil {
+		t.Fatalf("AddCallSite(external) failed: %v", err)
+	}
+
+	h := mcp.NewHandler(g, mcp.FormatterConfig{
+		RepoRoot:       "C:/repo/demo",
+		RepoName:       "demo",
+		FixedTimestamp: "2026-11-28T00:00:00Z",
+	})
+	_ = privUID
+
+	rawCallers, err := h.HandleCall(context.Background(), "get_callers", json.RawMessage(`{"symbol":"pkg::helper"}`))
+	if err != nil {
+		t.Fatalf("get_callers failed: %v", err)
+	}
+	if !strings.Contains(string(rawCallers), `"unresolved_hints"`) || !strings.Contains(string(rawCallers), "1 unresolved call site(s) might match") {
+		t.Fatalf("expected unresolved_hints in get_callers output, got: %s", rawCallers)
+	}
+
+	rawImpact, err := h.HandleCall(context.Background(), "get_impact", json.RawMessage(`{"symbol":"pkg::helper"}`))
+	if err != nil {
+		t.Fatalf("get_impact failed: %v", err)
+	}
+	if !strings.Contains(string(rawImpact), `"unresolved_hints"`) || !strings.Contains(string(rawImpact), `"dyn.helper"`) {
+		t.Fatalf("expected unresolved_hints in get_impact output, got: %s", rawImpact)
+	}
+}

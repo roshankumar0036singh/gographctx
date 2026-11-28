@@ -169,6 +169,11 @@ func (e *pythonExtractor) walkStatements(container *gotreesitter.Node, scopeQNam
 		case "assignment":
 			if !insideFunc {
 				e.extractAssignment(stmt, scopeQName, enclosingClass, inClassBody)
+				if !inClassBody {
+					e.recordPythonLocalAssignment(stmt, "")
+				}
+			} else {
+				e.recordPythonLocalAssignment(stmt, callerQName)
 			}
 			if right := stmt.ChildByFieldName("right", e.lang); right != nil {
 				e.collectCalls(right, callerQName)
@@ -177,7 +182,10 @@ func (e *pythonExtractor) walkStatements(container *gotreesitter.Node, scopeQNam
 			if right := stmt.ChildByFieldName("right", e.lang); right != nil {
 				e.collectCalls(right, callerQName)
 			}
-		case "if_statement", "for_statement", "while_statement", "with_statement", "try_statement", "match_statement":
+		case "with_statement":
+			e.recordPythonWithBindings(stmt, callerQName, insideFunc)
+			e.walkControlFlow(stmt, scopeQName, enclosingClass, callerQName, insideFunc)
+		case "if_statement", "for_statement", "while_statement", "try_statement", "match_statement":
 			// Walk control-flow statements at module/class level for nested defs or calls.
 			e.walkControlFlow(stmt, scopeQName, enclosingClass, callerQName, insideFunc)
 		default:
@@ -395,7 +403,12 @@ func (e *pythonExtractor) extractDecoratedDefinition(node *gotreesitter.Node, sc
 		if raw != "" {
 			decorators = append(decorators, raw)
 		}
+		callsBefore := len(e.out.Calls)
 		e.collectCalls(child, callerQName)
+		// Bare decorators (@login_required, @bp.before_request) invoke the decorator expression at runtime.
+		if len(e.out.Calls) == callsBefore && child.NamedChildCount() > 0 {
+			e.recordPythonCallableExpr(child.NamedChild(0), callerQName, 1)
+		}
 	}
 
 	def := node.ChildByFieldName("definition", e.lang)
@@ -558,12 +571,89 @@ func (e *pythonExtractor) walkFunctionBody(node *gotreesitter.Node, funcQName st
 		case "assignment":
 			e.recordPythonLocalAssignment(child, funcQName)
 			e.walkFunctionBody(child, funcQName)
+		case "with_statement":
+			e.recordPythonWithBindings(child, funcQName, true)
+			e.walkFunctionBody(child, funcQName)
 		case "call":
 			e.recordPythonCall(child, funcQName)
 			e.walkFunctionBody(child, funcQName)
 		default:
 			e.walkFunctionBody(child, funcQName)
 		}
+	}
+}
+
+func (e *pythonExtractor) recordPythonWithBindings(withStmt *gotreesitter.Node, scopeQName string, insideFunc bool) {
+	if withStmt == nil {
+		return
+	}
+	targetScope := scopeQName
+	if !insideFunc {
+		targetScope = ""
+	}
+	var walkWith func(n *gotreesitter.Node)
+	walkWith = func(n *gotreesitter.Node) {
+		if n == nil {
+			return
+		}
+		if n.Type(e.lang) == "as_pattern" && n.NamedChildCount() >= 2 {
+			exprNode := n.NamedChild(0)
+			aliasNode := n.NamedChild(1)
+			if aliasNode != nil {
+				if aliasNode.Type(e.lang) == "as_pattern_target" && aliasNode.NamedChildCount() > 0 {
+					aliasNode = aliasNode.NamedChild(0)
+				}
+				if aliasNode != nil && (aliasNode.Type(e.lang) == "identifier" || aliasNode.Type(e.lang) == "attribute") {
+					targetName := CollapseWhitespace(aliasNode.Text(e.src))
+					if targetName != "" && targetName != "_" {
+						lv := parser.ParsedLocalVar{
+							ScopeQName: targetScope,
+							Name:       targetName,
+							Line:       NodeStartLine(n),
+						}
+						e.populatePythonRHS(&lv, exprNode)
+						if lv.ExplicitType != "" || lv.InitCallee != "" || lv.InitAlias != "" {
+							e.out.LocalVars = append(e.out.LocalVars, lv)
+						}
+					}
+				}
+			}
+			return
+		}
+		for i := 0; i < n.NamedChildCount(); i++ {
+			walkWith(n.NamedChild(i))
+		}
+	}
+	walkWith(withStmt)
+}
+
+func (e *pythonExtractor) populatePythonRHS(lv *parser.ParsedLocalVar, rightNode *gotreesitter.Node) {
+	if lv == nil || rightNode == nil {
+		return
+	}
+	switch rightNode.Type(e.lang) {
+	case "call":
+		if fn := rightNode.ChildByFieldName("function", e.lang); fn != nil {
+			switch fn.Type(e.lang) {
+			case "identifier":
+				lv.InitCallee = strings.TrimSpace(fn.Text(e.src))
+				if lv.InitCallee != "" && unicode.IsUpper(rune(lv.InitCallee[0])) {
+					lv.IsConstructor = true
+				}
+			case "attribute":
+				if obj := fn.ChildByFieldName("object", e.lang); obj != nil {
+					lv.InitReceiver = CollapseWhitespace(obj.Text(e.src))
+				}
+				if attr := fn.ChildByFieldName("attribute", e.lang); attr != nil {
+					lv.InitCallee = strings.TrimSpace(attr.Text(e.src))
+				}
+				if lv.InitCallee != "" && unicode.IsUpper(rune(lv.InitCallee[0])) {
+					lv.IsConstructor = true
+				}
+			}
+		}
+	case "identifier", "attribute":
+		lv.InitAlias = CollapseWhitespace(rightNode.Text(e.src))
 	}
 }
 
@@ -592,33 +682,37 @@ func (e *pythonExtractor) recordPythonLocalAssignment(stmt *gotreesitter.Node, s
 		lv.ExplicitType = CollapseWhitespace(typeNode.Text(e.src))
 	}
 	if rightNode := stmt.ChildByFieldName("right", e.lang); rightNode != nil {
-		switch rightNode.Type(e.lang) {
-		case "call":
-			if fn := rightNode.ChildByFieldName("function", e.lang); fn != nil {
-				switch fn.Type(e.lang) {
-				case "identifier":
-					lv.InitCallee = strings.TrimSpace(fn.Text(e.src))
-					if lv.InitCallee != "" && unicode.IsUpper(rune(lv.InitCallee[0])) {
-						lv.IsConstructor = true
-					}
-				case "attribute":
-					if obj := fn.ChildByFieldName("object", e.lang); obj != nil {
-						lv.InitReceiver = CollapseWhitespace(obj.Text(e.src))
-					}
-					if attr := fn.ChildByFieldName("attribute", e.lang); attr != nil {
-						lv.InitCallee = strings.TrimSpace(attr.Text(e.src))
-					}
-					if lv.InitCallee != "" && unicode.IsUpper(rune(lv.InitCallee[0])) {
-						lv.IsConstructor = true
-					}
-				}
-			}
-		case "identifier", "attribute":
-			lv.InitAlias = CollapseWhitespace(rightNode.Text(e.src))
-		}
+		e.populatePythonRHS(&lv, rightNode)
 	}
 	if lv.ExplicitType != "" || lv.InitCallee != "" || lv.InitAlias != "" {
 		e.out.LocalVars = append(e.out.LocalVars, lv)
+	}
+}
+
+func (e *pythonExtractor) recordPythonCallableExpr(exprNode *gotreesitter.Node, callerQName string, argCount uint16) {
+	if exprNode == nil || callerQName == "" {
+		return
+	}
+	call := parser.ParsedCall{
+		CallerQName:   callerQName,
+		Line:          NodeStartLine(exprNode),
+		Col:           NodeStartCol(exprNode),
+		ArgumentCount: argCount,
+	}
+	switch exprNode.Type(e.lang) {
+	case "identifier":
+		call.CalleeName = strings.TrimSpace(exprNode.Text(e.src))
+	case "attribute":
+		call.IsMethodCall = true
+		if obj := exprNode.ChildByFieldName("object", e.lang); obj != nil {
+			call.ReceiverName = CollapseWhitespace(obj.Text(e.src))
+		}
+		if attr := exprNode.ChildByFieldName("attribute", e.lang); attr != nil {
+			call.CalleeName = strings.TrimSpace(attr.Text(e.src))
+		}
+	}
+	if call.CalleeName != "" {
+		e.out.Calls = append(e.out.Calls, call)
 	}
 }
 

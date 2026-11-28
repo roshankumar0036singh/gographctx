@@ -749,6 +749,10 @@ func (e *javaExtractor) collectCalls(node *gotreesitter.Node, callerQName string
 	switch node.Type(e.lang) {
 	case "local_variable_declaration":
 		e.recordJavaLocalVar(node, callerQName)
+	case "resource":
+		e.recordJavaResource(node, callerQName)
+	case "enhanced_for_statement":
+		e.recordJavaEnhancedFor(node, callerQName)
 	case "assignment_expression":
 		e.recordJavaLocalAssign(node, callerQName)
 	case "method_invocation":
@@ -800,6 +804,55 @@ func (e *javaExtractor) recordJavaLocalVar(decl *gotreesitter.Node, scopeQName s
 			e.out.LocalVars = append(e.out.LocalVars, lv)
 		}
 	}
+}
+
+// recordJavaResource captures try-with-resources variables (`try (Client c = factory.open())`).
+func (e *javaExtractor) recordJavaResource(resNode *gotreesitter.Node, scopeQName string) {
+	nameNode := resNode.ChildByFieldName("name", e.lang)
+	if nameNode == nil {
+		return
+	}
+	name := strings.TrimSpace(nameNode.Text(e.src))
+	if name == "" {
+		return
+	}
+	lv := parser.ParsedLocalVar{
+		ScopeQName: scopeQName,
+		Name:       name,
+		Line:       NodeStartLine(resNode),
+	}
+	if tNode := resNode.ChildByFieldName("type", e.lang); tNode != nil {
+		t := CollapseWhitespace(tNode.Text(e.src))
+		if t != "var" {
+			lv.ExplicitType = t
+		}
+	}
+	if val := resNode.ChildByFieldName("value", e.lang); val != nil {
+		e.populateJavaRHS(&lv, val)
+	}
+	if lv.ExplicitType != "" || lv.InitCallee != "" || lv.InitAlias != "" {
+		e.out.LocalVars = append(e.out.LocalVars, lv)
+	}
+}
+
+// recordJavaEnhancedFor captures loop element variables (`for (Order o : orders)`).
+func (e *javaExtractor) recordJavaEnhancedFor(forNode *gotreesitter.Node, scopeQName string) {
+	tNode := forNode.ChildByFieldName("type", e.lang)
+	nameNode := forNode.ChildByFieldName("name", e.lang)
+	if tNode == nil || nameNode == nil {
+		return
+	}
+	t := CollapseWhitespace(tNode.Text(e.src))
+	name := strings.TrimSpace(nameNode.Text(e.src))
+	if t == "" || t == "var" || name == "" {
+		return
+	}
+	e.out.LocalVars = append(e.out.LocalVars, parser.ParsedLocalVar{
+		ScopeQName:   scopeQName,
+		Name:         name,
+		ExplicitType: t,
+		Line:         NodeStartLine(forNode),
+	})
 }
 
 func (e *javaExtractor) recordJavaLocalAssign(expr *gotreesitter.Node, scopeQName string) {

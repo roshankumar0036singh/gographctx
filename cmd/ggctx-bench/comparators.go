@@ -162,10 +162,27 @@ func benchCGCComparator(ctx context.Context, repoDir string) ToolBenchmarkResult
 	}
 	defer func() { _ = os.RemoveAll(copyDir) }()
 
-	// Run cgc index with a bounded timeout (default CGC backends on Windows/unconfigured DB may error cleanly).
+	// Run cgc index with a bounded timeout; fall back to embedded KuzuDB if the
+	// configured database backend (e.g. Neo4j) is unavailable in this environment.
 	start := time.Now()
-	_, idxOut, idxErr := runMeasuredCapture(ctx, copyDir, 45*time.Second, bin, "index", ".")
+	rssBytes, idxOut, idxErr := runMeasuredCapture(ctx, copyDir, 45*time.Second, bin, "index", ".")
+	dbArgs := []string(nil)
+	var kuzuDir string
+	if idxErr != nil {
+		kuzuDir, cerr = os.MkdirTemp("", "ggctx-cgc-kuzu-*")
+		if cerr == nil {
+			defer func() { _ = os.RemoveAll(kuzuDir) }()
+			kuzuPath := filepath.Join(kuzuDir, "db")
+			dbArgs = []string{"--database", "kuzudb", "--db-path", kuzuPath}
+			kuzuArgs := append(slices.Clone(dbArgs), "index", ".")
+			start = time.Now()
+			rssBytes, idxOut, idxErr = runMeasuredCapture(ctx, copyDir, 120*time.Second, bin, kuzuArgs...)
+		}
+	}
 	res.IndexDurationMs = float64(time.Since(start).Microseconds()) / 1000.0
+	if rssBytes > 0 {
+		res.PeakRSSMB = float64(rssBytes) / (1024 * 1024)
+	}
 	if idxErr != nil {
 		res.Status = "skipped"
 		msg := strings.TrimSpace(idxOut)
@@ -175,8 +192,36 @@ func benchCGCComparator(ctx context.Context, repoDir string) ToolBenchmarkResult
 		res.Reason = fmt.Sprintf("cgc index unavailable in current environment (%v: %s)", idxErr, msg)
 		return res
 	}
+	if kuzuDir != "" {
+		res.IndexDiskBytes = dirSizeBytes(kuzuDir)
+	}
+
+	// Sample CLI query latency via `cgc stats` (warmup/startup proxy + DB read).
+	var qSamples []float64
+	statsArgs := append(slices.Clone(dbArgs), "stats")
+	for i := 0; i < 3; i++ {
+		qs := time.Now()
+		if _, _, qerr := runMeasuredCapture(ctx, copyDir, 15*time.Second, bin, statsArgs...); qerr == nil {
+			qSamples = append(qSamples, float64(time.Since(qs).Microseconds())/1000.0)
+		}
+	}
+	res.QueryP50Ms, res.QueryP95Ms = quantiles(qSamples)
 	res.Status = "ok"
 	return res
+}
+
+func dirSizeBytes(root string) int64 {
+	var total int64
+	_ = filepath.WalkDir(root, func(_ string, d fs.DirEntry, err error) error {
+		if err != nil || d.IsDir() {
+			return nil
+		}
+		if info, ierr := d.Info(); ierr == nil {
+			total += info.Size()
+		}
+		return nil
+	})
+	return total
 }
 
 func benchSCIPComparator(ctx context.Context, repoDir, corpusKind string) (ToolBenchmarkResult, string) {

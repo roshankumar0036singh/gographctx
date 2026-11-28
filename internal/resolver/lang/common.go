@@ -2,6 +2,7 @@ package lang
 
 import (
 	"cmp"
+	"path"
 	"slices"
 	"strings"
 
@@ -13,6 +14,34 @@ import (
 // ResolveCallerUID resolves the canonical UID for callerQName from rc.View when
 // available, falling back deterministically to GenerateNodeUID(KindFunction, callerQName, 0).
 func ResolveCallerUID(rc *resolver.ResolutionContext, callerQName string, line uint32) graph.UID {
+	return ResolveCallerUIDForFile(rc, nil, callerQName, line)
+}
+
+// ResolveCallerUIDForFile resolves callerQName and maps synthetic top-level module
+// callers (<module> / <package_init>) to the file's KindModule node ("mod:<file.Path>")
+// so top-level calls and decorators materialize cleanly in the graph.
+func ResolveCallerUIDForFile(rc *resolver.ResolutionContext, file *parser.ParsedFile, callerQName string, line uint32) graph.UID {
+	if file != nil && file.Path != "" && isSyntheticModuleCaller(callerQName) {
+		modQName := "mod:" + file.Path
+		if rc != nil && rc.View != nil {
+			for _, n := range rc.View.GetByQName(modQName) {
+				if n.Kind == graph.KindModule {
+					return n.UID
+				}
+			}
+		}
+		modName := file.Package
+		if modName == "" {
+			modName = strings.TrimSuffix(path.Base(file.Path), path.Ext(file.Path))
+		}
+		return graph.ComputeNodeUID(graph.Node{
+			Kind:     graph.KindModule,
+			Name:     modName,
+			QName:    modQName,
+			File:     file.Path,
+			Language: file.Language,
+		})
+	}
 	if rc != nil && rc.View != nil && callerQName != "" {
 		nodes := rc.View.GetByQName(callerQName)
 		if len(nodes) == 1 {
@@ -43,6 +72,13 @@ func ResolveCallerUID(rc *resolver.ResolutionContext, callerQName string, line u
 		}
 	}
 	return graph.GenerateNodeUID(graph.KindFunction, callerQName, 0)
+}
+
+func isSyntheticModuleCaller(callerQName string) bool {
+	return callerQName == "<module>" ||
+		callerQName == "<package_init>" ||
+		strings.HasSuffix(callerQName, "::<module>") ||
+		strings.HasSuffix(callerQName, "::<package_init>")
 }
 
 // FindSameFileFuncUID locates a function/method in file matching predicate and
@@ -152,8 +188,8 @@ func FindEnclosingClass(callerQName string, localClassesByQName map[string]parse
 	return parser.ParsedClass{}
 }
 
-// LookupScopedReceiverType resolves direct or dotted receiver chains (including
-// `self.attr`, `cls.attr`, `this.attr`, and cross-file struct/class fields).
+// LookupScopedReceiverType resolves direct, dotted, or chained-call receiver
+// expressions (such as `self.attr`, `app.config`, `app.test_client()`, or `svc.Repo()`).
 func LookupScopedReceiverType(
 	rc *resolver.ResolutionContext,
 	callerQName, enclosingClsQName, recv string,
@@ -169,8 +205,11 @@ func LookupScopedReceiverType(
 		}
 	}
 
-	parts := strings.Split(recv, ".")
-	if len(parts) < 2 {
+	parts := splitReceiverChain(recv)
+	if len(parts) == 0 {
+		return resolver.TypeInfo{}, false
+	}
+	if len(parts) == 1 && !strings.HasSuffix(parts[0], ")") {
 		return resolver.TypeInfo{}, false
 	}
 
@@ -179,45 +218,75 @@ func LookupScopedReceiverType(
 	var ok bool
 
 	first := strings.TrimSpace(parts[0])
-	if first == "self" || first == "cls" || first == "this" {
-		twoPart := first + "." + strings.TrimSpace(parts[1])
-		if cur, ok = resolver.LookupFlat(types, callerQName, twoPart); ok {
-			startIdx = 2
-		} else if enclosingClsQName != "" {
-			if cur, ok = resolver.LookupFlat(types, enclosingClsQName, strings.TrimSpace(parts[1])); ok {
+	if callName, isCall := stripCallSuffix(first); isCall {
+		cur, ok = resolveInitialCallSegmentType(rc, callerQName, callName, types, localClassesByQName)
+	} else {
+		if (first == "self" || first == "cls" || first == "this") && len(parts) >= 2 {
+			twoPart := first + "." + strings.TrimSpace(parts[1])
+			if cur, ok = resolver.LookupFlat(types, callerQName, twoPart); ok {
 				startIdx = 2
+			} else if enclosingClsQName != "" {
+				if cur, ok = resolver.LookupFlat(types, enclosingClsQName, strings.TrimSpace(parts[1])); ok {
+					startIdx = 2
+				}
+			}
+		}
+		if !ok {
+			cur, ok = resolver.LookupFlat(types, callerQName, first)
+		}
+		if !ok && len(parts) >= 2 && rc != nil {
+			// Static/class chain starter, e.g. `Client.builder().build()`.
+			for _, cls := range localClassesByQName {
+				if cls.Name == first {
+					cur = resolver.TypeInfo{Name: cls.Name, QName: cls.QName, Package: PackageScopePrefix(cls.QName)}
+					ok = true
+					break
+				}
+			}
+			if !ok {
+				if clsNode, unique, _ := resolver.MatchUniqueNode(rc.LookupByName(first), func(n graph.Node) bool {
+					return n.Kind == graph.KindClass || n.Kind == graph.KindStruct
+				}); unique {
+					cur = resolver.TypeInfo{Name: clsNode.Name, QName: clsNode.QName, Package: PackageScopePrefix(clsNode.QName)}
+					ok = true
+				}
 			}
 		}
 	}
 	if !ok {
-		cur, ok = resolver.LookupFlat(types, callerQName, first)
-		if !ok {
-			return resolver.TypeInfo{}, false
-		}
+		return resolver.TypeInfo{}, false
 	}
 
 	for _, seg := range parts[startIdx:] {
-		fieldName := strings.TrimSpace(seg)
-		if fieldName == "" {
+		fieldOrCall := strings.TrimSpace(seg)
+		if fieldOrCall == "" {
 			return resolver.TypeInfo{}, false
 		}
-		if info, found := resolver.LookupFlat(types, cur.QName, fieldName); found {
+		if methodName, isCall := stripCallSuffix(fieldOrCall); isCall {
+			next, matched := lookupChainedMethodReturnType(rc, cur, methodName)
+			if !matched {
+				return resolver.TypeInfo{}, false
+			}
+			cur = next
+			continue
+		}
+		if info, found := resolver.LookupFlat(types, cur.QName, fieldOrCall); found {
 			cur = info
 			continue
 		}
-		if info, found := resolver.LookupFlat(types, cur.Name, fieldName); found {
+		if info, found := resolver.LookupFlat(types, cur.Name, fieldOrCall); found {
 			cur = info
 			continue
 		}
 		if localClassesByQName != nil {
 			if cls, found := localClassesByQName[cur.QName]; found {
-				if next, matched := lookupFieldOnParsedClass(cls, fieldName, cur.Package); matched {
+				if next, matched := lookupFieldOnParsedClass(cls, fieldOrCall, cur.Package); matched {
 					cur = next
 					continue
 				}
 			}
 		}
-		if next, matched := lookupCrossFileFieldType(rc, cur, fieldName); matched {
+		if next, matched := lookupCrossFileFieldType(rc, cur, fieldOrCall); matched {
 			cur = next
 			continue
 		}
@@ -225,6 +294,231 @@ func LookupScopedReceiverType(
 	}
 
 	return cur, true
+}
+
+func splitReceiverChain(recv string) []string {
+	s := strings.TrimSpace(recv)
+	if s == "" {
+		return nil
+	}
+	var parts []string
+	paren, bracket, angle := 0, 0, 0
+	start := 0
+	for i := 0; i < len(s); i++ {
+		switch s[i] {
+		case '(':
+			paren++
+		case ')':
+			if paren > 0 {
+				paren--
+			}
+		case '[':
+			bracket++
+		case ']':
+			if bracket > 0 {
+				bracket--
+			}
+		case '<':
+			angle++
+		case '>':
+			if angle > 0 {
+				angle--
+			}
+		case '.':
+			if paren == 0 && bracket == 0 && angle == 0 {
+				if seg := strings.TrimSpace(s[start:i]); seg != "" {
+					parts = append(parts, seg)
+				}
+				start = i + 1
+			}
+		}
+	}
+	if tail := strings.TrimSpace(s[start:]); tail != "" {
+		parts = append(parts, tail)
+	}
+	return parts
+}
+
+func stripCallSuffix(seg string) (string, bool) {
+	s := strings.TrimSpace(strings.TrimRight(seg, "?!"))
+	if !strings.HasSuffix(s, ")") {
+		return s, false
+	}
+	depth := 0
+	for i := len(s) - 1; i >= 0; i-- {
+		switch s[i] {
+		case ')':
+			depth++
+		case '(':
+			depth--
+			if depth == 0 {
+				name := strings.TrimSpace(s[:i])
+				if gIdx := strings.Index(name, "::"); gIdx >= 0 && strings.Contains(name, "<") {
+					// Keep Turbofish base like parse::<Order> -> parse
+					if lt := strings.IndexByte(name, '<'); lt >= 0 {
+						name = strings.TrimSuffix(name[:lt], "::")
+					}
+				}
+				return name, name != ""
+			}
+		}
+	}
+	return s, false
+}
+
+func resolveInitialCallSegmentType(
+	rc *resolver.ResolutionContext,
+	callerQName, callName string,
+	types map[string]resolver.TypeInfo,
+	localClassesByQName map[string]parser.ParsedClass,
+) (resolver.TypeInfo, bool) {
+	if callName == "" {
+		return resolver.TypeInfo{}, false
+	}
+	if info, ok := resolver.LookupFlat(types, callerQName, callName); ok && info.CallableQName == "" {
+		return info, true
+	}
+	for _, cls := range localClassesByQName {
+		if cls.Name == callName {
+			return resolver.TypeInfo{Name: cls.Name, QName: cls.QName, Package: PackageScopePrefix(cls.QName)}, true
+		}
+	}
+	if rc == nil {
+		return resolver.TypeInfo{}, false
+	}
+	var retType string
+	var srcPkg string
+	lookupSym := callName
+	assocHint := ""
+	if idx := strings.LastIndex(callName, "::"); idx >= 0 {
+		assocHint = callName[:idx]
+		lookupSym = callName[idx+2:]
+		if sep := strings.LastIndex(assocHint, "::"); sep >= 0 {
+			assocHint = assocHint[sep+2:]
+		}
+	}
+	for _, n := range rc.LookupByName(lookupSym) {
+		if assocHint == "" && (n.Kind == graph.KindClass || n.Kind == graph.KindStruct) {
+			return resolver.TypeInfo{Name: n.Name, QName: n.QName, Package: PackageScopePrefix(n.QName)}, true
+		}
+		if n.Kind == graph.KindFunction && n.ReturnType != "" {
+			if assocHint != "" && !strings.HasSuffix(n.QName, "::"+callName) && resolver.StripTypeDecorations(n.Receiver) != assocHint {
+				continue
+			}
+			if retType == "" {
+				retType = n.ReturnType
+				srcPkg = PackageScopePrefix(n.QName)
+			} else if retType != n.ReturnType {
+				return resolver.TypeInfo{}, false
+			}
+		}
+	}
+	base := extractPrimaryInnerType(retType)
+	if base == "" {
+		return resolver.TypeInfo{}, false
+	}
+	return resolver.TypeInfo{Name: base, Package: srcPkg}, true
+}
+
+func lookupChainedMethodReturnType(rc *resolver.ResolutionContext, cur resolver.TypeInfo, methodName string) (resolver.TypeInfo, bool) {
+	if methodName == "" || rc == nil {
+		return resolver.TypeInfo{}, false
+	}
+	recvBase := resolver.StripTypeDecorations(cur.Name)
+	var retType string
+	var pkgScope string
+	if cur.QName != "" && rc.View != nil {
+		for _, n := range rc.View.GetByQName(cur.QName + "::" + methodName) {
+			if n.Kind == graph.KindFunction && n.ReturnType != "" {
+				retType = n.ReturnType
+				pkgScope = PackageScopePrefix(n.QName)
+				break
+			}
+		}
+	}
+	if retType == "" && recvBase != "" {
+		for _, n := range rc.LookupByName(methodName) {
+			if n.Kind == graph.KindFunction && resolver.StripTypeDecorations(n.Receiver) == recvBase && n.ReturnType != "" {
+				if retType == "" {
+					retType = n.ReturnType
+					pkgScope = PackageScopePrefix(n.QName)
+				} else if retType != n.ReturnType {
+					return resolver.TypeInfo{}, false
+				}
+			}
+		}
+	}
+	base := extractPrimaryInnerType(retType)
+	if base == "" {
+		return resolver.TypeInfo{}, false
+	}
+	outPkg := pkgScope
+	if outPkg == "" {
+		outPkg = cur.Package
+	}
+	qname := ""
+	if rc.View != nil && outPkg != "" {
+		for _, n := range rc.View.GetByQName(outPkg + "::" + base) {
+			if n.Kind == graph.KindClass || n.Kind == graph.KindStruct {
+				qname = n.QName
+				break
+			}
+		}
+	}
+	return resolver.TypeInfo{Name: base, QName: qname, Package: outPkg}, true
+}
+
+func unwrapCommonWrapperType(s string) string {
+	s = strings.TrimSpace(s)
+	if strings.EqualFold(s, "Result") || strings.EqualFold(s, "Option") || strings.EqualFold(s, "Optional") {
+		return ""
+	}
+	return s
+}
+
+func extractPrimaryInnerType(retType string) string {
+	trimmed := strings.TrimSpace(retType)
+	for _, prefix := range []string{"Result<", "Option<", "Optional[", "Box<", "Arc<", "Rc<"} {
+		if strings.HasPrefix(trimmed, prefix) {
+			openCh := prefix[len(prefix)-1]
+			closeCh := byte('>')
+			if openCh == '[' {
+				closeCh = ']'
+			}
+			if end := strings.LastIndexByte(trimmed, closeCh); end > len(prefix) {
+				inner := trimmed[len(prefix):end]
+				if prefix == "Result<" {
+					if comma := strings.IndexByte(inner, ','); comma > 0 {
+						inner = inner[:comma]
+					}
+				}
+				return resolver.StripTypeDecorations(inner)
+			}
+		}
+	}
+	return unwrapCommonWrapperType(resolver.StripTypeDecorations(trimmed))
+}
+
+// ResolveCallableAlias checks whether calleeName inside callerQName is bound in types
+// to a callable function/symbol (e.g., `fn = helper; fn()`).
+func ResolveCallableAlias(
+	rc *resolver.ResolutionContext,
+	callerQName, calleeName string,
+	types map[string]resolver.TypeInfo,
+) (graph.Node, bool) {
+	if calleeName == "" {
+		return graph.Node{}, false
+	}
+	info, ok := resolver.LookupFlat(types, callerQName, calleeName)
+	if !ok || info.CallableQName == "" {
+		return graph.Node{}, false
+	}
+	if rc != nil && rc.View != nil {
+		if n, unique, _ := FilterUniqueFunctionMatches(rc.View.GetByQName(info.CallableQName), false, nil); unique {
+			return n, true
+		}
+	}
+	return graph.Node{}, false
 }
 
 func lookupFieldOnParsedClass(cls parser.ParsedClass, fieldName, fallbackPkg string) (resolver.TypeInfo, bool) {

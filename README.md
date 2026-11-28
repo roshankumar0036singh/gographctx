@@ -152,8 +152,8 @@ All GoGraphCtx numbers below were measured directly via [`cmd/ggctx-bench`](cmd/
 
 | Tool | Category | Runtime / Setup | Call Graph | Impact BFS | Confidence Tiers | Key Trade-off vs GoGraphCtx |
 |---|---|---|---|---|---|---|
-| **GoGraphCtx** | Code-Graph MCP | **15.8 MB static Go binary**, zero external DB | Yes | Yes (`get_impact`) | **Yes** (8 tiers + `LIKELY_CALLS`) | Sub-second indexing, budgeted MCP payloads, zero setup |
-| **CodeGraphContext (CGC)** | Code-Graph MCP | Python + ~90 pip deps + Neo4j / FalkorDB / Kuzu | Yes | Yes | Partial (emits guesses as facts; ~39% strong tiers measured on Flask) | Requires Cypher graph DB & Python env |
+| **GoGraphCtx** | Code-Graph MCP | **15.8 MB static Go binary**, zero external DB | Yes | Yes (`get_impact`) | **Yes** (8 tiers + `LIKELY_CALLS` + `unresolved_hints`) | **98.4% Flask precision**, sub-second index, zero DB setup (trades aggressive speculative guesses for high-precision edges + explicit unresolved disclosure) |
+| **CodeGraphContext (CGC)** | Code-Graph MCP | Python + ~90 pip deps + Neo4j / FalkorDB / Kuzu | Yes | Yes | Partial (emits Tier 7–8 guesses as facts; ~61% of edges) | **69.2% Flask precision**, higher heuristic recall (~70% vs Jedi), requires Cypher DB & Python env |
 | **SCIP** (`scip-python`, `scip-go`) | Compiler Oracle | Node/Python/Go toolchain + full dependency install | Yes | External script | Exact compiler oracle | Requires buildable env & project deps installed |
 | **Universal Ctags** | Tag Indexer | Native CLI binary | No | No | No | No cross-file call graph or receiver type resolution |
 | **ast-grep (`sg`)** | AST Search CLI | Rust binary | No | No | Exact syntax match | Great ad-hoc syntax search, no persistent call/impact graph |

@@ -108,8 +108,8 @@ claude mcp add gographctx -- gographctx watch /absolute/path/to/your/repo
 
 | 工具 | 架构与部署 | 调用图 | 影响范围 BFS | 置信度分级 | 与 GoGraphCtx 对比说明 |
 |---|---|---|---|---|---|
-| **GoGraphCtx** | **15.8 MB 单二进制**，内置快照+WAL | 支持 | 支持 | **支持（8 级）** | 零外部数据库，亚秒级索引与 Token 预算控制 |
-| **CodeGraphContext (CGC)** | Python + 约 90 个依赖 + Neo4j/FalkorDB | 支持 | 支持 | 部分（猜测常直接入边） | 依赖图数据库与 Python 运行时 |
+| **GoGraphCtx** | **15.8 MB 单二进制**，内置快照+WAL | 支持 | 支持 | **支持（8 级 + `unresolved_hints`）** | 98.4% Flask 精确率、亚秒级索引、零图数据库；通过 `unresolved_hints` 显式披露未解析调用点而非猜测入边 |
+| **CodeGraphContext (CGC)** | Python + 约 90 个依赖 + Neo4j/FalkorDB | 支持 | 支持 | 部分（约 61% 为 Tier 7-8 启发式猜测） | Flask 精确率 69.2%（启发式召回率约 70%），依赖图数据库与 Python 运行时 |
 | **SCIP**（`scip-python` 等） | 需完整编译器环境与项目依赖 | 支持 | 需外部脚本 | 编译器精标准 | 精度基准参照，但依赖环境配置与全量依赖安装 |
 | **Universal Ctags** | 轻量符号标签 CLI | 不支持 | 不支持 | 不支持 | 仅做符号位置标签，无调用链与类型推断 |
 | **ast-grep (`sg`)** | AST 结构模式搜索 CLI | 不支持 | 不支持 | 语法精确匹配 | 擅长语法模式搜索，无持久化跨文件调用图 |
