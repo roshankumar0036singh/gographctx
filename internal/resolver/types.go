@@ -246,11 +246,12 @@ func InferTypes(ctx context.Context, file *parser.ParsedFile, rc *ResolutionCont
 			continue
 		}
 		tm.Set("", v.Name, TypeInfo{
-			Name:       vt,
-			Package:    file.Package,
-			Origin:     OriginAssignment,
-			Confidence: 0.95,
-			Line:       v.StartLine,
+			Name:        vt,
+			ElementType: ExtractContainerElementType(v.Type),
+			Package:     file.Package,
+			Origin:      OriginAssignment,
+			Confidence:  0.95,
+			Line:        v.StartLine,
 		})
 	}
 
@@ -293,11 +294,12 @@ func InferTypes(ctx context.Context, file *parser.ParsedFile, rc *ResolutionCont
 				continue
 			}
 			tm.Set(fn.QName, p.Name, TypeInfo{
-				Name:       pt,
-				Package:    file.Package,
-				Origin:     OriginParameter,
-				Confidence: 0.96,
-				Line:       fn.StartLine,
+				Name:        pt,
+				ElementType: ExtractContainerElementType(p.Type),
+				Package:     file.Package,
+				Origin:      OriginParameter,
+				Confidence:  0.96,
+				Line:        fn.StartLine,
 			})
 		}
 	}
@@ -336,7 +338,13 @@ func inferLocalVarType(
 	fnReturnsByQName map[string]string,
 ) (TypeInfo, bool) {
 	if lv.ExplicitType != "" {
-		base := StripTypeDecorations(lv.ExplicitType)
+		rawType := lv.ExplicitType
+		elemType := ExtractContainerElementType(rawType)
+		base := StripTypeDecorations(rawType)
+		if lv.UnwrapElement && elemType != "" {
+			base = StripTypeDecorations(elemType)
+			elemType = ExtractContainerElementType(elemType)
+		}
 		if base != "" {
 			origin := OriginAssignment
 			conf := float32(0.95)
@@ -344,11 +352,12 @@ func inferLocalVarType(
 				origin = OriginConstructor
 			}
 			return TypeInfo{
-				Name:       base,
-				Package:    file.Package,
-				Origin:     origin,
-				Confidence: conf,
-				Line:       lv.Line,
+				Name:        base,
+				ElementType: elemType,
+				Package:     file.Package,
+				Origin:      origin,
+				Confidence:  conf,
+				Line:        lv.Line,
 			}, true
 		}
 	}
@@ -372,14 +381,20 @@ func inferLocalVarType(
 	if lv.InitCallee != "" {
 		if retType, found := resolveCallReturnType(file, lv, tm, rc, fnReturnsByName, fnReturnsByQName); found {
 			part := pickReturnElement(retType, lv.ResultIndex)
+			elemType := ExtractContainerElementType(part)
 			base := StripTypeDecorations(part)
+			if lv.UnwrapElement && elemType != "" {
+				base = StripTypeDecorations(elemType)
+				elemType = ExtractContainerElementType(elemType)
+			}
 			if isUsefulInferredType(base) {
 				return TypeInfo{
-					Name:       base,
-					Package:    file.Package,
-					Origin:     OriginReturnType,
-					Confidence: 0.88,
-					Line:       lv.Line,
+					Name:        base,
+					ElementType: elemType,
+					Package:     file.Package,
+					Origin:      OriginReturnType,
+					Confidence:  0.88,
+					Line:        lv.Line,
 				}, true
 			}
 		}
@@ -424,6 +439,19 @@ func inferLocalVarType(
 
 	if lv.InitAlias != "" {
 		if aliased, ok := tm.LookupReceiver(lv.ScopeQName, lv.InitAlias); ok {
+			if lv.UnwrapElement && aliased.ElementType != "" {
+				elemBase := StripTypeDecorations(aliased.ElementType)
+				if isUsefulInferredType(elemBase) {
+					return TypeInfo{
+						Name:        elemBase,
+						ElementType: ExtractContainerElementType(aliased.ElementType),
+						Package:     aliased.Package,
+						Origin:      OriginAssignment,
+						Confidence:  0.84,
+						Line:        lv.Line,
+					}, true
+				}
+			}
 			aliased.Origin = OriginAssignment
 			if aliased.Confidence > 0.82 {
 				aliased.Confidence = 0.82
@@ -613,4 +641,69 @@ func isUsefulInferredType(base string) bool {
 	default:
 		return true
 	}
+}
+
+// ExtractContainerElementType extracts the inner element/item type T from typed
+// container annotations such as `list[T]`, `List[T]`, `Sequence[T]`, `Vec<T>`, `&[T]`, `[]T`, `map[K]V`.
+func ExtractContainerElementType(raw string) string {
+	s := strings.TrimSpace(raw)
+	if s == "" {
+		return ""
+	}
+	for {
+		prev := s
+		s = strings.TrimSpace(strings.TrimPrefix(s, "&"))
+		if strings.HasPrefix(s, "'") {
+			if sp := strings.IndexByte(s, ' '); sp > 0 {
+				s = strings.TrimSpace(s[sp+1:])
+			}
+		}
+		s = strings.TrimSpace(strings.TrimPrefix(s, "mut "))
+		s = strings.TrimSpace(strings.TrimPrefix(s, "*"))
+		if s == prev {
+			break
+		}
+	}
+	if strings.HasPrefix(s, "[]") {
+		return strings.TrimSpace(s[2:])
+	}
+	if strings.HasPrefix(s, "[") && strings.HasSuffix(s, "]") {
+		inner := strings.TrimSpace(s[1 : len(s)-1])
+		if semi := strings.IndexByte(inner, ';'); semi >= 0 {
+			return strings.TrimSpace(inner[:semi])
+		}
+		return inner
+	}
+	if strings.HasPrefix(s, "map[") {
+		depth := 0
+		for i := 3; i < len(s); i++ {
+			switch s[i] {
+			case '[':
+				depth++
+			case ']':
+				depth--
+				if depth == 0 && i+1 < len(s) {
+					return strings.TrimSpace(s[i+1:])
+				}
+			}
+		}
+	}
+	for _, wrap := range []string{"list[", "List[", "Sequence[", "Iterable[", "Iterator[", "Set[", "set[", "Vec<", "VecDeque<", "HashSet<", "BTreeSet<", "List<", "Set<", "Collection<", "Iterable<", "Stream<", "Array<", "ReadonlyArray<"} {
+		if strings.HasPrefix(s, wrap) && (strings.HasSuffix(s, "]") || strings.HasSuffix(s, ">")) {
+			return strings.TrimSpace(s[len(wrap) : len(s)-1])
+		}
+	}
+	for _, dictWrap := range []string{"dict[", "Dict[", "Mapping[", "HashMap<", "BTreeMap<", "Map<"} {
+		if strings.HasPrefix(s, dictWrap) && (strings.HasSuffix(s, "]") || strings.HasSuffix(s, ">")) {
+			inner := s[len(dictWrap) : len(s)-1]
+			parts := splitTopLevelCommas(inner)
+			if len(parts) >= 2 {
+				return strings.TrimSpace(parts[1])
+			}
+		}
+	}
+	if strings.HasPrefix(s, "chan ") {
+		return strings.TrimSpace(strings.TrimPrefix(s, "chan "))
+	}
+	return ""
 }

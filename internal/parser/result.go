@@ -29,15 +29,17 @@ type ParsedFile struct {
 // ParsedLocalVar records an in-function variable/attribute binding extracted
 // during the single AST pass for scope-aware receiver type inference.
 type ParsedLocalVar struct {
-	ScopeQName    string `json:"scope_qname"`
-	Name          string `json:"name"`
-	ExplicitType  string `json:"explicit_type,omitempty"`
-	InitCallee    string `json:"init_callee,omitempty"`
-	InitReceiver  string `json:"init_receiver,omitempty"`
-	InitAlias     string `json:"init_alias,omitempty"`
-	IsConstructor bool   `json:"is_constructor,omitempty"`
-	ResultIndex   uint8  `json:"result_index,omitempty"`
-	Line          uint32 `json:"line,omitempty"`
+	ScopeQName       string `json:"scope_qname"`
+	Name             string `json:"name"`
+	ExplicitType     string `json:"explicit_type,omitempty"`
+	InitCallee       string `json:"init_callee,omitempty"`
+	InitReceiver     string `json:"init_receiver,omitempty"`
+	InitAlias        string `json:"init_alias,omitempty"`
+	DestructuredProp string `json:"destructured_prop,omitempty"`
+	IsConstructor    bool   `json:"is_constructor,omitempty"`
+	UnwrapElement    bool   `json:"unwrap_element,omitempty"`
+	ResultIndex      uint8  `json:"result_index,omitempty"`
+	Line             uint32 `json:"line,omitempty"`
 }
 
 // ParsedCounts summarizes extracted entity totals for a ParsedFile.

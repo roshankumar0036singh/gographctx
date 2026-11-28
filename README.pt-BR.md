@@ -90,7 +90,7 @@ Executado com [`cmd/ggctx-bench`](cmd/ggctx-bench/main.go) (`go1.25.1`, `windows
 | **Atualização incremental (p50)** | **22.78 ms** (corpo) / **22.77 ms** (export) | `< 50ms` / `< 100ms` |
 | **Latência MCP (p95) / Binário** | **3.80 ms** / **15.79 MB** | `< 10ms` / `< 30 MB` |
 
-Veja [docs/benchmarks.md](docs/benchmarks.md) para a comparação detalhada contra **CGC**, **SCIP**, **Universal Ctags**, **ast-grep**, **Serena** e **ripgrep**.
+Veja [docs/benchmarks.md](docs/benchmarks.md) para a comparação detalhada contra **CGC**, **SCIP**, **Universal Ctags**, **ast-grep**, **Serena** e **ripgrep** (incluindo **98,4% de precisão no Flask** vs. **69,2% no CGC**, transparência `unresolved_hints` e `~492 ms` vs. `92,7 s` de indexação).
 
 ## Documentação
 

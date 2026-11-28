@@ -185,7 +185,10 @@ func (e *pythonExtractor) walkStatements(container *gotreesitter.Node, scopeQNam
 		case "with_statement":
 			e.recordPythonWithBindings(stmt, callerQName, insideFunc)
 			e.walkControlFlow(stmt, scopeQName, enclosingClass, callerQName, insideFunc)
-		case "if_statement", "for_statement", "while_statement", "try_statement", "match_statement":
+		case "for_statement":
+			e.recordPythonForBinding(stmt, callerQName, insideFunc)
+			e.walkControlFlow(stmt, scopeQName, enclosingClass, callerQName, insideFunc)
+		case "if_statement", "while_statement", "try_statement", "match_statement":
 			// Walk control-flow statements at module/class level for nested defs or calls.
 			e.walkControlFlow(stmt, scopeQName, enclosingClass, callerQName, insideFunc)
 		default:
@@ -574,6 +577,9 @@ func (e *pythonExtractor) walkFunctionBody(node *gotreesitter.Node, funcQName st
 		case "with_statement":
 			e.recordPythonWithBindings(child, funcQName, true)
 			e.walkFunctionBody(child, funcQName)
+		case "for_statement":
+			e.recordPythonForBinding(child, funcQName, true)
+			e.walkFunctionBody(child, funcQName)
 		case "call":
 			e.recordPythonCall(child, funcQName)
 			e.walkFunctionBody(child, funcQName)
@@ -625,6 +631,36 @@ func (e *pythonExtractor) recordPythonWithBindings(withStmt *gotreesitter.Node, 
 		}
 	}
 	walkWith(withStmt)
+}
+
+// recordPythonForBinding captures loop variable types (`for item in orders:` / `for item in get_orders():`).
+func (e *pythonExtractor) recordPythonForBinding(forStmt *gotreesitter.Node, scopeQName string, insideFunc bool) {
+	if forStmt == nil {
+		return
+	}
+	targetScope := scopeQName
+	if !insideFunc {
+		targetScope = ""
+	}
+	leftNode := forStmt.ChildByFieldName("left", e.lang)
+	rightNode := forStmt.ChildByFieldName("right", e.lang)
+	if leftNode == nil || rightNode == nil || leftNode.Type(e.lang) != "identifier" {
+		return
+	}
+	name := strings.TrimSpace(leftNode.Text(e.src))
+	if name == "" || name == "_" {
+		return
+	}
+	lv := parser.ParsedLocalVar{
+		ScopeQName:    targetScope,
+		Name:          name,
+		UnwrapElement: true,
+		Line:          NodeStartLine(forStmt),
+	}
+	e.populatePythonRHS(&lv, rightNode)
+	if lv.ExplicitType != "" || lv.InitCallee != "" || lv.InitAlias != "" {
+		e.out.LocalVars = append(e.out.LocalVars, lv)
+	}
 }
 
 func (e *pythonExtractor) populatePythonRHS(lv *parser.ParsedLocalVar, rightNode *gotreesitter.Node) {

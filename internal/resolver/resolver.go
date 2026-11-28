@@ -53,6 +53,7 @@ type TypeInfo struct {
 	Name          string     `json:"name"`
 	QName         string     `json:"qualified_name,omitempty"`
 	CallableQName string     `json:"callable_qname,omitempty"`
+	ElementType   string     `json:"element_type,omitempty"`
 	Package       string     `json:"package,omitempty"`
 	Origin        TypeOrigin `json:"origin"`
 	Confidence    float32    `json:"confidence"`

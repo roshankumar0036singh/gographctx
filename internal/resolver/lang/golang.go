@@ -619,6 +619,20 @@ func (r *GoResolver) resolveOneCall(
 				LookupKey:   resolver.BuildLookupKey(targetType, targetPkg, call.CalleeName),
 			}, nil, true
 		}
+		if implTarget, okImpl := resolveGoUniqueImplementerMethod(rc, targetPkg, targetType, call.CalleeName); okImpl {
+			return &resolver.ResolvedCall{
+				CallerUID:   callerUID,
+				CallerQName: call.CallerQName,
+				TargetUID:   implTarget.UID,
+				TargetQName: implTarget.QName,
+				Tier:        resolver.TierTypeNarrowed,
+				EdgeKind:    graph.EdgeLikelyCalls,
+				Line:        call.Line,
+				Column:      uint16(call.Col),
+				Method:      "unique EdgeImplements implementer for " + targetType + "." + call.CalleeName,
+				LookupKey:   resolver.BuildLookupKey(targetType, targetPkg, call.CalleeName),
+			}, nil, true
+		}
 		// Fallback search across indexed graph methods matching Receiver == targetType.
 		if rc.View != nil {
 			if target, unique, cands := FilterUniqueFunctionMatches(rc.View.GetByName(call.CalleeName), false, func(n graph.Node) bool {
@@ -814,6 +828,46 @@ func resolveGoReceiverMethod(
 	}
 
 	return graph.Node{}, "", false
+}
+
+// resolveGoUniqueImplementerMethod resolves an interface call to a unique concrete
+// struct linked via EdgeImplements when the interface method node itself is absent.
+func resolveGoUniqueImplementerMethod(rc *resolver.ResolutionContext, pkgScope, ifaceName, methodName string) (graph.Node, bool) {
+	if rc == nil || rc.View == nil || ifaceName == "" || methodName == "" {
+		return graph.Node{}, false
+	}
+	var ifaceNodes []graph.Node
+	if pkgScope != "" {
+		ifaceNodes = rc.View.GetByQName(pkgScope + "::" + ifaceName)
+	}
+	if len(ifaceNodes) == 0 {
+		for _, n := range rc.View.GetByName(ifaceName) {
+			if n.Kind == graph.KindInterface {
+				ifaceNodes = append(ifaceNodes, n)
+			}
+		}
+	}
+	if len(ifaceNodes) != 1 || ifaceNodes[0].Kind != graph.KindInterface {
+		return graph.Node{}, false
+	}
+	var implMethods []graph.Node
+	seenUID := make(map[graph.UID]struct{})
+	for _, edge := range rc.View.GetIncomingEdges(ifaceNodes[0].UID, graph.EdgeImplements) {
+		implCls, ok := rc.View.GetNode(edge.Source)
+		if !ok {
+			continue
+		}
+		if m, found, _ := FilterUniqueFunctionMatches(rc.View.GetByQName(implCls.QName+"::"+methodName), false, nil); found {
+			if _, dup := seenUID[m.UID]; !dup {
+				seenUID[m.UID] = struct{}{}
+				implMethods = append(implMethods, m)
+			}
+		}
+	}
+	if len(implMethods) == 1 {
+		return implMethods[0], true
+	}
+	return graph.Node{}, false
 }
 
 func lookupStructBases(rc *resolver.ResolutionContext, pkgScope, typeName string, localClassByName map[string]parser.ParsedClass) []string {

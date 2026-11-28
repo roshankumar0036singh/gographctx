@@ -90,7 +90,7 @@ claude mcp add gographctx -- gographctx watch /absolute/path/to/your/repo
 | **증분 업데이트 (p50)** | **22.78 ms** (본문) / **22.77 ms** (시그니처) | `< 50ms` / `< 100ms` |
 | **MCP 쿼리 지연 (p95) / 바이너리 크기** | **3.80 ms** / **15.79 MB** | `< 10ms` / `< 30 MB` |
 
-CGC, SCIP, Universal Ctags, ast-grep, Serena, ripgrep과의 상세 비교는 [docs/benchmarks.md](docs/benchmarks.md)를 참고하세요.
+CGC, SCIP, Universal Ctags, ast-grep, Serena, ripgrep과의 상세 비교(**Flask 정밀도 98.4% vs CGC 69.2%**, `unresolved_hints` 미해결 호출 공개 및 **492 ms vs 92.7 s** 인덱싱 속도 포함)는 [docs/benchmarks.md](docs/benchmarks.md)를 참고하세요.
 
 ## 문서 안내
 

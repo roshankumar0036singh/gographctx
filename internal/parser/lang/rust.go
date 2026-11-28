@@ -727,6 +727,10 @@ func (e *rustExtractor) collectCalls(node *gotreesitter.Node, callerQName string
 		e.recordRustLocalVar(node, callerQName)
 	case "let_condition":
 		e.recordRustLetCondition(node, callerQName)
+	case "for_expression":
+		e.recordRustForExpression(node, callerQName)
+	case "match_expression":
+		e.recordRustMatchArms(node, callerQName)
 	case "call_expression":
 		e.recordRustCall(node, callerQName)
 	case "macro_invocation":
@@ -777,6 +781,60 @@ func (e *rustExtractor) recordRustLetCondition(cond *gotreesitter.Node, scopeQNa
 	}
 	if lv.ExplicitType != "" || lv.InitCallee != "" || lv.InitAlias != "" {
 		e.out.LocalVars = append(e.out.LocalVars, lv)
+	}
+}
+
+// recordRustForExpression captures element bindings in `for item in items` loops.
+func (e *rustExtractor) recordRustForExpression(expr *gotreesitter.Node, scopeQName string) {
+	patNode := expr.ChildByFieldName("pattern", e.lang)
+	name := extractRustBoundIdent(patNode, e.lang, e.src)
+	if name == "" || name == "_" {
+		return
+	}
+	lv := parser.ParsedLocalVar{
+		ScopeQName:    scopeQName,
+		Name:          name,
+		UnwrapElement: true,
+		Line:          NodeStartLine(expr),
+	}
+	if val := expr.ChildByFieldName("value", e.lang); val != nil {
+		e.populateRustRHS(&lv, val)
+	}
+	if lv.ExplicitType != "" || lv.InitCallee != "" || lv.InitAlias != "" {
+		e.out.LocalVars = append(e.out.LocalVars, lv)
+	}
+}
+
+// recordRustMatchArms captures `Some(x)` / `Ok(x)` arm pattern bindings from `match expr { ... }`.
+func (e *rustExtractor) recordRustMatchArms(matchExpr *gotreesitter.Node, scopeQName string) {
+	valNode := matchExpr.ChildByFieldName("value", e.lang)
+	bodyNode := matchExpr.ChildByFieldName("body", e.lang)
+	if valNode == nil || bodyNode == nil {
+		return
+	}
+	for i := 0; i < bodyNode.NamedChildCount(); i++ {
+		arm := bodyNode.NamedChild(i)
+		if arm == nil || arm.Type(e.lang) != "match_arm" {
+			continue
+		}
+		patWrapper := arm.ChildByFieldName("pattern", e.lang)
+		patNode := patWrapper
+		if patNode != nil && patNode.Type(e.lang) == "match_pattern" && patNode.NamedChildCount() > 0 {
+			patNode = patNode.NamedChild(0)
+		}
+		name := extractRustBoundIdent(patNode, e.lang, e.src)
+		if name == "" || name == "_" {
+			continue
+		}
+		lv := parser.ParsedLocalVar{
+			ScopeQName: scopeQName,
+			Name:       name,
+			Line:       NodeStartLine(arm),
+		}
+		e.populateRustRHS(&lv, valNode)
+		if lv.ExplicitType != "" || lv.InitCallee != "" || lv.InitAlias != "" {
+			e.out.LocalVars = append(e.out.LocalVars, lv)
+		}
 	}
 }
 
@@ -847,7 +905,7 @@ func (e *rustExtractor) populateRustRHS(lv *parser.ParsedLocalVar, val *gotreesi
 				}
 			case "scoped_identifier":
 				if pathNode := fn.ChildByFieldName("path", e.lang); pathNode != nil {
-					lv.InitReceiver = stripRustGenericsAndLifetimes(pathNode.Text(e.src))
+					lv.InitReceiver = e.extractRustScopedReceiver(pathNode)
 				}
 				if nameNode := fn.ChildByFieldName("name", e.lang); nameNode != nil {
 					lv.InitCallee = strings.TrimSpace(nameNode.Text(e.src))
@@ -860,6 +918,28 @@ func (e *rustExtractor) populateRustRHS(lv *parser.ParsedLocalVar, val *gotreesi
 	case "identifier", "field_expression":
 		lv.InitAlias = CollapseWhitespace(cur.Text(e.src))
 	}
+}
+
+func (e *rustExtractor) extractRustScopedReceiver(pathNode *gotreesitter.Node) string {
+	if pathNode == nil {
+		return ""
+	}
+	if pathNode.Type(e.lang) == "bracketed_type" {
+		if t := pathNode.ChildByFieldName("type", e.lang); t != nil {
+			return stripRustGenericsAndLifetimes(t.Text(e.src))
+		}
+		if pathNode.NamedChildCount() > 0 {
+			return stripRustGenericsAndLifetimes(pathNode.NamedChild(0).Text(e.src))
+		}
+	}
+	raw := CollapseWhitespace(pathNode.Text(e.src))
+	if strings.HasPrefix(raw, "<") && strings.Contains(raw, " as ") {
+		inner := strings.TrimPrefix(raw, "<")
+		if idx := strings.Index(inner, " as "); idx > 0 {
+			return stripRustGenericsAndLifetimes(inner[:idx])
+		}
+	}
+	return stripRustGenericsAndLifetimes(raw)
 }
 
 func (e *rustExtractor) recordRustCall(callNode *gotreesitter.Node, callerQName string) {
@@ -900,7 +980,7 @@ func (e *rustExtractor) recordRustCall(callNode *gotreesitter.Node, callerQName 
 		pathNode := fnNode.ChildByFieldName("path", e.lang)
 		nameNode := fnNode.ChildByFieldName("name", e.lang)
 		if pathNode != nil {
-			call.ReceiverName = stripRustGenericsAndLifetimes(pathNode.Text(e.src))
+			call.ReceiverName = e.extractRustScopedReceiver(pathNode)
 		}
 		if nameNode != nil {
 			call.CalleeName = strings.TrimSpace(nameNode.Text(e.src))

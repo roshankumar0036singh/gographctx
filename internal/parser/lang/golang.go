@@ -735,6 +735,10 @@ func (e *goExtractor) collectCalls(node *gotreesitter.Node, callerQName string) 
 		if callerQName != e.pkgInitCaller {
 			e.recordGoLocalVarDecl(node, callerQName)
 		}
+	case "range_clause":
+		if callerQName != e.pkgInitCaller {
+			e.recordGoRangeClause(node, callerQName)
+		}
 	case "call_expression":
 		e.recordCallExpression(node, callerQName)
 	case "type_conversion_expression":
@@ -798,6 +802,36 @@ func (e *goExtractor) recordGoLocalAssign(stmt *gotreesitter.Node, scopeQName st
 	lhsNodes := collectExprList(leftNode, e.lang)
 	rhsNodes := collectExprList(rightNode, e.lang)
 	e.emitGoLocalBindings(scopeQName, NodeStartLine(stmt), lhsNodes, "", rhsNodes)
+}
+
+func (e *goExtractor) recordGoRangeClause(clause *gotreesitter.Node, scopeQName string) {
+	if clause == nil {
+		return
+	}
+	leftNode := clause.ChildByFieldName("left", e.lang)
+	rightNode := clause.ChildByFieldName("right", e.lang)
+	if leftNode == nil || rightNode == nil {
+		return
+	}
+	lhs := collectExprList(leftNode, e.lang)
+	// For `for _, v := range items`, bind value variable v (index 1) to container element type.
+	if len(lhs) < 2 || lhs[1] == nil || lhs[1].Type(e.lang) != "identifier" {
+		return
+	}
+	name := strings.TrimSpace(lhs[1].Text(e.src))
+	if name == "" || name == "_" {
+		return
+	}
+	lv := parser.ParsedLocalVar{
+		ScopeQName:    scopeQName,
+		Name:          name,
+		UnwrapElement: true,
+		Line:          NodeStartLine(clause),
+	}
+	e.populateGoLocalRHS(&lv, rightNode)
+	if lv.ExplicitType != "" || lv.InitCallee != "" || lv.InitAlias != "" {
+		e.out.LocalVars = append(e.out.LocalVars, lv)
+	}
 }
 
 func (e *goExtractor) emitGoLocalBindings(scopeQName string, line uint32, lhs []*gotreesitter.Node, explicitType string, rhs []*gotreesitter.Node) {
