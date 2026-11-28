@@ -49,4 +49,9 @@ jobs:
         shell: bash
         env:
           CGO_ENABLED: "1"
-        run: go test -race -count=1 -v ./internal/pipeline/... ./internal/storage/... ./internal/watcher/... ./internal/mcp/... ./internal/bench/... ./cmd/...
+        run: |
+          EXTRA_FLAGS=""
+          if [ "${RUNNER_OS}" = "macOS" ]; then
+            EXTRA_FLAGS="-ldflags=-linkmode=external"
+          fi
+          go test -race ${EXTRA_FLAGS} -count=1 -v ./internal/pipeline/... ./internal/storage/... ./internal/watcher/... ./internal/mcp/... ./internal/bench/... ./cmd/...

@@ -37,7 +37,12 @@ jobs:
         shell: bash
         env:
           CGO_ENABLED: "1"
-        run: go test -short -race -coverprofile=coverage.out -covermode=atomic ./...
+        run: |
+          EXTRA_FLAGS=""
+          if [ "${RUNNER_OS}" = "macOS" ]; then
+            EXTRA_FLAGS="-ldflags=-linkmode=external"
+          fi
+          go test -short -race ${EXTRA_FLAGS} -coverprofile=coverage.out -covermode=atomic ./...
 
       - name: Summarize per-package coverage
         if: always() && matrix.os == 'ubuntu-latest' && matrix.go-version == '1.25'
