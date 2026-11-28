@@ -1,0 +1,104 @@
+{
+  "confidence_summary": {
+    "certain": 0,
+    "likely": 0,
+    "max_confidence": 0,
+    "min_confidence": 0,
+    "overall_label": "certain",
+    "unresolved": 0
+  },
+  "data": {
+    "call_site_count": 0,
+    "complexity_distribution": {
+      "high_11_20": 0,
+      "low_1_5": 4,
+      "medium_6_10": 0,
+      "very_high_gt_20": 0
+    },
+    "edge_count": 7,
+    "edges_by_kind": {
+      "CONTAINS": 7
+    },
+    "edges_by_tier": {
+      "structural": 7
+    },
+    "file_count": 3,
+    "node_count": 10,
+    "nodes_by_kind": {
+      "File": 3,
+      "Function": 4,
+      "Module": 3
+    },
+    "nodes_by_language": {
+      "go": 4,
+      "python": 3,
+      "typescript": 3
+    },
+    "resolution_coverage": 0,
+    "top_complex_functions": [
+      {
+        "complexity": 1,
+        "end_line": 2,
+        "exported": true,
+        "file": "backend/svc.go",
+        "kind": "Function",
+        "language": "go",
+        "name": "Handle",
+        "qualified_name": "backend::Handle",
+        "start_line": 2,
+        "uid": "e62399df4ea921f79c1d806cf0b3badc"
+      },
+      {
+        "complexity": 1,
+        "end_line": 3,
+        "exported": true,
+        "file": "backend/svc.go",
+        "kind": "Function",
+        "language": "go",
+        "name": "Helper",
+        "qualified_name": "backend::Helper",
+        "start_line": 3,
+        "uid": "8ec9212a7a568acdb0523ed4ca5f9d24"
+      },
+      {
+        "complexity": 1,
+        "end_line": 2,
+        "exported": true,
+        "file": "scripts/job.py",
+        "kind": "Function",
+        "language": "python",
+        "name": "run_job",
+        "qualified_name": "scripts.job::run_job",
+        "start_line": 1,
+        "uid": "42f9c87bb3e31183c2063b7618294a0b"
+      },
+      {
+        "complexity": 1,
+        "end_line": 1,
+        "exported": true,
+        "file": "web/ui.ts",
+        "kind": "Function",
+        "language": "typescript",
+        "name": "render",
+        "qualified_name": "web/ui::render",
+        "return_type": "string",
+        "start_line": 1,
+        "uid": "c43acb226a2608a879b1ff2e6347a476"
+      }
+    ]
+  },
+  "metadata": {
+    "estimated_tokens": 430,
+    "index_version": 1,
+    "repo_name": "mixed-polyglot",
+    "resolution_coverage": 0,
+    "timestamp": "2026-11-28T00:00:00Z",
+    "token_budget": 4000,
+    "tool": "repo_overview"
+  },
+  "returned": 4,
+  "summary": "3 file(s), 10 symbol node(s), 7 edge(s), 0.0% resolution coverage",
+  "tool": "repo_overview",
+  "total": 4,
+  "truncated": false
+}

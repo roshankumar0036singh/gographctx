@@ -1,0 +1,42 @@
+{
+  "confidence_summary": {
+    "certain": 0,
+    "likely": 0,
+    "max_confidence": 0,
+    "min_confidence": 0,
+    "overall_label": "certain",
+    "unresolved": 0
+  },
+  "data": {
+    "symbols": [
+      {
+        "complexity": 1,
+        "end_line": 4,
+        "exported": true,
+        "file": "pkg/repo.go",
+        "kind": "Function",
+        "language": "go",
+        "name": "Load",
+        "qualified_name": "pkg::Store::Load",
+        "receiver": "Store",
+        "return_type": "string",
+        "start_line": 4,
+        "uid": "81134882487df2bce35f81fdd4d055af"
+      }
+    ]
+  },
+  "metadata": {
+    "estimated_tokens": 169,
+    "index_version": 1,
+    "repo_name": "orders-go",
+    "resolution_coverage": 1,
+    "timestamp": "2026-11-28T00:00:00Z",
+    "token_budget": 4000,
+    "tool": "find_symbol"
+  },
+  "returned": 1,
+  "summary": "Found 1 matching symbol(s)",
+  "tool": "find_symbol",
+  "total": 1,
+  "truncated": false
+}

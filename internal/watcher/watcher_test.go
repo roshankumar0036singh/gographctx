@@ -145,7 +145,28 @@ def emit_metric(val: str) -> str:
 		}
 	}
 
-	// 4. Graceful shutdown.
+	// 4. Delete subdirectory and verify tracked dir + files inside it are removed from the graph.
+	if err := os.RemoveAll(subDir); err != nil {
+		t.Fatalf("RemoveAll extra failed: %v", err)
+	}
+	fw.EnqueueEvent(fsnotify.Event{Name: subDir, Op: fsnotify.Remove})
+	delDeadline := time.After(3 * time.Second)
+	for {
+		var stillPresent bool
+		eng.Graph().View(func(v *graph.ReadView) {
+			stillPresent = len(v.GetByQName("pkg.extra.worker::tick")) > 0 || len(v.FileNodes("pkg/extra/worker.py")) > 0
+		})
+		if !stillPresent {
+			break
+		}
+		select {
+		case <-notifyCh:
+		case <-delDeadline:
+			t.Fatalf("timed out waiting for removed subdirectory cleanup of pkg/extra/worker.py")
+		}
+	}
+
+	// 5. Graceful shutdown.
 	cancel()
 	if err := fw.Close(); err != nil {
 		t.Fatalf("fw.Close() failed: %v", err)

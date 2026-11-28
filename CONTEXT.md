@@ -1470,54 +1470,50 @@ d:\gographctx\gographctx\
 **Goal:** Implement MCP JSON-RPC over stdio.
 **Deliverables:**
 - `internal/mcp/server.go`:
-  - JSON-RPC 2.0 message parsing (request, response, notification)
-  - stdio transport (read from stdin, write to stdout, log to stderr)
-  - Method routing: `initialize`, `tools/list`, `tools/call`
-  - Capability negotiation
-  - Graceful shutdown on SIGINT/SIGTERM
-- Tests: mock stdio, send initialize → verify response, send tools/list → verify tool list
+  - `Server`, `NewServer`, `ServeStdio`, and JSON-RPC 2.0 wire types (`RPCRequest`, `RPCResponse`, `RPCError`, `TextContent`, `CallToolResult`)
+  - Dual stdio framing (`readRPCMessage` supporting newline-delimited JSON and `Content-Length` headers, writing JSON-RPC responses to stdout and diagnostics to stderr)
+  - Method routing: `initialize` (protocol/capability negotiation), `notifications/initialized`, `ping`, `tools/list`, `tools/call`
+  - Notification handling (no response emitted when `id` is absent/null) and graceful shutdown on EOF or context/signal cancellation (`SIGINT`/`SIGTERM`)
+- Tests: `internal/mcp/server_test.go` (`TestServerStdioProtocolRouting`, `TestServerContentLengthFramingAndCancelShutdown`)
 **Exit criteria:** MCP server starts, responds to initialize and tools/list correctly
 
 #### Phase 26: MCP Tool Definitions & Handlers
 **Goal:** Implement all 7 MCP tools with handlers.
 **Deliverables:**
-- `internal/mcp/tools.go` — Tool definitions (JSON schema for each tool's input)
-- `internal/mcp/handlers.go`:
-  - `find_symbol`: query graph by name pattern, kind, file → return matching nodes
-  - `get_callers`: query Callers index → return caller list with confidence
-  - `get_callees`: query Callees index → return callee list with confidence
-  - `get_impact`: transitive caller analysis → return impact tree with depth
-  - `file_outline`: query FileNodes → return structured file outline
-  - `search_code`: multi-criteria graph search → return results
-  - `repo_overview`: aggregate stats (file count, symbol count, edge count, language breakdown, complexity distribution)
-- Tests: each tool tested with mock graph, verify correct results and response format
+- `internal/mcp/tools.go`: `ToolDefinition` and `AllToolDefinitions` (JSON schemas for all 7 MCP tools)
+- `internal/mcp/handlers.go` (`Handler`, `NewHandler`, `SymbolSummary`, `CallEdgeSummary`, `ImpactEntry`):
+  - `find_symbol`: query graph by name pattern, kind, and optional file filter → return matching nodes with signature/complexity/doc metadata
+  - `get_callers`: query `Callers` index → return caller list enriched with confidence/tier and call-site evidence
+  - `get_callees`: query `Callees` index → return direct callees enriched with confidence/tier and ambiguous candidate details
+  - `get_impact`: transitive caller BFS via `ImpactAnalysis` → return impact list ordered by depth with `Via` QName and confidence
+  - `file_outline`: query `FileNodes` → return structured outline (modules, classes/interfaces, functions, properties, variables, imports)
+  - `search_code`: multi-criteria `SearchWithStats` query → return matching symbols with pagination and filter stats
+  - `repo_overview`: aggregate repository stats via `Stats` (`file_count`, `symbol_count`, `edge_count`, `language_breakdown`, `complexity_distribution`, `call_site_resolution_summary`)
+- Tests: `internal/mcp/handlers_test.go` (`TestAllSevenMCPToolHandlers`)
 **Exit criteria:** All 7 tools return correct, well-formatted results
 
 #### Phase 27: Response Formatting & Token Budget
 **Goal:** Ensure all MCP responses are LLM-optimized.
 **Deliverables:**
-- `internal/mcp/formatter.go`:
-  - Token budget enforcement (default 4000 tokens, configurable per tool)
-  - Token counting (approximate: chars / 4 for English code)
-  - Truncation with explicit signaling (`"truncated": true, "total": N, "returned": M`)
-  - Confidence summary in every response
-  - Path stripping (repo-relative paths only)
-  - Deterministic field ordering in JSON output
-  - `metadata` block with index version, timestamp, resolution coverage
-- Tests: response within budget, truncation signaling, confidence summary accuracy
+- `internal/mcp/formatter.go` (`Formatter`, `NewFormatter`, `FormatterConfig`, `FormattedResponse`, `ToolPayload`, `ConfidenceSummary`, `ResponseMetadata`):
+  - Token budget enforcement (default 4000 tokens, configurable per tool via `FormatterConfig.ToolBudgets`)
+  - `EstimateTokens` (`(len(text)+3)/4` heuristic) with binary-search shrinking over `Items` and explicit truncation signaling (`"truncated": true`, `"total": N`, `"returned": M`)
+  - `ConfidenceSummary` (`Certain`, `Likely`, `Unresolved`, `OverallLabel`, `MinConfidence`, `MaxConfidence`) in every response
+  - `StripRepoPath` converting repo-local and Windows paths to clean repo-relative POSIX paths
+  - Deterministic field ordering (fixed struct tags + sorted keys/lists) and `ResponseMetadata` (`IndexVersion` matching `storage.FormatVersion`, `Timestamp`, `ResolutionCoverage`)
+- Tests: `internal/mcp/formatter_test.go` (`TestFormatterTokenBudgetTruncationPathStrippingAndDeterminism`)
 **Exit criteria:** No response exceeds token budget; truncated responses clearly signal truncation
 
 #### Phase 28: MCP Integration Testing
 **Goal:** End-to-end testing of the full MCP server with real indexed repos.
 **Deliverables:**
-- Integration test harness: start MCP server, send tool calls, verify responses
-- Test scenarios:
-  - Index a Go project → `find_symbol` → verify results
-  - Index a Python project → `get_callers` → verify confidence levels
-  - Index a mixed project → `repo_overview` → verify language breakdown
-  - `get_impact` on a heavily-called function → verify transitive analysis
-  - Response formatting: verify token budget, path stripping, confidence metadata
-- Regression tests: golden output for each scenario
+- `internal/mcp/integration_test.go` (`TestMCPIntegrationScenariosAndGoldenOutputs`, `runMCPStdioSession`, `assertGoldenJSON` supporting `-update` / `UPDATE_GOLDEN=1`):
+  - Index a Go project → `find_symbol` → verify results against golden JSON
+  - Index a Python project → `get_callers` → verify tier/confidence levels against golden JSON
+  - Index a mixed Go/Python/TypeScript project → `repo_overview` → verify language breakdown and complexity distribution
+  - `get_impact` on a multi-hop Python call chain → verify transitive `ImpactEntry` depths and `Via` chains
+  - Verify token budget ceiling, repo-relative path stripping, and confidence metadata across every scenario
+- Golden snapshots: `internal/mcp/testdata/{go_find_symbol,py_get_callers,py_get_impact,mixed_repo_overview}.golden.json`
 **Exit criteria:** All integration tests pass; responses match golden output
 
 ### Polish & Benchmarks (Phases 29–30)
@@ -1526,15 +1522,14 @@ d:\gographctx\gographctx\
 **Goal:** Build the CLI interface for the binary.
 **Deliverables:**
 - `cmd/gographctx/main.go`:
-  - `gographctx index <path>` — index a repository
-  - `gographctx serve` — start MCP server over stdio
-  - `gographctx watch <path>` — start watcher + MCP server
-  - `gographctx query <tool> <args>` — run a tool query from CLI (useful for debugging)
-  - `gographctx version` — print version
-  - `gographctx stats <path>` — show index stats without full query
-  - Flags: `--config`, `--verbose`, `--force`, `--workers`, `--format` (json/text)
-  - Startup time target: <50ms
-- Tests: CLI integration tests
+  - `gographctx index <path>` (`runIndex`) — full or incremental indexing via `pipeline.IndexRepository`
+  - `gographctx serve` (`runServe`) — load or build index and start `mcp.ServeStdio`
+  - `gographctx watch <path>` (`runWatch`) — start `watcher.FileWatcher` + `watcher.IncrementalEngine` alongside optional MCP stdio server (`--no-mcp` for headless watcher mode)
+  - `gographctx query <tool> <args>` (`runQuery`) — run any of the 7 MCP tools (`find_symbol`, `get_callers`, `get_callees`, `get_impact`, `file_outline`, `search_code`, `repo_overview`) from CLI
+  - `gographctx version` (`runVersion`) — print build version
+  - `gographctx stats <path>` (`runStats`) — read persisted graph stats without re-indexing
+  - Global/command flags (`--config`, `--verbose`, `--force`, `--workers`, `--format` `json`/`text`) with `reorderFlagsBeforeArgs` support
+- Tests: `cmd/gographctx/main_test.go` (`TestCLICommandsEndToEnd`, `TestCLIBinaryStartupUnderTarget`)
 **Exit criteria:** CLI works correctly for all commands; `gographctx serve` connects to Claude/Cursor
 
 #### Phase 30: Performance Benchmarks & Accuracy Validation

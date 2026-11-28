@@ -1,0 +1,97 @@
+{
+  "confidence_summary": {
+    "certain": 2,
+    "likely": 0,
+    "max_confidence": 0.95,
+    "min_confidence": 0.95,
+    "overall_label": "certain",
+    "unresolved": 0
+  },
+  "data": {
+    "affected_files": [
+      "app/routes.py",
+      "app/service.py"
+    ],
+    "certain_count": 2,
+    "direct_callers": 1,
+    "found": true,
+    "impacted": [
+      {
+        "certain": true,
+        "confidence": 0.95,
+        "confidence_label": "certain",
+        "depth": 1,
+        "effective_tier": "qualified import",
+        "symbol": {
+          "complexity": 1,
+          "end_line": 4,
+          "exported": true,
+          "file": "app/service.py",
+          "kind": "Function",
+          "language": "python",
+          "name": "normalize",
+          "qualified_name": "app.service::normalize",
+          "return_type": "str",
+          "start_line": 3,
+          "uid": "7872a03c6786a3acdba15b5f09b1bd66"
+        },
+        "via": [
+          "app.service::normalize"
+        ]
+      },
+      {
+        "certain": true,
+        "confidence": 0.95,
+        "confidence_label": "certain",
+        "depth": 2,
+        "effective_tier": "qualified import",
+        "symbol": {
+          "complexity": 1,
+          "end_line": 4,
+          "exported": true,
+          "file": "app/routes.py",
+          "kind": "Function",
+          "language": "python",
+          "name": "endpoint",
+          "qualified_name": "app.routes::endpoint",
+          "return_type": "str",
+          "start_line": 3,
+          "uid": "d8c73454cea207bb90814b879f0c3420"
+        },
+        "via": [
+          "app.routes::endpoint"
+        ]
+      }
+    ],
+    "likely_count": 0,
+    "max_depth": 4,
+    "target": {
+      "complexity": 1,
+      "end_line": 2,
+      "exported": true,
+      "file": "app/core.py",
+      "kind": "Function",
+      "language": "python",
+      "name": "validate",
+      "qualified_name": "app.core::validate",
+      "return_type": "str",
+      "start_line": 1,
+      "uid": "97901c6f8508544598ac5fc86e02d877"
+    },
+    "total_impacted": 2
+  },
+  "metadata": {
+    "estimated_tokens": 412,
+    "index_version": 1,
+    "repo_name": "flask-py",
+    "resolution_coverage": 0.6667,
+    "timestamp": "2026-11-28T00:00:00Z",
+    "token_budget": 4000,
+    "tool": "get_impact"
+  },
+  "returned": 2,
+  "summary": "2 impacted symbol(s) across 2 file(s) within depth 4",
+  "tool": "get_impact",
+  "total": 2,
+  "truncated": false
+}
