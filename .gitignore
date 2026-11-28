@@ -1,0 +1,22 @@
+# Binaries & build artifacts
+/gographctx
+/gographctx.exe
+/ggctx-bench
+/ggctx-bench.exe
+*.exe
+*.test
+*.out
+*.prof
+/bin/
+/dist/
+/artifacts/
+
+# Local GoGraphCtx index state
+.ggctx/
+
+# IDE & OS metadata
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
