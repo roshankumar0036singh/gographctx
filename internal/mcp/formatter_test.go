@@ -85,4 +85,26 @@ func TestFormatterTokenBudgetTruncationPathStrippingAndDeterminism(t *testing.T)
 	if got := mcp.StripRepoPath(`C:\Users\dev\myrepo`, `C:\Users\dev\myrepo\pkg\a.go`); got != "pkg/a.go" {
 		t.Fatalf("StripRepoPath Windows path = %q, want pkg/a.go", got)
 	}
+
+	// Verify unresolved-only tiers classify OverallLabel as "unresolved".
+	unresPayload := mcp.ToolPayload{
+		Summary:   "Unresolved only",
+		Total:     1,
+		MaxItems:  1,
+		ItemTiers: []graph.ResolutionTier{graph.TierUnresolved},
+		BuildEnvelope: func(limit int) (int, any) {
+			return limit, map[string]any{"items": items[:limit]}
+		},
+	}
+	unresRaw, err := f.Format("find_symbol", unresPayload, 0)
+	if err != nil {
+		t.Fatalf("Format unresolved failed: %v", err)
+	}
+	var unresEnv mcp.FormattedResponse
+	if err := json.Unmarshal(unresRaw, &unresEnv); err != nil {
+		t.Fatalf("unmarshal unresolved FormattedResponse: %v", err)
+	}
+	if unresEnv.ConfidenceSummary.OverallLabel != "unresolved" || unresEnv.ConfidenceSummary.Unresolved != 1 || unresEnv.ConfidenceSummary.Certain != 0 {
+		t.Fatalf("unexpected unresolved ConfidenceSummary: %+v", unresEnv.ConfidenceSummary)
+	}
 }

@@ -341,17 +341,18 @@ func (fw *FileWatcher) acceptAndTrackEvent(ev fsnotify.Event, pending map[string
 	if !filepath.IsAbs(absPath) {
 		absPath = filepath.Join(fw.repoRoot, filepath.FromSlash(absPath))
 	}
-	relPath, ok := fw.relPath(absPath)
+	canonPath := fw.canonicalPath(absPath)
+	relPath, ok := fw.relPathFromCanonical(canonPath)
 	if !ok {
 		return false
 	}
 
 	// Watch newly created subdirectories recursively and enqueue any source files within them.
 	if ev.Op&fsnotify.Create != 0 {
-		if st, err := os.Stat(absPath); err == nil && st.IsDir() {
+		if st, err := os.Stat(canonPath); err == nil && st.IsDir() {
 			if !fw.matcherForDir(path.Dir(relPath)).ShouldIgnorePath(relPath, true) {
-				_ = fw.watchRecursive(absPath)
-				_ = fw.enqueueNewDirSources(absPath, pending)
+				_ = fw.watchRecursive(canonPath)
+				_ = fw.enqueueNewDirSources(canonPath, pending)
 			}
 			return len(pending) > 0
 		}
@@ -359,11 +360,11 @@ func (fw *FileWatcher) acceptAndTrackEvent(ev fsnotify.Event, pending map[string
 
 	if ev.Op&(fsnotify.Remove|fsnotify.Rename) != 0 {
 		fw.mu.Lock()
-		_, wasDir := fw.dirs[absPath]
+		_, wasDir := fw.dirs[canonPath]
 		if wasDir {
-			delete(fw.dirs, absPath)
+			delete(fw.dirs, canonPath)
 			for dirPath := range fw.dirs {
-				if strings.HasPrefix(dirPath, absPath+string(filepath.Separator)) {
+				if strings.HasPrefix(dirPath, canonPath+string(filepath.Separator)) {
 					delete(fw.dirs, dirPath)
 				}
 			}
@@ -389,8 +390,9 @@ func (fw *FileWatcher) enqueueRemovedDirFiles(relDir string, pending map[string]
 	var doomed []string
 	fw.engine.Graph().View(func(v *graph.ReadView) {
 		for _, n := range v.AllNodes() {
-			if n.Kind == graph.KindFile && strings.HasPrefix(n.File, prefix) {
-				doomed = append(doomed, n.File)
+			normFile := strings.ReplaceAll(n.File, "\\", "/")
+			if n.Kind == graph.KindFile && strings.HasPrefix(normFile, prefix) {
+				doomed = append(doomed, normFile)
 			}
 		}
 	})
@@ -457,12 +459,13 @@ func (fw *FileWatcher) watchRecursive(rootDir string) error {
 			fw.layerDirIgnoreFiles(absPath, "", "")
 		}
 		fw.mu.Lock()
-		_, seen := fw.dirs[absPath]
+		canonDir := fw.canonicalPath(absPath)
+		_, seen := fw.dirs[canonDir]
 		fw.mu.Unlock()
 		if !seen {
-			if addErr := fw.fsw.Add(absPath); addErr == nil {
+			if addErr := fw.fsw.Add(canonDir); addErr == nil {
 				fw.mu.Lock()
-				fw.dirs[absPath] = struct{}{}
+				fw.dirs[canonDir] = struct{}{}
 				fw.mu.Unlock()
 			}
 		}
@@ -557,14 +560,19 @@ func (fw *FileWatcher) isWatchableSource(relPath string) bool {
 	return true
 }
 
-func (fw *FileWatcher) relPath(absPath string) (string, bool) {
-	canon := absPath
-	if resolved, err := filepath.EvalSymlinks(absPath); err == nil {
-		canon = resolved
-	} else if dirResolved, errDir := filepath.EvalSymlinks(filepath.Dir(absPath)); errDir == nil {
-		// Handle deleted files cleanly even when repoRoot lives behind a symlink or short 8.3 path.
-		canon = filepath.Join(dirResolved, filepath.Base(absPath))
+func (fw *FileWatcher) canonicalPath(absPath string) string {
+	canon := filepath.Clean(absPath)
+	if resolved, err := filepath.EvalSymlinks(canon); err == nil {
+		return filepath.Clean(resolved)
 	}
+	// Handle deleted files/dirs cleanly even when repoRoot lives behind a symlink or short 8.3 path.
+	if dirResolved, errDir := filepath.EvalSymlinks(filepath.Dir(canon)); errDir == nil {
+		return filepath.Clean(filepath.Join(dirResolved, filepath.Base(canon)))
+	}
+	return canon
+}
+
+func (fw *FileWatcher) relPathFromCanonical(canon string) (string, bool) {
 	rel, err := filepath.Rel(fw.repoRoot, canon)
 	if err != nil {
 		return "", false
@@ -574,6 +582,10 @@ func (fw *FileWatcher) relPath(absPath string) (string, bool) {
 		return "", false
 	}
 	return slash, true
+}
+
+func (fw *FileWatcher) relPath(absPath string) (string, bool) {
+	return fw.relPathFromCanonical(fw.canonicalPath(absPath))
 }
 
 func buildAllowedWatchLanguages(langs []string) map[string]bool {

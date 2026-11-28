@@ -669,14 +669,15 @@ func synthesizeIndexInputsFromView(v *graph.ReadView, reParsed []*parser.ParsedF
 				pf.Package = n.Name
 			case graph.KindFunction:
 				pf.Functions = append(pf.Functions, parser.ParsedFunction{
-					Name:       n.Name,
-					QName:      n.QName,
-					StartLine:  n.StartLine,
-					Exported:   n.Exported,
-					Receiver:   n.Receiver,
-					Params:     slices.Clone(n.Params),
-					ReturnType: n.ReturnType,
-					Decorators: slices.Clone(n.Decorators),
+					Name:         n.Name,
+					QName:        n.QName,
+					StartLine:    n.StartLine,
+					Exported:     n.Exported,
+					Receiver:     n.Receiver,
+					ReceiverType: n.Receiver,
+					Params:       slices.Clone(n.Params),
+					ReturnType:   n.ReturnType,
+					Decorators:   slices.Clone(n.Decorators),
 				})
 			case graph.KindClass, graph.KindStruct, graph.KindInterface, graph.KindEnum:
 				pf.Classes = append(pf.Classes, parser.ParsedClass{
