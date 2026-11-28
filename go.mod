@@ -1,10 +1,10 @@
 module github.com/roshankumar0036singh/gographctx
 
-go 1.22.0
+go 1.25
 
 require (
 	github.com/fsnotify/fsnotify v1.8.0
-	github.com/klauspost/compress v1.17.11
+	github.com/klauspost/compress v1.20.2
 	github.com/odvcencio/gotreesitter v0.58.0
 	golang.org/x/sync v0.11.0
 	modernc.org/sqlite v1.34.5
