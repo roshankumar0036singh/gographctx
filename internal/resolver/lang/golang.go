@@ -9,6 +9,8 @@ import (
 	"path/filepath"
 	"slices"
 	"strings"
+	"sync"
+	"time"
 	"unicode"
 	"unicode/utf8"
 
@@ -112,13 +114,78 @@ type InterfaceSatisfaction struct {
 	MatchedMethods []string
 }
 
+type cachedGoMod struct {
+	info      GoModInfo
+	exists    bool
+	modTime   time.Time
+	size      int64
+	checkedAt time.Time
+}
+
 // GoResolver implements LanguageResolver for Go packages using go.mod module
 // resolution, receiver type inference, embedded struct lookup, and Tier 1-8 scoring.
-type GoResolver struct{}
+type GoResolver struct {
+	modMu    sync.RWMutex
+	modCache map[string]cachedGoMod
+}
 
 // NewGoResolver returns a Go LanguageResolver.
 func NewGoResolver() *GoResolver {
-	return &GoResolver{}
+	return &GoResolver{
+		modCache: make(map[string]cachedGoMod),
+	}
+}
+
+func (r *GoResolver) parseGoModCached(repoRoot string) (GoModInfo, error) {
+	if r == nil || strings.TrimSpace(repoRoot) == "" {
+		return ParseGoMod(repoRoot)
+	}
+	cleanRoot := filepath.Clean(repoRoot)
+	now := time.Now()
+	r.modMu.RLock()
+	cached, ok := r.modCache[cleanRoot]
+	r.modMu.RUnlock()
+	if ok && now.Sub(cached.checkedAt) < 500*time.Millisecond {
+		return cached.info, nil
+	}
+
+	modFile := filepath.Join(cleanRoot, "go.mod")
+	st, statErr := os.Stat(modFile)
+	exists := statErr == nil
+	var modTime time.Time
+	var size int64
+	if exists {
+		modTime = st.ModTime()
+		size = st.Size()
+	} else if !os.IsNotExist(statErr) {
+		return ParseGoMod(cleanRoot)
+	}
+
+	if ok && cached.exists == exists && (!exists || (cached.modTime.Equal(modTime) && cached.size == size)) {
+		r.modMu.Lock()
+		cached.checkedAt = now
+		r.modCache[cleanRoot] = cached
+		r.modMu.Unlock()
+		return cached.info, nil
+	}
+
+	info, err := ParseGoMod(cleanRoot)
+	if err != nil {
+		return info, err
+	}
+	r.modMu.Lock()
+	if r.modCache == nil {
+		r.modCache = make(map[string]cachedGoMod)
+	}
+	r.modCache[cleanRoot] = cachedGoMod{
+		info:      info,
+		exists:    exists,
+		modTime:   modTime,
+		size:      size,
+		checkedAt: now,
+	}
+	r.modMu.Unlock()
+	return info, nil
 }
 
 // Language returns "go".
@@ -141,7 +208,7 @@ func (r *GoResolver) ResolveImports(ctx context.Context, file *parser.ParsedFile
 		rc = &resolver.ResolutionContext{}
 	}
 
-	modInfo, err := ParseGoMod(rc.RepoRoot)
+	modInfo, err := r.parseGoModCached(rc.RepoRoot)
 	if err != nil {
 		return nil, err
 	}
@@ -796,40 +863,60 @@ func DetectInterfaceSatisfaction(view *graph.ReadView) []InterfaceSatisfaction {
 	if view == nil {
 		return nil
 	}
-	allNodes := view.AllNodes()
-	var structs []graph.Node
-	var interfaces []graph.Node
-	methodsByType := make(map[string]map[string]graph.Node) // "<pkg>::<Type>" -> methodName -> Node
+	return detectInterfaceSatisfactionForStructs(view, nil)
+}
 
-	for _, n := range allNodes {
-		switch n.Kind {
-		case graph.KindStruct:
-			structs = append(structs, n)
-		case graph.KindInterface:
-			interfaces = append(interfaces, n)
-		case graph.KindFunction:
-			if n.Receiver != "" {
-				pkg := PackageScopePrefix(n.QName)
-				recv := resolver.StripTypeDecorations(n.Receiver)
-				key := pkg + "::" + recv
-				mset, ok := methodsByType[key]
+func detectInterfaceSatisfactionForStructs(view *graph.ReadView, targetStructs []graph.Node) []InterfaceSatisfaction {
+	if view == nil {
+		return nil
+	}
+	interfaces := view.GetByKind(graph.KindInterface)
+	if len(interfaces) == 0 {
+		return nil
+	}
+
+	structs := targetStructs
+	if structs == nil {
+		structs = view.GetByKind(graph.KindStruct)
+	}
+	if len(structs) == 0 {
+		return nil
+	}
+
+	// Collect required methods only from files declaring interfaces (Go interface methods
+	// live inside the interface type declaration in the same file).
+	ifaceMethodsByQName := make(map[string]map[string]graph.Node, len(interfaces))
+	fileNodesCache := make(map[string][]graph.Node)
+	for _, iface := range interfaces {
+		var nodes []graph.Node
+		if iface.File != "" {
+			var cached bool
+			nodes, cached = fileNodesCache[iface.File]
+			if !cached {
+				nodes = view.GetByFile(iface.File)
+				fileNodesCache[iface.File] = nodes
+			}
+		} else {
+			nodes = view.GetContains(iface.UID)
+		}
+		for _, n := range nodes {
+			if n.Kind == graph.KindFunction && n.Receiver != "" {
+				key := PackageScopePrefix(n.QName) + "::" + resolver.StripTypeDecorations(n.Receiver)
+				if key != iface.QName {
+					continue
+				}
+				mset, ok := ifaceMethodsByQName[iface.QName]
 				if !ok {
 					mset = make(map[string]graph.Node)
-					methodsByType[key] = mset
+					ifaceMethodsByQName[iface.QName] = mset
 				}
 				mset[n.Name] = n
 			}
 		}
 	}
 
-	structByKey := make(map[string]graph.Node, len(structs))
-	for _, st := range structs {
-		structByKey[st.QName] = st
-	}
-
-	collectStructMethods := func(st graph.Node) map[string]graph.Node {
-		out := make(map[string]graph.Node)
-		visited := make(map[string]struct{})
+	lookupStructMethod := func(st graph.Node, methodName string) (graph.Node, bool) {
+		visited := make(map[string]struct{}, 4)
 		queue := []graph.Node{st}
 		for len(queue) > 0 {
 			cur := queue[0]
@@ -838,28 +925,31 @@ func DetectInterfaceSatisfaction(view *graph.ReadView) []InterfaceSatisfaction {
 				continue
 			}
 			visited[cur.QName] = struct{}{}
-			for name, fn := range methodsByType[cur.QName] {
-				if _, exists := out[name]; !exists {
-					out[name] = fn
+			for _, cand := range view.GetByQName(cur.QName + "::" + methodName) {
+				if cand.Kind == graph.KindFunction && cand.Receiver != "" {
+					return cand, true
 				}
 			}
 			pkg := PackageScopePrefix(cur.QName)
 			for _, base := range cur.Bases {
-				baseKey := pkg + "::" + base
+				baseKey := pkg + "::" + resolver.StripTypeDecorations(base)
 				if idx := strings.LastIndexByte(base, '.'); idx >= 0 {
-					baseKey = base[:idx] + "::" + base[idx+1:]
+					baseKey = base[:idx] + "::" + resolver.StripTypeDecorations(base[idx+1:])
 				}
-				if bNode, ok := structByKey[baseKey]; ok {
-					queue = append(queue, bNode)
+				for _, bNode := range view.GetByQName(baseKey) {
+					if bNode.Kind == graph.KindStruct {
+						queue = append(queue, bNode)
+						break
+					}
 				}
 			}
 		}
-		return out
+		return graph.Node{}, false
 	}
 
 	var results []InterfaceSatisfaction
 	for _, iface := range interfaces {
-		reqMethods := methodsByType[iface.QName]
+		reqMethods := ifaceMethodsByQName[iface.QName]
 		if len(reqMethods) == 0 {
 			continue
 		}
@@ -870,12 +960,11 @@ func DetectInterfaceSatisfaction(view *graph.ReadView) []InterfaceSatisfaction {
 		slices.Sort(reqNames)
 
 		for _, st := range structs {
-			stMethods := collectStructMethods(st)
 			var matched []string
 			satisfied := true
 			for _, mName := range reqNames {
 				reqFn := reqMethods[mName]
-				implFn, ok := stMethods[mName]
+				implFn, ok := lookupStructMethod(st, mName)
 				if !ok || !goInterfaceMethodMatch(implFn, reqFn) {
 					satisfied = false
 					break
@@ -1007,7 +1096,15 @@ func (r *GoResolver) ResolveLinks(ctx context.Context, file *parser.ParsedFile, 
 	}
 
 	if rc.View != nil && len(localClassByQName) > 0 {
-		for _, sat := range DetectInterfaceSatisfaction(rc.View) {
+		var localStructs []graph.Node
+		for _, cls := range file.Classes {
+			if cls.EffectiveKind() == graph.KindStruct {
+				if stNode, ok := lookupGoClassNode(rc, cls.QName); ok && stNode.Kind == graph.KindStruct {
+					localStructs = append(localStructs, stNode)
+				}
+			}
+		}
+		for _, sat := range detectInterfaceSatisfactionForStructs(rc.View, localStructs) {
 			if cls, ok := localClassByQName[sat.StructQName]; ok {
 				if ifaceNode, okIface := lookupGoClassNode(rc, sat.InterfaceQName); okIface {
 					links = append(links, MakeResolvedLink(sat.StructUID, sat.StructQName, ifaceNode, graph.EdgeImplements, resolver.TierStructural, cls.StartLine, "structural interface satisfaction"))

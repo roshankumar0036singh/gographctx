@@ -322,6 +322,8 @@ func (s *Server) writeResponse(resp *RPCResponse, contentLengthFramed bool) erro
 	return err
 }
 
+const maxRPCMessageBytes = 32 << 20 // 32 MiB defensive framing cap
+
 // readRPCMessage supports both standard MCP newline-delimited JSON and LSP-style
 // Content-Length header framing transparently.
 func readRPCMessage(br *bufio.Reader) (payload []byte, framed bool, err error) {
@@ -342,7 +344,7 @@ func readRPCMessage(br *bufio.Reader) (payload []byte, framed bool, err error) {
 		if len(trimmed) > 15 && strings.EqualFold(trimmed[:15], "content-length:") {
 			lengthStr := strings.TrimSpace(trimmed[15:])
 			n, convErr := strconv.Atoi(lengthStr)
-			if convErr != nil || n < 0 {
+			if convErr != nil || n < 0 || n > maxRPCMessageBytes {
 				return nil, true, fmt.Errorf("invalid Content-Length header %q", trimmed)
 			}
 			// Consume remaining headers up to blank line.

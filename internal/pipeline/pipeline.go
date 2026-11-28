@@ -353,10 +353,18 @@ func indexFullBatch(
 	timings *StageTimings,
 ) (*graph.Graph, []error, error) {
 	// Parse discovered files in parallel via Coordinator.
+	parseWorkers := cfg.Workers
+	if parseWorkers <= 0 {
+		parseWorkers = runtime.NumCPU()
+	}
+	if parseWorkers > 4 {
+		// Cap concurrent tree-sitter GLR scratch pools at 4 workers to keep peak RSS well under 150MB on large repos.
+		parseWorkers = 4
+	}
 	parseStart := time.Now()
-	inputs, readErrs := readDiscoveredFileInputs(files)
+	inputs, readErrs := readDiscoveredFileInputs(ctx, files, parseWorkers)
 	coord, err := parser.NewCoordinator(preg, parser.CoordinatorConfig{
-		Workers:           cfg.Workers,
+		Workers:           parseWorkers,
 		FailFast:          false,
 		DeterministicSort: true,
 	})
@@ -364,8 +372,12 @@ func indexFullBatch(
 		return nil, nil, err
 	}
 	batch, err := coord.ParseFiles(ctx, inputs)
+	inputs = nil
 	if err != nil {
 		return nil, nil, err
+	}
+	if len(files) >= 250 {
+		runtime.GC()
 	}
 	timings.Parse = time.Since(parseStart)
 
@@ -386,8 +398,13 @@ func indexFullBatch(
 	// Resolve imports, types, calls, and links concurrently under read view.
 	resolveStart := time.Now()
 	resolvedMap, resErrs, err := resolveFilesParallel(ctx, rreg, repoRoot, batch.Files, batch.NameIndex, skelGraph, cfg.Workers)
+	skelGraph = nil
+	batch.NameIndex = nil
 	if err != nil {
 		return nil, nil, err
+	}
+	if len(files) >= 250 {
+		runtime.GC()
 	}
 	errs = append(errs, resErrs...)
 	timings.Resolve = time.Since(resolveStart)
@@ -395,8 +412,13 @@ func indexFullBatch(
 	// Finalize fragments into complete graph.
 	finStart := time.Now()
 	finalGraph, err := BuildGraph(ctx, batch.Files, resolvedMap)
+	batch = nil
+	resolvedMap = nil
 	if err != nil {
 		return nil, nil, err
+	}
+	if len(files) >= 250 {
+		runtime.GC()
 	}
 	timings.Finalize = time.Since(finStart)
 
@@ -462,10 +484,17 @@ func indexIncrementalDelta(
 		return cmp.Compare(a.RelPath, b.RelPath)
 	})
 
+	parseWorkers := cfg.Workers
+	if parseWorkers <= 0 {
+		parseWorkers = runtime.NumCPU()
+	}
+	if parseWorkers > 8 {
+		parseWorkers = 8
+	}
 	parseStart := time.Now()
-	inputs, readErrs := readDiscoveredFileInputs(reparseList)
+	inputs, readErrs := readDiscoveredFileInputs(ctx, reparseList, parseWorkers)
 	coord, err := parser.NewCoordinator(preg, parser.CoordinatorConfig{
-		Workers:           cfg.Workers,
+		Workers:           parseWorkers,
 		FailFast:          false,
 		DeterministicSort: true,
 	})
@@ -473,6 +502,7 @@ func indexIncrementalDelta(
 		return nil, nil, err
 	}
 	batch, err := coord.ParseFiles(ctx, inputs)
+	inputs = nil
 	if err != nil {
 		return nil, nil, err
 	}
@@ -719,20 +749,53 @@ func synthesizeIndexInputsFromView(v *graph.ReadView, reParsed []*parser.ParsedF
 	return out
 }
 
-func readDiscoveredFileInputs(files []DiscoveredFile) ([]parser.FileInput, []error) {
+func readDiscoveredFileInputs(ctx context.Context, files []DiscoveredFile, workers int) ([]parser.FileInput, []error) {
+	if len(files) == 0 {
+		return nil, nil
+	}
+	if workers <= 0 {
+		workers = runtime.NumCPU()
+	}
+	if workers < 1 {
+		workers = 1
+	}
+
+	results := make([]parser.FileInput, len(files))
+	fileErrs := make([]error, len(files))
+
+	g, gctx := errgroup.WithContext(ctx)
+	g.SetLimit(workers)
+	for i, df := range files {
+		i, df := i, df
+		g.Go(func() error {
+			if err := gctx.Err(); err != nil {
+				return err
+			}
+			raw, err := os.ReadFile(df.AbsPath)
+			if err != nil {
+				fileErrs[i] = fmt.Errorf("read %q: %w", df.RelPath, err)
+				return nil
+			}
+			results[i] = parser.FileInput{
+				Path:     df.RelPath,
+				Language: df.Language,
+				Source:   raw,
+			}
+			return nil
+		})
+	}
+	_ = g.Wait()
+
 	inputs := make([]parser.FileInput, 0, len(files))
 	var errs []error
-	for _, df := range files {
-		raw, err := os.ReadFile(df.AbsPath)
-		if err != nil {
-			errs = append(errs, fmt.Errorf("read %q: %w", df.RelPath, err))
+	for i := range files {
+		if fileErrs[i] != nil {
+			errs = append(errs, fileErrs[i])
 			continue
 		}
-		inputs = append(inputs, parser.FileInput{
-			Path:     df.RelPath,
-			Language: df.Language,
-			Source:   raw,
-		})
+		if results[i].Path != "" {
+			inputs = append(inputs, results[i])
+		}
 	}
 	return inputs, errs
 }
