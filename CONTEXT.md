@@ -1535,20 +1535,17 @@ d:\gographctx\gographctx\
 #### Phase 30: Performance Benchmarks & Accuracy Validation
 **Goal:** Prove we meet our targets.
 **Deliverables:**
-- Performance benchmark suite:
-  - Index Flask (83 .py files) — target: <1s, RSS <80MB
-  - Index a 1000-file Go project — target: <3s, RSS <150MB
-  - Incremental update (body change) — target: <50ms
-  - Incremental update (export change) — target: <100ms
-  - MCP tool response — target: <10ms per query
-  - CLI startup — target: <50ms
-- Accuracy benchmark:
-  - Run SCIP on Flask → extract ground-truth call edges
-  - Run GoGraphCtx on Flask → compare
-  - Report precision, recall, per-tier breakdown
-  - Target: precision ≥90%, strong-tier edges ≥85%
-- CI integration: benchmarks run on every PR, fail if targets regressed
-- Comparison report: GoGraphCtx vs CGC on same repos
+- `internal/bench/`:
+  - `corpus.go`: deterministic `GenerateFlaskScalePythonCorpus` (83 `.py` files), `GenerateGoMonorepoCorpus` (1,000 `.go` files), `GenerateMixedPolyglotCorpus`
+  - `perf.go` & `rss_{windows,linux,darwin}.go`: `RunPerfSuite`, `CheckSLAs`, `RunMeasuredCapture`, `CurrentPeakRSSBytes`
+  - `scip.go` & `accuracy.go`: zero-dep binary `.scip` decoder (`ParseSCIPBytes`/`ParseSCIPFile`, `ExtractCallEdgesFromSCIP`) and `EvaluateGraphAccuracy` / `CheckAccuracyGates` (precision ≥90%, strong-tier ≥85%, recall ≥75%)
+  - Verified performance & accuracy SLAs (`internal/bench/perf_test.go`, `accuracy_test.go`):
+    - Flask (83 `.py` files): ~542ms, Peak RSS ~49MB (<1s, <80MB target), 100.0% strong-tier edges
+    - Go-1k (1,000 `.go` files): ~2.15s, Peak RSS ~95.5MB (<3s, <150MB target)
+    - Incremental updates: body p50 ~22.9ms (<50ms), export p50 ~38.7ms (<100ms)
+    - MCP queries: p95 ~2.76ms (<10ms); CLI cold startup ~21.4ms (<50ms); stripped binary ~15.8MB (<30MB)
+- `cmd/ggctx-bench/` (`main.go`, `comparators.go`, `report.go`, `main_test.go`):
+  - Multi-tool head-to-head comparator & baseline regression CLI benchmarking GoGraphCtx against **CGC**, **SCIP indexers** (`scip-python`, `scip-go`), **Universal Ctags** (`ctags`), **ast-grep** (`sg`), **Serena** (LSP MCP), and **ripgrep** (`rg`) with JSON + Markdown report output (`CompareBaseline`, `RenderMarkdownReport`)
 **Exit criteria:** All performance targets met. Accuracy targets met. Comparison report generated.
 
 ### CI/CD, Testing & Release Benchmarking Workflows (Phases 31–34)
@@ -1557,47 +1554,43 @@ d:\gographctx\gographctx\
 **Goal:** Enforce fast unit test verification, formatting, static analysis, and vulnerability scanning on every Pull Request and push.
 **Deliverables:**
 - `.github/workflows/unit-tests.yml`:
-  - Trigger: `pull_request` (all opened/synchronized PRs) and `push` to `main` / `phase-*` branches
-  - Fast unit-test matrix (`go test -short -race -cover ./...`) across Ubuntu Linux, macOS, and Windows on supported Go versions (`1.22`, `1.25`)
-  - Enforce per-package coverage reporting (`go tool cover`) and artifact upload
+  - Trigger: `pull_request` and `push` to `main` / `phase-*` branches
+  - Fast unit-test matrix (`go test -short -race -coverprofile=coverage.out -covermode=atomic ./...`) across Ubuntu Linux, macOS, and Windows on Go `1.22` and `1.25`
+  - Coverage summary written to `$GITHUB_STEP_SUMMARY` and `coverage.out` artifact upload
 - `.github/workflows/lint-security.yml`:
-  - Trigger: `pull_request` and `push`
-  - Enforce `gofmt -l .` zero-diff check, `go vet ./...`, `staticcheck ./...`, `govulncheck ./...`, and `go mod verify`
+  - Trigger: `pull_request` and `push` to `main` / `phase-*`
+  - Enforces `go mod verify`, `gofmt -l .` zero-diff check, `go vet ./...`, `staticcheck ./...` (`v0.7.0`), and `govulncheck ./...` (`v1.1.4`)
 **Exit criteria:** Every PR runs unit tests, lint, and security checks automatically in <3 minutes with zero manual triggers
 
 #### Phase 32: Approved-PR Integration & Cross-Platform E2E Workflows
 **Goal:** Gate heavyweight integration, watcher, recovery, and cross-platform end-to-end workflows so they execute only after PR approval (plus manual dispatch for maintainers).
 **Deliverables:**
 - `.github/workflows/integration-tests.yml`:
-  - Trigger: `pull_request_review` (`types: [submitted]`, conditional on `github.event.review.state == 'approved'`) and `workflow_dispatch` (skipping unapproved/draft PRs)
-  - Concurrency cancellation per PR ref; checks out PR head commit cleanly after verifying approval state via GitHub context
-  - Runs full multi-package/multi-language indexing tests (`internal/pipeline`), crash-recovery & WAL compaction tests (`internal/storage`), real `fsnotify` watcher tests (`internal/watcher`), and full MCP stdio integration harness (`internal/mcp`)
+  - Trigger: `pull_request_review` (`types: [submitted]`, conditional on `github.event.review.state == 'approved' && !github.event.pull_request.draft`), `merge_group`, and `workflow_dispatch`
+  - Least-privilege `contents: read` checkout at PR head SHA; runs full `-race -count=1` suite across `internal/pipeline`, `internal/storage`, `internal/watcher`, `internal/mcp`, `internal/bench`, and `cmd/...`
 - `.github/workflows/cross-platform-smoke.yml`:
-  - Trigger: approved PR merge queue / `push` to `main` / `workflow_dispatch`
-  - Builds release-grade binaries (`CGO_ENABLED=0` or target toolchains) and executes CLI smoke tests (`index`, `query`, `stats`, `serve`) across Linux, macOS, and Windows
+  - Trigger: `push` to `main`, `merge_group`, and `workflow_dispatch`
+  - Builds stripped static binaries (`CGO_ENABLED=0`) across `ubuntu-latest`, `macos-latest`, and `windows-latest`, asserts `<30MB` binary size, and executes live CLI smoke tests (`version`, `index`, `stats`, `query`, `serve`)
 **Exit criteria:** Unapproved PRs skip heavy integration suites, while every approved PR passes full end-to-end integration tests across platforms before merge
 
 #### Phase 33: Fuzz, Race Stress & Accuracy Evaluation Workflows
 **Goal:** Continuously guard against persistence corruption, data races, watcher deadlocks, and resolver accuracy drift via dedicated specialized testing workflows.
 **Deliverables:**
+- Fuzz targets: `FuzzSnapshotAndWALDecode` (`internal/storage/reader_test.go`), `FuzzMCPReadRPCMessage` (`internal/mcp/server_fuzz_test.go`), `FuzzIgnoreMatcher` (`internal/config/ignore_fuzz_test.go`)
 - `.github/workflows/fuzz-soak.yml`:
   - Trigger: `schedule` (nightly cron), `pull_request` with `run-fuzz` label, and `workflow_dispatch`
-  - Runs binary snapshot/WAL fuzzing (`go test -fuzz=FuzzSnapshotAndWALDecode -fuzztime=60s ./internal/storage`) and `-race` stress tests on `internal/graph` and `internal/watcher`
+  - Runs all fuzz targets + `-race -count=5` stress soak across `internal/graph`, `internal/watcher`, and `internal/mcp`
 - `.github/workflows/accuracy-eval.yml`:
-  - Trigger: `pull_request_review` (approved PRs touching `internal/parser/` or `internal/resolver/`), nightly `schedule`, and `workflow_dispatch`
-  - Indexes reference open-source fixtures (including Flask 83 Python files and multi-package Go/TS/Rust/Java fixtures), compares resolved edges against SCIP ground truth, asserts precision ≥90% and strong-tier coverage ≥85%, and uploads JSON diff reports
+  - Trigger: approved `pull_request_review` touching `internal/parser/**`, `internal/resolver/**`, `internal/pipeline/**`, or `internal/bench/**`, nightly `schedule`, and `workflow_dispatch`
+  - Indexes pinned Flask (`3.1.0`) and runs `cmd/ggctx-bench` accuracy & multi-tool evaluation against SCIP, Ctags, and ripgrep
 **Exit criteria:** Fuzzing, race stress, and resolver accuracy gates catch regressions automatically without slowing routine unit PRs
 
 #### Phase 34: Post-Release Comprehensive Benchmarking Workflow
 **Goal:** Run a full end-to-end performance, memory, latency, and binary-size benchmark suite automatically after every published release to track trends and detect regressions across versions.
 **Deliverables:**
 - `.github/workflows/release-benchmarks.yml`:
-  - Trigger: `release` (`types: [published]`), tag push `v*`, and `workflow_dispatch`
-  - Runs comprehensive release benchmarks on dedicated consistent runners:
-    - Micro-benchmarks (`go test -bench=. -benchmem -count=5 ./...`) across graph queries, binary snapshot/WAL codec, parser coordinator, and pipeline
-    - Full repository benchmarks: Flask (target <1s, RSS <80MB) and 1000-file Go monorepo (target <3s, RSS <150MB)
-    - Incremental body-edit (<50ms) and export-change (<100ms) latency benchmarks, MCP tool query p50/p95/p99 latency (<10ms), CLI cold-startup time (<50ms), and binary size measurement
-  - Compares results against the previous release tag baseline and CGC reference metrics, generates Markdown + JSON benchmark reports attached to the GitHub Release assets / Actions summary, and fails or alerts on regression beyond configured tolerance thresholds
+  - Trigger: `release` (`types: [published]`), tag push `v*.*.*`, and `workflow_dispatch`
+  - Builds release + `ggctx-bench` binaries, runs `-count=5` Go micro-benchmarks (`benchstat`), executes full SLA & multi-tool comparisons (**GoGraphCtx vs CGC, SCIP, Ctags, ast-grep, Serena, ripgrep**), compares against previous release `bench-report.json` / `micro-bench.txt`, and uploads `bench-report.json`, `bench-report.md`, `micro-bench.txt`, and `micro-benchstat.md` to release assets & Step Summary
 **Exit criteria:** Every published release produces an audited, archived benchmark report comparing throughput, RSS memory, latency, and accuracy against prior releases
 
 ### Phase Summary Table
