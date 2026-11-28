@@ -349,29 +349,38 @@ func (r *TypeScriptResolver) InferTypes(ctx context.Context, file *parser.Parsed
 
 				if foundTarget {
 					if clsNode, pkg, okType := inferTSTargetReturnOrClass(rc, target, modPkg, bindings, modScope); okType {
-						origin := resolver.OriginReturnType
-						conf := float32(0.86)
-						if lv.IsConstructor {
-							origin = resolver.OriginConstructor
-							conf = 0.92
+						if lv.DestructuredProp != "" {
+							inferred, hasInferred = resolveTSDestructuredMemberType(rc, clsNode, pkg, lv.DestructuredProp, lv.Line, bindings, modScope)
+						} else {
+							origin := resolver.OriginReturnType
+							conf := float32(0.90)
+							if lv.IsConstructor {
+								origin = resolver.OriginConstructor
+								conf = 0.95
+							}
+							inferred = resolver.TypeInfo{
+								Name:       clsNode.Name,
+								QName:      clsNode.QName,
+								Package:    pkg,
+								Origin:     origin,
+								Confidence: conf,
+								Line:       lv.Line,
+							}
+							hasInferred = true
 						}
-						inferred = resolver.TypeInfo{
-							Name:       clsNode.Name,
-							QName:      clsNode.QName,
-							Package:    pkg,
-							Origin:     origin,
-							Confidence: conf,
-							Line:       lv.Line,
-						}
-						hasInferred = true
 					}
 				}
 
 			case lv.InitAlias != "":
 				if rhsInfo, ok := tm.LookupReceiver(lv.ScopeQName, lv.InitAlias); ok && rhsInfo.Name != "" {
-					inferred = rhsInfo
-					inferred.Line = lv.Line
-					hasInferred = true
+					if lv.DestructuredProp != "" {
+						rhsNode := graph.Node{Name: rhsInfo.Name, QName: rhsInfo.QName}
+						inferred, hasInferred = resolveTSDestructuredMemberType(rc, rhsNode, pkgOrDefault(rhsInfo.Package, modScope), lv.DestructuredProp, lv.Line, bindings, modScope)
+					} else {
+						inferred = rhsInfo
+						inferred.Line = lv.Line
+						hasInferred = true
+					}
 				}
 			}
 
@@ -383,6 +392,49 @@ func (r *TypeScriptResolver) InferTypes(ctx context.Context, file *parser.Parsed
 	}
 
 	return tm.ToFlatMap(), nil
+}
+
+func resolveTSDestructuredMemberType(
+	rc *resolver.ResolutionContext,
+	clsNode graph.Node,
+	pkg, propName string,
+	line uint32,
+	bindings *tsBindings,
+	modScope string,
+) (resolver.TypeInfo, bool) {
+	if clsNode.Name == "" || propName == "" {
+		return resolver.TypeInfo{}, false
+	}
+	targetPkg := pkgOrDefault(pkg, pkgOrDefault(PackageScopePrefix(clsNode.QName), modScope))
+	if m, _, okMeth := resolveTSMethodOnHierarchy(rc, targetPkg, clsNode.Name, propName, nil, bindings, modScope); okMeth {
+		return resolver.TypeInfo{
+			Name:          m.Name,
+			QName:         m.QName,
+			CallableQName: m.QName,
+			Package:       pkgOrDefault(PackageScopePrefix(m.QName), targetPkg),
+			Origin:        resolver.OriginCallable,
+			Confidence:    0.90,
+			Line:          line,
+		}, true
+	}
+	if rc != nil && rc.View != nil && clsNode.QName != "" {
+		for _, n := range rc.View.GetByQName(clsNode.QName + "::" + propName) {
+			if ft := resolver.StripTypeDecorations(n.Type); ft != "" {
+				if fieldCls, fieldPkg, okCls := resolveTSSymbolType(rc, bindings, targetPkg, ft); okCls {
+					return resolver.TypeInfo{
+						Name:       fieldCls.Name,
+						QName:      fieldCls.QName,
+						Package:    fieldPkg,
+						Origin:     resolver.OriginField,
+						Confidence: 0.90,
+						Line:       line,
+					}, true
+				}
+				return resolver.TypeInfo{Name: ft, Package: targetPkg, Origin: resolver.OriginField, Confidence: 0.85, Line: line}, true
+			}
+		}
+	}
+	return resolver.TypeInfo{}, false
 }
 
 // ResolveCalls resolves local, this/super, imported/barrel/alias, namespace,
@@ -979,6 +1031,21 @@ func inferTSTargetReturnOrClass(rc *resolver.ResolutionContext, target graph.Nod
 		}
 		if clsNode, boundPkg, ok := resolveTSSymbolType(rc, bindings, modScope, ret); ok {
 			return clsNode, boundPkg, true
+		}
+		if rc != nil && target.File != "" {
+			if pf := rc.LookupFile(target.File); pf != nil {
+				targetBindings := buildTSBindings(pf, nil, rc)
+				if clsNode, boundPkg, ok := resolveTSSymbolType(rc, targetBindings, pkg, ret); ok {
+					return clsNode, boundPkg, true
+				}
+			}
+		}
+		if rc != nil {
+			if clsNode, unique, _ := resolver.MatchUniqueNode(rc.LookupByName(ret), func(n graph.Node) bool {
+				return n.Kind == graph.KindClass || n.Kind == graph.KindInterface
+			}); unique {
+				return clsNode, PackageScopePrefix(clsNode.QName), true
+			}
 		}
 		return graph.Node{Name: ret, QName: pkg + "::" + ret, Kind: graph.KindClass}, pkg, true
 	}

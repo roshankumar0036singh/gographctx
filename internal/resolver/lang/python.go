@@ -181,13 +181,16 @@ func (r *PythonResolver) InferTypes(ctx context.Context, file *parser.ParsedFile
 			case lv.InitCallee != "":
 				var clsNode graph.Node
 				var pkg string
+				var rawRet string
 				var found bool
 				if lv.InitReceiver == "" {
 					if target, ok := resolvePythonBindingCall(rc, bindings, modScope, lv.InitCallee); ok {
+						rawRet = target.ReturnType
 						clsNode, pkg, found = inferTargetReturnOrClass(rc, target)
 					}
 				} else {
 					if target, modPkg, isMod := resolvePythonModuleMember(rc, bindings, lv.InitReceiver, lv.InitCallee); isMod && !target.UID.IsZero() {
+						rawRet = target.ReturnType
 						clsNode, pkg, found = inferTargetReturnOrClass(rc, target)
 						if pkg == "" {
 							pkg = modPkg
@@ -195,48 +198,82 @@ func (r *PythonResolver) InferTypes(ctx context.Context, file *parser.ParsedFile
 					} else if recvInfo, ok := tm.LookupReceiver(lv.ScopeQName, lv.InitReceiver); ok {
 						recvPkg := pkgOrDefault(recvInfo.Package, modScope)
 						if target, _, okMethod := resolvePythonMethodOnHierarchy(rc, recvPkg, resolver.StripTypeDecorations(recvInfo.Name), lv.InitCallee, nil, bindings, modScope); okMethod {
+							rawRet = target.ReturnType
 							clsNode, pkg, found = inferTargetReturnOrClass(rc, target)
 						}
 					} else if recvInfo, ok := LookupScopedReceiverType(rc, lv.ScopeQName, "", lv.InitReceiver, tm.ToFlatMap(), nil); ok {
 						recvPkg := pkgOrDefault(recvInfo.Package, modScope)
 						if target, _, okMethod := resolvePythonMethodOnHierarchy(rc, recvPkg, resolver.StripTypeDecorations(recvInfo.Name), lv.InitCallee, nil, bindings, modScope); okMethod {
+							rawRet = target.ReturnType
 							clsNode, pkg, found = inferTargetReturnOrClass(rc, target)
 						}
 					} else if recvInfo, ok := resolvePythonImportedVarType(rc, bindings, lv.InitReceiver, 0); ok {
 						recvPkg := pkgOrDefault(recvInfo.Package, modScope)
 						if target, _, okMethod := resolvePythonMethodOnHierarchy(rc, recvPkg, resolver.StripTypeDecorations(recvInfo.Name), lv.InitCallee, nil, bindings, modScope); okMethod {
+							rawRet = target.ReturnType
 							clsNode, pkg, found = inferTargetReturnOrClass(rc, target)
 						}
 					}
 				}
 				if found && clsNode.Name != "" {
+					if lv.UnwrapElement {
+						elemRaw := rawRet
+						if elemRaw == "" {
+							elemRaw = clsNode.Name
+						}
+						if inner := resolver.ExtractContainerElementType(elemRaw); inner != "" {
+							baseInner := resolver.StripTypeDecorations(inner)
+							if uNode, uPkg, okU := resolvePythonSymbolType(rc, bindings, pkgOrDefault(pkg, modScope), baseInner); okU {
+								clsNode = uNode
+								pkg = uPkg
+							} else {
+								clsNode = graph.Node{Name: baseInner}
+							}
+						}
+					}
 					origin := resolver.OriginReturnType
-					conf := float32(0.86)
+					conf := float32(0.90)
 					if lv.IsConstructor {
 						origin = resolver.OriginConstructor
-						conf = 0.92
+						conf = 0.95
 					}
 					inferred = resolver.TypeInfo{
-						Name:       clsNode.Name,
-						QName:      clsNode.QName,
-						Package:    pkg,
-						Origin:     origin,
-						Confidence: conf,
-						Line:       lv.Line,
+						Name:        clsNode.Name,
+						QName:       clsNode.QName,
+						ElementType: resolver.ExtractContainerElementType(rawRet),
+						Package:     pkg,
+						Origin:      origin,
+						Confidence:  conf,
+						Line:        lv.Line,
 					}
 					hasInferred = true
 				}
 
 			case lv.InitAlias != "":
 				if rhsInfo, ok := tm.LookupReceiver(lv.ScopeQName, lv.InitAlias); ok && rhsInfo.Name != "" {
-					rhsInfo.Line = lv.Line
-					if clsNode, pkg, found := resolvePythonSymbolType(rc, bindings, modScope, resolver.StripTypeDecorations(rhsInfo.Name)); found {
-						rhsInfo.Name = clsNode.Name
-						rhsInfo.QName = clsNode.QName
-						rhsInfo.Package = pkg
+					if lv.UnwrapElement && rhsInfo.ElementType != "" {
+						elemBase := resolver.StripTypeDecorations(rhsInfo.ElementType)
+						if clsNode, pkg, found := resolvePythonSymbolType(rc, bindings, modScope, elemBase); found {
+							inferred = resolver.TypeInfo{
+								Name:       clsNode.Name,
+								QName:      clsNode.QName,
+								Package:    pkg,
+								Origin:     resolver.OriginAssignment,
+								Confidence: 0.84,
+								Line:       lv.Line,
+							}
+							hasInferred = true
+						}
+					} else {
+						rhsInfo.Line = lv.Line
+						if clsNode, pkg, found := resolvePythonSymbolType(rc, bindings, modScope, resolver.StripTypeDecorations(rhsInfo.Name)); found {
+							rhsInfo.Name = clsNode.Name
+							rhsInfo.QName = clsNode.QName
+							rhsInfo.Package = pkg
+						}
+						inferred = rhsInfo
+						hasInferred = true
 					}
-					inferred = rhsInfo
-					hasInferred = true
 				}
 			}
 

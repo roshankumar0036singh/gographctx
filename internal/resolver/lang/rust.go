@@ -239,20 +239,38 @@ func (r *RustResolver) InferTypes(ctx context.Context, file *parser.ParsedFile, 
 			continue
 		}
 		if lv.InitCallee == "" {
+			if lv.UnwrapElement && lv.InitAlias != "" {
+				if rhsInfo, ok := tm.Lookup(lv.ScopeQName, lv.InitAlias); ok && rhsInfo.ElementType != "" {
+					elemBase := stripRustWrapperType(rhsInfo.ElementType)
+					if clsNode, targetPkg, found := resolveRustSymbolType(rc, bindings, modScope, elemBase, cargoInfo); found {
+						tm.Set(lv.ScopeQName, lv.Name, resolver.TypeInfo{
+							Name:       clsNode.Name,
+							QName:      clsNode.QName,
+							Package:    targetPkg,
+							Origin:     resolver.OriginAssignment,
+							Confidence: 0.85,
+							Line:       lv.Line,
+						})
+					}
+				}
+			}
 			continue
 		}
 
 		var typeNode graph.Node
 		var pkg string
+		var rawRet string
 		var found bool
 
 		if lv.InitReceiver == "" {
 			if fn, modPkg, ok := resolveRustUnqualifiedSymbol(rc, file, bindings, modScope, lv.InitCallee); ok {
+				rawRet = fn.ReturnType
 				typeNode, pkg, found = inferRustReturnOrType(rc, fn, modPkg, bindings, modScope, cargoInfo)
 			}
 		} else {
 			recvClean := stripRustWrapperType(lv.InitReceiver)
 			if fn, modPkg, ok := resolveRustAssociatedTarget(rc, bindings, modScope, recvClean, lv.InitCallee, cargoInfo); ok {
+				rawRet = fn.ReturnType
 				typeNode, pkg, found = inferRustReturnOrType(rc, fn, modPkg, bindings, modScope, cargoInfo)
 			} else if recvType, okRecv := LookupScopedReceiverType(rc, lv.ScopeQName, "", lv.InitReceiver, tm.ToFlatMap(), nil); okRecv {
 				// Chained call / smart unwrapping: e.g. `Client::builder().build()` or `make_client().unwrap()`.
@@ -271,6 +289,7 @@ func (r *RustResolver) InferTypes(ctx context.Context, file *parser.ParsedFile, 
 					recvTypeName := stripRustWrapperType(recvType.Name)
 					recvPkg := pkgOrDefault(recvType.Package, PackageScopePrefix(recvType.QName))
 					if fnNode, _, okMeth := resolveRustTypeMethod(rc, pkgOrDefault(recvPkg, modScope), recvTypeName, lv.InitCallee); okMeth {
+						rawRet = fnNode.ReturnType
 						typeNode, pkg, found = inferRustReturnOrType(rc, fnNode, pkgOrDefault(recvPkg, modScope), bindings, modScope, cargoInfo)
 					}
 				}
@@ -278,6 +297,17 @@ func (r *RustResolver) InferTypes(ctx context.Context, file *parser.ParsedFile, 
 		}
 
 		if found && typeNode.Name != "" {
+			if lv.UnwrapElement && rawRet != "" {
+				if inner := resolver.ExtractContainerElementType(rawRet); inner != "" {
+					elemBase := stripRustWrapperType(inner)
+					if uNode, uPkg, okU := resolveRustSymbolType(rc, bindings, modScope, elemBase, cargoInfo); okU {
+						typeNode = uNode
+						pkg = uPkg
+					} else if elemBase != "" {
+						typeNode = graph.Node{Name: elemBase}
+					}
+				}
+			}
 			origin := resolver.OriginReturnType
 			conf := float32(0.88)
 			if lv.IsConstructor {
@@ -285,12 +315,13 @@ func (r *RustResolver) InferTypes(ctx context.Context, file *parser.ParsedFile, 
 				conf = 0.93
 			}
 			tm.Set(lv.ScopeQName, lv.Name, resolver.TypeInfo{
-				Name:       typeNode.Name,
-				QName:      typeNode.QName,
-				Package:    pkg,
-				Origin:     origin,
-				Confidence: conf,
-				Line:       lv.Line,
+				Name:        typeNode.Name,
+				QName:       typeNode.QName,
+				ElementType: resolver.ExtractContainerElementType(rawRet),
+				Package:     pkg,
+				Origin:      origin,
+				Confidence:  conf,
+				Line:        lv.Line,
 			})
 		}
 	}

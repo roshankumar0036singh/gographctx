@@ -207,10 +207,10 @@ func (r *JavaResolver) InferTypes(ctx context.Context, file *parser.ParsedFile, 
 
 		if found && typeNode.Name != "" {
 			origin := resolver.OriginReturnType
-			conf := float32(0.88)
+			conf := float32(0.90)
 			if lv.IsConstructor {
 				origin = resolver.OriginConstructor
-				conf = 0.93
+				conf = 0.95
 			}
 			tm.Set(lv.ScopeQName, lv.Name, resolver.TypeInfo{
 				Name:       typeNode.Name,

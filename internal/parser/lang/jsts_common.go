@@ -994,20 +994,8 @@ func (e *jstsExtractor) extractVariableDecl(decl *gotreesitter.Node, scopeQName,
 		}
 
 		if valNode != nil {
-			if callerQName == e.moduleCaller && !isRequireCall(valNode, e.lang, e.src) && nameNode != nil && nameNode.Type(e.lang) == "identifier" {
-				vname := strings.TrimSpace(nameNode.Text(e.src))
-				if vname != "" {
-					lv := parser.ParsedLocalVar{
-						ScopeQName:   "",
-						Name:         vname,
-						ExplicitType: typeStr,
-						Line:         line,
-					}
-					e.populateJSTSRHS(&lv, valNode)
-					if lv.ExplicitType != "" || lv.InitCallee != "" || lv.InitAlias != "" {
-						e.out.LocalVars = append(e.out.LocalVars, lv)
-					}
-				}
+			if callerQName == e.moduleCaller && !isRequireCall(valNode, e.lang, e.src) {
+				e.recordJSTSBindingDeclarator("", typeStr, line, nameNode, valNode)
 			}
 			e.collectCalls(valNode, callerQName)
 		}
@@ -1307,26 +1295,74 @@ func (e *jstsExtractor) recordJSTSLocalVarDecl(decl *gotreesitter.Node, scopeQNa
 			continue
 		}
 		nameNode := vd.ChildByFieldName("name", e.lang)
-		if nameNode == nil || nameNode.Type(e.lang) != "identifier" {
-			continue
+		val := vd.ChildByFieldName("value", e.lang)
+		var explicitType string
+		if tNode := vd.ChildByFieldName("type", e.lang); tNode != nil {
+			explicitType = cleanTSTypeAnnotation(tNode.Text(e.src))
 		}
+		e.recordJSTSBindingDeclarator(scopeQName, explicitType, NodeStartLine(vd), nameNode, val)
+	}
+}
+
+// recordJSTSBindingDeclarator records simple identifiers and `{ prop, prop: alias }`
+// destructured bindings from factory calls into LocalVars.
+func (e *jstsExtractor) recordJSTSBindingDeclarator(scopeQName, explicitType string, line uint32, nameNode, valNode *gotreesitter.Node) {
+	if nameNode == nil {
+		return
+	}
+	switch nameNode.Type(e.lang) {
+	case "identifier":
 		name := strings.TrimSpace(nameNode.Text(e.src))
 		if name == "" {
-			continue
+			return
 		}
 		lv := parser.ParsedLocalVar{
-			ScopeQName: scopeQName,
-			Name:       name,
-			Line:       NodeStartLine(vd),
+			ScopeQName:   scopeQName,
+			Name:         name,
+			ExplicitType: explicitType,
+			Line:         line,
 		}
-		if tNode := vd.ChildByFieldName("type", e.lang); tNode != nil {
-			lv.ExplicitType = cleanTSTypeAnnotation(tNode.Text(e.src))
-		}
-		if val := vd.ChildByFieldName("value", e.lang); val != nil {
-			e.populateJSTSRHS(&lv, val)
+		if valNode != nil {
+			e.populateJSTSRHS(&lv, valNode)
 		}
 		if lv.ExplicitType != "" || lv.InitCallee != "" || lv.InitAlias != "" {
 			e.out.LocalVars = append(e.out.LocalVars, lv)
+		}
+	case "object_pattern":
+		if valNode == nil {
+			return
+		}
+		for i := 0; i < nameNode.NamedChildCount(); i++ {
+			child := nameNode.NamedChild(i)
+			if child == nil {
+				continue
+			}
+			var propName, localName string
+			switch child.Type(e.lang) {
+			case "shorthand_property_identifier_pattern", "shorthand_property_identifier":
+				localName = strings.TrimSpace(child.Text(e.src))
+				propName = localName
+			case "pair_pattern":
+				k := child.ChildByFieldName("key", e.lang)
+				v := child.ChildByFieldName("value", e.lang)
+				if k != nil && v != nil && v.Type(e.lang) == "identifier" {
+					propName = strings.TrimSpace(k.Text(e.src))
+					localName = strings.TrimSpace(v.Text(e.src))
+				}
+			}
+			if propName == "" || localName == "" {
+				continue
+			}
+			lv := parser.ParsedLocalVar{
+				ScopeQName:       scopeQName,
+				Name:             localName,
+				DestructuredProp: propName,
+				Line:             line,
+			}
+			e.populateJSTSRHS(&lv, valNode)
+			if lv.InitCallee != "" || lv.InitAlias != "" {
+				e.out.LocalVars = append(e.out.LocalVars, lv)
+			}
 		}
 	}
 }
