@@ -1,0 +1,69 @@
+{
+  "confidence_summary": {
+    "certain": 1,
+    "likely": 0,
+    "max_confidence": 0.95,
+    "min_confidence": 0.95,
+    "overall_label": "certain",
+    "unresolved": 0
+  },
+  "data": {
+    "callers": [
+      {
+        "confidence": 0.95,
+        "confidence_label": "certain",
+        "edge_kind": "CALLS",
+        "reason": "imported symbol: app.core::validate",
+        "sites": [
+          {
+            "column": 12,
+            "line": 4,
+            "tier": 3
+          }
+        ],
+        "symbol": {
+          "complexity": 1,
+          "end_line": 4,
+          "exported": true,
+          "file": "app/service.py",
+          "kind": "Function",
+          "language": "python",
+          "name": "normalize",
+          "qualified_name": "app.service::normalize",
+          "return_type": "str",
+          "start_line": 3,
+          "uid": "7872a03c6786a3acdba15b5f09b1bd66"
+        },
+        "tier": "qualified import"
+      }
+    ],
+    "found": true,
+    "target": {
+      "complexity": 1,
+      "end_line": 2,
+      "exported": true,
+      "file": "app/core.py",
+      "kind": "Function",
+      "language": "python",
+      "name": "validate",
+      "qualified_name": "app.core::validate",
+      "return_type": "str",
+      "start_line": 1,
+      "uid": "97901c6f8508544598ac5fc86e02d877"
+    }
+  },
+  "metadata": {
+    "estimated_tokens": 285,
+    "index_version": 1,
+    "repo_name": "flask-py",
+    "resolution_coverage": 0.6667,
+    "timestamp": "2026-11-28T00:00:00Z",
+    "token_budget": 4000,
+    "tool": "get_callers"
+  },
+  "returned": 1,
+  "summary": "1 callers of app.core::validate",
+  "tool": "get_callers",
+  "total": 1,
+  "truncated": false
+}
