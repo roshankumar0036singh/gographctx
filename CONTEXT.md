@@ -1498,7 +1498,7 @@ d:\gographctx\gographctx\
 - `internal/mcp/formatter.go` (`Formatter`, `NewFormatter`, `FormatterConfig`, `FormattedResponse`, `ToolPayload`, `ConfidenceSummary`, `ResponseMetadata`):
   - Token budget enforcement (default 4000 tokens, configurable per tool via `FormatterConfig.ToolBudgets`)
   - `EstimateTokens` (`(len(text)+3)/4` heuristic) with binary-search shrinking over `Items` and explicit truncation signaling (`"truncated": true`, `"total": N`, `"returned": M`)
-  - `ConfidenceSummary` (`Resolved`, `Likely`, `Ambiguous`, `External`, `Unresolved`, `ResolutionCoverage`) in every response
+  - `ConfidenceSummary` (`Certain`, `Likely`, `Unresolved`, `OverallLabel`, `MinConfidence`, `MaxConfidence`) in every response
   - `StripRepoPath` converting repo-local and Windows paths to clean repo-relative POSIX paths
   - Deterministic field ordering (fixed struct tags + sorted keys/lists) and `ResponseMetadata` (`IndexVersion` matching `storage.FormatVersion`, `Timestamp`, `ResolutionCoverage`)
 - Tests: `internal/mcp/formatter_test.go` (`TestFormatterTokenBudgetTruncationPathStrippingAndDeterminism`)
