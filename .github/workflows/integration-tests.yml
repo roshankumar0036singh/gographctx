@@ -46,6 +46,7 @@ jobs:
           go-version: "1.25"
 
       - name: Run full end-to-end integration and SLA suite
+        shell: bash
         env:
           CGO_ENABLED: "1"
         run: go test -race -count=1 -v ./internal/pipeline/... ./internal/storage/... ./internal/watcher/... ./internal/mcp/... ./internal/bench/... ./cmd/...
