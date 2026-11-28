@@ -1246,11 +1246,6 @@ func resolvePythonImportModule(curPkg, impPath string, isRel bool) (targetMod st
 	return strings.Join(baseParts, "."), true
 }
 
-func findPythonModuleFile(rc *resolver.ResolutionContext, modName string) (string, bool) {
-	_, f, ok := resolveCanonicalPythonModuleFile(rc, modName)
-	return f, ok
-}
-
 func resolveCanonicalPythonModuleFile(rc *resolver.ResolutionContext, modName string) (canonMod string, filePath string, ok bool) {
 	for _, cand := range pythonModuleCandidates(modName) {
 		if files := exactPythonModuleFiles(rc, cand); len(files) > 0 {
