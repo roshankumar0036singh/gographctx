@@ -1,0 +1,28 @@
+name: Bug Report
+description: Report a bug in GoGraphCtx indexing, MCP tools, CLI, or watcher
+title: "[Bug]: "
+labels: ["bug"]
+body:
+  - type: textarea
+    id: description
+    attributes:
+      label: What happened?
+      description: A clear description of the bug or unexpected graph/MCP result.
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: Reproduction steps
+      placeholder: |
+        1. Run `gographctx index --force ./repo`
+        2. Run `gographctx query get_callers ...`
+    validations:
+      required: true
+  - type: input
+    id: env
+    attributes:
+      label: Environment (OS, Go version, `gographctx version`)
+      placeholder: "Windows 11 / Ubuntu 24.04, go1.25.1, gographctx v0.1.0"
+    validations:
+      required: true
