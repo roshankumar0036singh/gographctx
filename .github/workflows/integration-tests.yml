@@ -1,0 +1,51 @@
+name: Approved-PR Integration Tests
+
+on:
+  pull_request_review:
+    types: [submitted]
+  merge_group:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Git ref to test"
+        required: false
+        default: "main"
+
+concurrency:
+  group: integration-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  integration:
+    name: Full Integration Suite (${{ matrix.os }})
+    if: >-
+      github.event_name == 'merge_group' ||
+      github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'pull_request_review' &&
+       github.event.review.state == 'approved' &&
+       !github.event.pull_request.draft)
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+
+    steps:
+      - name: Checkout target commit
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.event.inputs.ref || github.sha }}
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.25"
+
+      - name: Run full end-to-end integration and SLA suite
+        env:
+          CGO_ENABLED: "1"
+        run: go test -race -count=1 -v ./internal/pipeline/... ./internal/storage/... ./internal/watcher/... ./internal/mcp/... ./internal/bench/... ./cmd/...

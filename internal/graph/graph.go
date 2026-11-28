@@ -1252,6 +1252,23 @@ func (g *Graph) allNodesLocked() []Node {
 	return result
 }
 
+// getByKindLocked returns clones of all live nodes matching kind sorted deterministically by UID.
+func (g *Graph) getByKindLocked(kind NodeKind) []Node {
+	if !g.init || g.nodeCount == 0 || !kind.IsValid() {
+		return nil
+	}
+	var result []Node
+	for i := range g.nodes {
+		if g.nodes[i].Kind == kind {
+			result = append(result, g.nodes[i].Clone())
+		}
+	}
+	slices.SortFunc(result, func(a, b Node) int {
+		return a.UID.Compare(b.UID)
+	})
+	return result
+}
+
 // NodeCount returns the number of nodes in the graph.
 func (g *Graph) NodeCount() int {
 	g.mu.RLock()
@@ -1315,6 +1332,7 @@ func (v *ReadView) NodeCount() int                 { return v.g.nodeCount }
 func (v *ReadView) EdgeCount() int                 { return v.g.edgeCount }
 func (v *ReadView) CallSiteCount() int             { return v.g.callSiteCountLocked() }
 func (v *ReadView) AllNodes() []Node               { return v.g.allNodesLocked() }
+func (v *ReadView) GetByKind(kind NodeKind) []Node { return v.g.getByKindLocked(kind) }
 func (v *ReadView) AllEdges() []Edge               { return v.g.allEdgesLocked() }
 func (v *ReadView) GetByName(name string) []Node   { return v.g.getByNameLocked(name) }
 func (v *ReadView) GetByFile(file string) []Node   { return v.g.getByFileLocked(file) }

@@ -1,0 +1,99 @@
+name: Accuracy Evaluation (SCIP Ground Truth)
+
+on:
+  pull_request_review:
+    types: [submitted]
+  schedule:
+    - cron: "30 4 * * *"
+  workflow_dispatch:
+
+concurrency:
+  group: accuracy-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  check-paths:
+    if: >-
+      github.event_name == 'schedule' ||
+      github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'pull_request_review' &&
+       github.event.review.state == 'approved' &&
+       !github.event.pull_request.draft)
+    runs-on: ubuntu-latest
+    outputs:
+      run_eval: ${{ steps.filter.outputs.matched }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          fetch-depth: 0
+      - id: filter
+        shell: bash
+        run: |
+          if [ "${{ github.event_name }}" != "pull_request_review" ]; then
+            echo "matched=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          BASE="${{ github.event.pull_request.base.sha }}"
+          HEAD="${{ github.event.pull_request.head.sha }}"
+          if git diff --name-only "${BASE}" "${HEAD}" | grep -qE '^(internal/parser/|internal/resolver/|internal/pipeline/|internal/bench/)'; then
+            echo "matched=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "matched=false" >> "$GITHUB_OUTPUT"
+          fi
+
+  accuracy-eval:
+    name: Evaluate Call-Graph Precision & Recall
+    needs: check-paths
+    if: needs.check-paths.outputs.run_eval == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.25"
+
+      - name: Setup Python & Node for optional SCIP oracle & comparators
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Install scip-python, ripgrep, and universal-ctags (best effort)
+        shell: bash
+        run: |
+          sudo apt-get update -y && sudo apt-get install -y ripgrep universal-ctags || true
+          npm install -g @sourcegraph/scip-python || true
+
+      - name: Clone pinned Flask benchmark corpus (3.1.0)
+        shell: bash
+        run: |
+          git clone --depth 1 --branch 3.1.0 https://github.com/pallets/flask.git /tmp/flask-repo
+
+      - name: Run ggctx-bench accuracy & multi-tool evaluation on Flask
+        shell: bash
+        run: |
+          mkdir -p artifacts
+          go run ./cmd/ggctx-bench \
+            --corpus custom \
+            --repo /tmp/flask-repo/src/flask \
+            --tools gographctx,scip,ctags,ripgrep \
+            --out-json artifacts/accuracy-report.json \
+            --out-md artifacts/accuracy-report.md
+          cat artifacts/accuracy-report.md >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload accuracy evaluation report
+        uses: actions/upload-artifact@v4
+        with:
+          name: accuracy-report
+          path: artifacts/
+          retention-days: 30

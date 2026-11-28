@@ -1,0 +1,132 @@
+name: Post-Release Comprehensive Benchmarks
+
+on:
+  release:
+    types: [published]
+  push:
+    tags:
+      - "v*.*.*"
+  workflow_dispatch:
+    inputs:
+      baseline_tag:
+        description: "Optional previous release tag to compare against"
+        required: false
+        default: ""
+
+concurrency:
+  group: release-bench-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  release-benchmarks:
+    name: Comprehensive Release Benchmark & Comparison Suite
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.25"
+
+      - name: Setup Python & Node toolchains for comparator benchmarks
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install comparator tools (CGC, SCIP, Ctags, ast-grep, ripgrep)
+        shell: bash
+        run: |
+          sudo apt-get update -y && sudo apt-get install -y ripgrep universal-ctags time || true
+          pip install --quiet codegraphcontext ast-grep-cli || true
+          go install golang.org/x/perf/cmd/benchstat@latest || true
+
+      - name: Build release binary & bench runner
+        shell: bash
+        env:
+          CGO_ENABLED: "0"
+        run: |
+          mkdir -p artifacts
+          VER="${GITHUB_REF_NAME:-dev}"
+          go build -trimpath -ldflags="-s -w -X main.version=${VER}" -o artifacts/gographctx ./cmd/gographctx
+          go build -trimpath -ldflags="-s -w" -o artifacts/ggctx-bench ./cmd/ggctx-bench
+
+      - name: Run Go micro-benchmarks (-count=5)
+        shell: bash
+        run: |
+          go test -run=^$ -bench=. -benchmem -count=5 ./internal/graph/... ./internal/storage/... ./internal/parser/... ./internal/pipeline/... ./internal/bench/... \
+            | tee artifacts/micro-bench.txt
+
+      - name: Fetch previous release baseline report (if available)
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          BASE_TAG="${{ github.event.inputs.baseline_tag }}"
+          if [ -z "${BASE_TAG}" ]; then
+            BASE_TAG=$(gh release list --limit 5 --json tagName --jq '.[].tagName' | grep -v "^${GITHUB_REF_NAME}$" | head -n 1 || true)
+          fi
+          if [ -n "${BASE_TAG}" ]; then
+            echo "Comparing against baseline tag: ${BASE_TAG}"
+            gh release download "${BASE_TAG}" -p "bench-report.json" -p "micro-bench.txt" -D artifacts/baseline || true
+          fi
+
+      - name: Run full SLA & multi-tool benchmark suite (Flask + Go-1k)
+        shell: bash
+        run: |
+          BASE_ARGS=""
+          if [ -f artifacts/baseline/bench-report.json ]; then
+            BASE_ARGS="--baseline-json artifacts/baseline/bench-report.json --max-regression 0.20"
+          fi
+          ./artifacts/ggctx-bench \
+            --corpus flask-synth \
+            --cli-bin ./artifacts/gographctx \
+            --tools all \
+            --out-json artifacts/bench-report.json \
+            --out-md artifacts/bench-report.md \
+            ${BASE_ARGS} \
+            --assert-sla
+
+      - name: Compute benchstat micro-benchmark delta
+        shell: bash
+        run: |
+          {
+            echo "## Micro-Benchmark Summary (Go benchstat)"
+            echo '```'
+            if [ -f artifacts/baseline/micro-bench.txt ] && command -v benchstat >/dev/null 2>&1; then
+              benchstat artifacts/baseline/micro-bench.txt artifacts/micro-bench.txt
+            elif command -v benchstat >/dev/null 2>&1; then
+              benchstat artifacts/micro-bench.txt
+            else
+              cat artifacts/micro-bench.txt
+            fi
+            echo '```'
+          } >> artifacts/micro-benchstat.md
+          cat artifacts/bench-report.md >> "$GITHUB_STEP_SUMMARY"
+          cat artifacts/micro-benchstat.md >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload benchmark artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-benchmark-report-${{ github.ref_name }}
+          path: artifacts/
+          retention-days: 90
+
+      - name: Attach benchmark reports to GitHub Release
+        if: github.event_name == 'release'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release upload "${{ github.event.release.tag_name }}" \
+            artifacts/bench-report.json \
+            artifacts/bench-report.md \
+            artifacts/micro-bench.txt \
+            artifacts/micro-benchstat.md \
+            --clobber

@@ -1,0 +1,55 @@
+name: Fuzz & Race Stress Soak
+
+on:
+  schedule:
+    - cron: "0 3 * * *"
+  pull_request:
+    branches: [main, "phase-*"]
+  workflow_dispatch:
+
+concurrency:
+  group: fuzz-soak-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  fuzz-and-race:
+    name: Fuzzing & Multi-Iteration Race Soak
+    if: >-
+      github.event_name != 'pull_request' ||
+      contains(github.event.pull_request.labels.*.name, 'run-fuzz')
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.25"
+
+      - name: Fuzz storage snapshot and WAL decoder (60s)
+        run: go test -run=^$ -fuzz=FuzzSnapshotAndWALDecode -fuzztime=60s ./internal/storage
+
+      - name: Fuzz MCP stdio wire framing (45s)
+        run: go test -run=^$ -fuzz=FuzzMCPReadRPCMessage -fuzztime=45s ./internal/mcp
+
+      - name: Fuzz ignore matcher globs (45s)
+        run: go test -run=^$ -fuzz=FuzzIgnoreMatcher -fuzztime=45s ./internal/config
+
+      - name: Race detector stress soak (5x)
+        env:
+          CGO_ENABLED: "1"
+        run: go test -race -count=5 ./internal/graph/... ./internal/watcher/... ./internal/mcp/...
+
+      - name: Upload fuzz crashers on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-crashers
+          path: "**/testdata/fuzz/**"
+          retention-days: 14
